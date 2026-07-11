@@ -1,0 +1,120 @@
+# Shared env for the api + worker (same image, same config).
+x-app-env: &app-env
+  DATABASE_URL: postgresql+asyncpg://aios:aios@postgres:5432/aios
+  REDIS_URL: redis://redis:6379/0
+  LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+  OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
+  CHAT_MODEL: ${CHAT_MODEL:-gpt-4o-mini}
+  NEBIUS_BASE_URL: ${NEBIUS_BASE_URL:-https://api.studio.nebius.com/v1}
+  NEBIUS_API_KEY: ${NEBIUS_API_KEY:-}
+  OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+  OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+  GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+  GITHUB_REPO: ${GITHUB_REPO:-}
+  GITHUB_LIMIT: ${GITHUB_LIMIT:-30}
+  FERNET_KEY: ${FERNET_KEY:-}
+  SMTP_HOST: ${SMTP_HOST:-}
+  SMTP_PORT: ${SMTP_PORT:-587}
+  SMTP_USER: ${SMTP_USER:-}
+  SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+  SMTP_FROM: ${SMTP_FROM:-ai-os@localhost}
+  PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8000}
+  SCAN_ENABLED: ${SCAN_ENABLED:-true}
+  SCAN_INTERVAL_MINUTES: ${SCAN_INTERVAL_MINUTES:-15}
+  SCAN_INGEST_TIMEOUT: ${SCAN_INGEST_TIMEOUT:-120}
+  GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: aios
+      POSTGRES_PASSWORD: aios
+      POSTGRES_DB: aios
+    ports:
+      # host 5442 -> container 5432 (5432 is used by another local stack)
+      - "5442:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aios -d aios"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # Local fake inbox: catches every email the app sends. Nothing leaves the
+  # machine. Read them at http://localhost:8025
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - "8025:8025"   # web UI
+      - "1025:1025"   # SMTP
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      # host 6389 -> container 6379 (6379 is used by another local stack)
+      - "6389:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    environment: *app-env
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  worker:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    environment: *app-env
+    command: ["arq", "apps.worker.main.WorkerSettings"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+    environment:
+      # Server-side rewrite target so the browser only ever calls /api/*
+      API_URL: http://api:8000
+      WATCHPACK_POLLING: "true"
+    volumes:
+      # Hot reload: edit apps/web on the host, see it live. node_modules stays in-image.
+      - ./apps/web:/app
+      - /app/node_modules
+      - /app/.next
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
