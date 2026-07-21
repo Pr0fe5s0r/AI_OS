@@ -4,6 +4,7 @@ from sqlalchemy import text
 
 from apps.common.analysis import evaluate_watchers
 from apps.common.context import get_profile
+from apps.common.triggers import fire_event_workflows
 from packages.core import audit
 from packages.core.db import Session
 from packages.core.norms import get_norms
@@ -31,6 +32,12 @@ async def evaluate_all_watchers(ctx: dict) -> dict:
             norms = await get_norms(session, company_id)
             summary = await evaluate_watchers(session, profile, norms)
             summary["trigger"] = "watcher_cron"
+            # event-triggered workflows fire off what this pass raised. Each
+            # situation claims its own key, so a situation that stays true
+            # across passes fires once, not every five minutes.
+            summary["events"] = await fire_event_workflows(
+                session, company_id, summary.get("raised", [])
+            )
             await audit.record(session, company_id, "watcher_cron", "watchers.run", metadata=summary)
             summaries[company_id] = summary
         await session.commit()

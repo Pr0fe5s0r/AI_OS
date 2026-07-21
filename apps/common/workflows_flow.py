@@ -278,17 +278,27 @@ def _matches_selector(situation: Any, selector: dict[str, Any]) -> bool:
 
 
 async def _expand_steps(
-    session: AsyncSession, profile: Profile, steps: list[WorkflowStep]
+    session: AsyncSession,
+    profile: Profile,
+    steps: list[WorkflowStep],
+    only_situation_id: str | None = None,
 ) -> list[WorkflowStep]:
     """Resolve dynamic (``select``) run_action steps against the situations open
     RIGHT NOW — one concrete step per match. This is what makes a saved or
     scheduled workflow act on today's items instead of the ones frozen into the
     plan when it was written. A selector that matches nothing contributes no
     steps (there is simply nothing to do), which is the correct quiet resting
-    state, not a failure."""
+    state, not a failure.
+
+    ``only_situation_id`` narrows the candidate set to a single situation: an
+    EVENT-triggered run means "this just happened, handle it", so it must act on
+    the situation that fired it, not sweep every open item that also matches.
+    """
     if not any(s.select and s.enabled for s in steps):
         return steps  # nothing dynamic to resolve — skip the situations query entirely
     open_sits = [s for s in await list_situations(session, profile.company_id) if s.status != "resolved"]
+    if only_situation_id is not None:
+        open_sits = [s for s in open_sits if s.id == only_situation_id]
     expanded: list[WorkflowStep] = []
     for step in steps:
         if not step.enabled or not step.select:
@@ -331,17 +341,23 @@ def _run_status(results: list[WorkflowStepResult]) -> str:
 
 
 async def run_workflow(
-    session: AsyncSession, profile: Profile, workflow_id: int, trigger: str = "manual"
+    session: AsyncSession,
+    profile: Profile,
+    workflow_id: int,
+    trigger: str = "manual",
+    only_situation_id: str | None = None,
 ) -> dict[str, Any]:
     """Execute a saved workflow now. Returns the run id, final status, per-step
     results and a summary. External actions ride act()'s approval/dry-run brake
-    plus the allowlist gate above."""
+    plus the allowlist gate above — which is what makes an UNATTENDED run
+    (scheduled or event-fired) safe: it takes exactly the same path a manual
+    run does, with no extra privilege."""
     workflow = await wf.get_workflow(session, profile.company_id, workflow_id)
     if workflow is None:
         return {"error": "workflow not found"}
 
     run_id = await wf.create_run(session, workflow_id, profile.company_id, trigger)
-    steps = await _expand_steps(session, profile, workflow.steps)
+    steps = await _expand_steps(session, profile, workflow.steps, only_situation_id)
     base = _make_dispatch(session, profile)
     dispatch = _make_workflow_dispatch(session, profile, base)
     results = await wf.execute_plan(steps, dispatch)

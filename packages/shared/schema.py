@@ -300,8 +300,9 @@ class WorkflowTrigger(BaseModel):
       manual   — a human hits Run. config: {}
       schedule — a cron cadence.     config: {"cron": "0 9 * * *", "label": "every morning"}
       event    — a raised situation matches. config: {"rule"?: str, "severity"?: str}
-    Only manual runs today; schedule + event runtimes land in the triggers-runtime
-    build. Storing the config now means the graph and the plan are already whole."""
+    All three fire: manual from the UI, schedule from a once-a-minute cron scan,
+    event from a detection pass (apps.common.triggers). Unattended runs take the
+    same gated path a manual one does — dry-run brake plus allowlist."""
 
     type: str = "manual"  # manual | schedule | event
     config: dict[str, Any] = Field(default_factory=dict)
@@ -339,7 +340,7 @@ class WorkflowRun(BaseModel):
     workflow_id: int
     company_id: str
     status: str = "running"  # planning | running | needs_approval | done | failed
-    trigger: str = "manual"  # manual | scheduled
+    trigger: str = "manual"  # what caused THIS run: manual | scheduled | event
     step_results: list[WorkflowStepResult] = Field(default_factory=list)
     summary: str = ""
     started_at: datetime | None = None

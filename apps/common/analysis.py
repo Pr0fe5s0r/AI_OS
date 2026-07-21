@@ -521,6 +521,11 @@ async def evaluate_watchers(
 
     return {
         "situations": len(situations),
+        # what this pass had on the feed, in the shape event-triggered workflows
+        # match on. Returned rather than acted on here: the trigger runtime
+        # imports this module, so firing from inside it would be a cycle — and
+        # the caller (a cron entrypoint) is the honest owner of side effects.
+        "raised": [{"id": s.id, "rule": s.rule, "severity": s.severity} for s in situations],
         "delivered": delivered,
         "resolved": resolved,
         "by_severity": by_severity,

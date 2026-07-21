@@ -10,6 +10,7 @@ from apps.common.scheduling import (
     scan_minutes,
     scheduled_scan,
 )
+from apps.common.triggers import run_scheduled_workflows
 from apps.common.watching import evaluate_all_watchers
 from packages.core import graph
 from packages.core.pipeline import (
@@ -61,6 +62,22 @@ _WATCHER_SCAN = cron(
 )
 
 
+# Schedule-triggered workflows: every minute, because a workflow's cadence is
+# its OWN cron string — this tick just asks each one "is this your minute?".
+# Cheap when nothing is due (one indexed query, no LLM, no external call).
+_WORKFLOW_SCAN = cron(
+    run_scheduled_workflows,
+    minute=set(range(60)),
+    unique=True,
+    # a restart must not replay every schedule that passed while we were down
+    run_at_startup=False,
+    # a retry would re-fire actions; the fire-claim would block it anyway, but
+    # failing loudly is the honest behaviour
+    max_tries=1,
+    timeout=300,
+)
+
+
 async def startup(ctx: dict) -> None:
     # constraints + vector index must exist before the first embed job lands
     await graph.bootstrap()
@@ -76,8 +93,11 @@ class WorkerSettings:
     functions = [
         ingest_raw, embed_event, resolve_event, analyze_company,
         evaluate_connector_health, delete_company_job, backfill_source,
+        run_scheduled_workflows,
     ]
-    cron_jobs = ([_SCAN] if scan_enabled() else []) + [_HEALTH_SCAN, _WATCHER_SCAN]
+    cron_jobs = ([_SCAN] if scan_enabled() else []) + [
+        _HEALTH_SCAN, _WATCHER_SCAN, _WORKFLOW_SCAN,
+    ]
     on_startup = startup
     on_shutdown = shutdown
     redis_settings = redis_settings()

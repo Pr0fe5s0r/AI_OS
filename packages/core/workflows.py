@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Awaitable, Callable
+from datetime import datetime
 from typing import Any, cast
 
 from sqlalchemy import CursorResult, text
@@ -237,6 +238,118 @@ async def list_runs(
             )
         )
     return out
+
+
+# ------------------------------- triggers -------------------------------
+#
+# The mechanics of "what should fire, and has it fired already". Still no
+# domain knowledge: matching a cron string against a clock and claiming an
+# idempotency key are pure functions of their arguments. WHICH workflows exist
+# and what their steps do stays a caller concern.
+
+
+def _cron_field(spec: str, low: int, high: int) -> set[int]:
+    """Expand one cron field into the values it matches. Supports ``*``, ``a``,
+    ``a-b``, ``a,b``, and a ``/step`` on any of those."""
+    out: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            raise ValueError("empty cron field")
+        step = 1
+        if "/" in part:
+            part, _, raw = part.partition("/")
+            step = int(raw)
+            if step < 1:
+                raise ValueError("cron step must be positive")
+        if part in ("*", ""):
+            start, end = low, high
+        elif "-" in part:
+            a, _, b = part.partition("-")
+            start, end = int(a), int(b)
+        else:
+            start = end = int(part)
+        if start < low or end > high or start > end:
+            raise ValueError(f"cron field out of range: {spec}")
+        out.update(range(start, end + 1, step))
+    return out
+
+
+def cron_matches(expr: str, when: datetime) -> bool:
+    """Does a 5-field cron expression fire at ``when`` (minute resolution)?
+
+    Deliberately dependency-free: the runtime only ever asks "is this minute a
+    match", never "when is the next one", so a full scheduler library would be
+    weight for nothing. A malformed expression returns False — a workflow the
+    planner mis-wrote silently does nothing rather than firing at every tick.
+    """
+    fields = (expr or "").split()
+    if len(fields) != 5:
+        return False
+    try:
+        minutes = _cron_field(fields[0], 0, 59)
+        hours = _cron_field(fields[1], 0, 23)
+        doms = _cron_field(fields[2], 1, 31)
+        months = _cron_field(fields[3], 1, 12)
+        dows = _cron_field(fields[4], 0, 7)
+    except ValueError:
+        return False
+    if 7 in dows:  # both 0 and 7 mean Sunday
+        dows.add(0)
+    if when.minute not in minutes or when.hour not in hours or when.month not in months:
+        return False
+    dow = (when.weekday() + 1) % 7  # python Mon=0 -> cron Sun=0
+    dom_any, dow_any = fields[2].strip() == "*", fields[4].strip() == "*"
+    # cron's day quirk: when BOTH day fields are restricted, the match is OR
+    if dom_any and dow_any:
+        return True
+    if dom_any:
+        return dow in dows
+    if dow_any:
+        return when.day in doms
+    return when.day in doms or dow in dows
+
+
+def minute_bucket(when: datetime) -> str:
+    """The idempotency key for a scheduled fire: one claim per workflow-minute."""
+    return when.strftime("%Y-%m-%dT%H:%M")
+
+
+async def list_triggered(session: AsyncSession, trigger_type: str) -> list[Workflow]:
+    """Every ENABLED workflow of one trigger kind, across all companies — what
+    the unattended runtime scans. Company-scoped execution is the caller's job:
+    it loads each company's own profile before running anything."""
+    rows = await session.execute(
+        text(
+            f"SELECT {_COLS} FROM workflows "
+            "WHERE enabled = true AND trigger ->> 'type' = :t ORDER BY id"
+        ),
+        {"t": trigger_type},
+    )
+    return [_row_to_workflow(r) for r in rows]
+
+
+async def claim_fire(session: AsyncSession, workflow_id: int, fire_key: str) -> bool:
+    """Claim the right to fire ``workflow_id`` for ``fire_key``, exactly once.
+
+    One atomic INSERT: whoever wins the unique constraint gets True, everyone
+    else gets False. No read-then-write, so two workers hitting the same cron
+    minute — or the same still-open situation on two watcher passes — cannot
+    both run it.
+    """
+    row = (
+        await session.execute(
+            text(
+                """
+                INSERT INTO workflow_trigger_fires (workflow_id, fire_key)
+                VALUES (:w, :k) ON CONFLICT (workflow_id, fire_key) DO NOTHING
+                RETURNING id
+                """
+            ),
+            {"w": workflow_id, "k": fire_key},
+        )
+    ).first()
+    return row is not None
 
 
 # --------------------------- the generic executor ---------------------------

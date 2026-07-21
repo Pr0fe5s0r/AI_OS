@@ -7,6 +7,7 @@ from sqlalchemy import text
 from apps.common.analysis import run_analysis
 from apps.common.context import get_profile
 from apps.common.ingestion import trigger_ingest
+from apps.common.triggers import fire_event_workflows
 from packages.core import audit
 from packages.core.db import Session
 
@@ -63,6 +64,9 @@ async def scheduled_scan(ctx: dict) -> dict:
             summary = await run_analysis(session, profile)
             summary["ingested"] = ingested
             summary["trigger"] = "scheduler"
+            summary["events"] = await fire_event_workflows(
+                session, company_id, summary.get("raised", [])
+            )
             await audit.record(
                 session, company_id, "scheduler", "analyze.run", metadata=summary
             )
@@ -81,6 +85,10 @@ async def analyze_company(ctx: dict, company_id: str, trigger: str = "webhook") 
         profile = await get_profile(session, company_id)
         summary = await run_analysis(session, profile)
         summary["trigger"] = trigger
+        # the webhook path is the fastest route from "it happened" to "we acted"
+        summary["events"] = await fire_event_workflows(
+            session, company_id, summary.get("raised", [])
+        )
         await audit.record(session, company_id, trigger, "analyze.run", metadata=summary)
         await session.commit()
     return summary
