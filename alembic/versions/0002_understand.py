@@ -1,4 +1,8 @@
-"""understand layer: nodes + edges + norm baselines
+"""understand layer: norm baselines
+
+The knowledge graph (things, event mirrors, typed links) lives in Neo4j —
+created idempotently by core.graph.bootstrap(), not by a Postgres migration.
+Norm baselines stay here: they are relational rollups over events.
 
 Revision ID: 0002_understand
 Revises: 0001_initial
@@ -14,42 +18,6 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.execute(
-        """
-        CREATE TABLE IF NOT EXISTS nodes (
-            id         TEXT PRIMARY KEY,
-            company_id TEXT NOT NULL DEFAULT 'default',
-            type       TEXT NOT NULL,
-            key        TEXT NOT NULL,
-            label      TEXT NOT NULL,
-            source     TEXT,
-            metadata   JSONB NOT NULL DEFAULT '{}'::jsonb,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-        """
-    )
-    op.execute("CREATE INDEX IF NOT EXISTS ix_nodes_company ON nodes (company_id)")
-    op.execute("CREATE INDEX IF NOT EXISTS ix_nodes_company_key ON nodes (company_id, key)")
-
-    op.execute(
-        """
-        CREATE TABLE IF NOT EXISTS edges (
-            id         BIGSERIAL PRIMARY KEY,
-            company_id TEXT NOT NULL DEFAULT 'default',
-            src_id     TEXT NOT NULL REFERENCES nodes (id) ON DELETE CASCADE,
-            dst_id     TEXT NOT NULL REFERENCES nodes (id) ON DELETE CASCADE,
-            type       TEXT NOT NULL,
-            weight     DOUBLE PRECISION NOT NULL DEFAULT 1.0,
-            metadata   JSONB NOT NULL DEFAULT '{}'::jsonb,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            CONSTRAINT uq_edge UNIQUE (company_id, src_id, dst_id, type)
-        )
-        """
-    )
-    op.execute("CREATE INDEX IF NOT EXISTS ix_edges_src ON edges (company_id, src_id)")
-    op.execute("CREATE INDEX IF NOT EXISTS ix_edges_dst ON edges (company_id, dst_id)")
-
     op.execute(
         """
         CREATE TABLE IF NOT EXISTS norm_baselines (
@@ -70,5 +38,3 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.execute("DROP TABLE IF EXISTS norm_baselines")
-    op.execute("DROP TABLE IF EXISTS edges")
-    op.execute("DROP TABLE IF EXISTS nodes")

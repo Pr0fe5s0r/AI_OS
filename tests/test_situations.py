@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+from sqlalchemy import text
+
 from packages.core.db import Session
 from packages.core.situations import list_situations, resolve_stale, save_situation
 from packages.shared.schema import Evidence, Situation
@@ -94,3 +96,64 @@ async def test_empty_active_set_resolves_everything() -> None:
         await resolve_stale(session, _CO, [])
         await session.commit()
         assert all(s.status == "resolved" for s in await list_situations(session, _CO))
+
+
+# --------------------------- kind: system self-monitoring ---------------------------
+
+
+def _sys_sit(sid: str) -> Situation:
+    s = _sit(sid)
+    return s.model_copy(update={"kind": "system", "rule": "connector_health"})
+
+
+async def _wipe(session, *ids: str) -> None:
+    """Situations are keyed by id, shared across this file's company — a test
+    that leaves one OPEN (by design, to prove it) must clean it up itself so
+    it can never leak into another test's un-scoped resolve_stale/list call."""
+    await session.execute(text("DELETE FROM situations WHERE id = ANY(:ids)"), {"ids": list(ids)})
+    await session.commit()
+
+
+async def test_system_situations_are_hidden_by_default() -> None:
+    """No auth exists in this system — this is an honest default-visibility
+    filter, not a claim of authorization. See core.situations.list_situations."""
+    ids = ("untriaged_issue:biz", "connector_health:github")
+    async with Session() as session:
+        await _wipe(session, *ids)
+
+        await save_situation(session, _sit("untriaged_issue:biz"))
+        await save_situation(session, _sys_sit("connector_health:github"))
+        await session.commit()
+
+        default = await list_situations(session, _CO)
+        assert "untriaged_issue:biz" in {s.id for s in default}
+        assert "connector_health:github" not in {s.id for s in default}
+
+        everything = await list_situations(session, _CO, include_system=True)
+        found = {s.id for s in everything}
+        assert {"untriaged_issue:biz", "connector_health:github"} <= found
+
+        await _wipe(session, *ids)  # both left OPEN above — don't leak into other tests
+
+
+async def test_resolve_stale_scoped_to_a_kind_never_touches_other_kinds() -> None:
+    biz = _sit("untriaged_issue:kind-scope")
+    sysit = _sys_sit("connector_health:kind-scope")
+    async with Session() as session:
+        await _wipe(session, biz.id, sysit.id)
+
+        await save_situation(session, biz)
+        await save_situation(session, sysit)
+        await session.commit()
+
+        # nothing system-kind fires any more -> the system situation retires,
+        # but resolve_stale is scoped to kind="system" so `biz` is untouched
+        # (kept alive by whatever the caller passes as active_ids elsewhere)
+        await resolve_stale(session, _CO, [], kind="system")
+        await session.commit()
+
+        by_id = {s.id: s for s in await list_situations(session, _CO, include_system=True)}
+        assert by_id[sysit.id].status == "resolved"
+        assert by_id[biz.id].status != "resolved"
+
+        await _wipe(session, biz.id, sysit.id)  # `biz` left OPEN above — don't leak into other tests

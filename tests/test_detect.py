@@ -54,9 +54,9 @@ def test_rule_without_norm_always_passes_the_gate() -> None:
 
 
 def _matches(rule_name: str, event: dict) -> bool:
-    from verticals.software.config import DETECTION_RULES
+    from tests.conftest import SOFTWARE_PROFILE
 
-    rule = next(r for r in DETECTION_RULES if r["name"] == rule_name)
+    rule = next(r for r in SOFTWARE_PROFILE.watchers if r["name"] == rule_name)
     return all(_match(event, p, _NOW) for p in rule["select"]["where"])
 
 

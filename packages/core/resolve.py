@@ -5,37 +5,21 @@ import re
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core.graph import upsert_edge, upsert_node
-from packages.shared.schema import Event, GraphEdge, GraphNode, ResolvedEntity
+from packages.core import graph
+from packages.shared.schema import Event, ResolvedEntity
 
-_SYMMETRIC = {"SAME_AS", "MENTIONS"}
-
-_CANDIDATES = text(
-    """
-    WITH self_emb AS (
-        SELECT embedding FROM event_embeddings WHERE event_id = :self
-    )
-    SELECT
-        n.id      AS id,
-        n.type    AS type,
-        e.content AS content,
-        1 - (em.embedding <=> (SELECT embedding FROM self_emb)) AS sim
-    FROM nodes n
-    JOIN events e ON e.id = n.id
-    JOIN event_embeddings em ON em.event_id = n.id
-    WHERE n.company_id = :c
-      AND n.source IS NOT NULL
-      AND n.id <> :self
-      AND EXISTS (SELECT 1 FROM self_emb)
-    ORDER BY sim DESC
-    LIMIT :limit
-    """
-)
+# Entity resolution, driven entirely by profile data. The engine has no idea
+# what a "pull request" or a "purchase order" is:
+#   things_cfg  = profile.things  (type mapping, actor thing, entity_rules)
+#   links_cfg   = profile.links   (relationship names + the closes rule)
+# Graph writes happen in core.graph (the only Cypher module).
 
 
-def _node_type(event: Event, rules: dict) -> str:
-    mapping = rules.get("node_types", {})
-    return mapping.get(event.source, {}).get(event.type, rules.get("default_node_type", "Event"))
+def thing_type_for(source: str, event_type: str, things_cfg: dict) -> str:
+    for spec in things_cfg.get("types", []):
+        if spec.get("source") == source and spec.get("event_type") == event_type:
+            return str(spec["name"])
+    return str(things_cfg.get("default_type", "Event"))
 
 
 def _id_tokens(textval: str, patterns: list[str]) -> set[str]:
@@ -55,149 +39,159 @@ def _keyword_hit(a: str, b: str, keyword_rules: list[dict]) -> bool:
     return False
 
 
+async def _candidate_rows(
+    session: AsyncSession, company_id: str, event_id: str, limit: int
+) -> list[dict]:
+    """Nearest events by embedding (Neo4j), hydrated with content from Postgres."""
+    hits = await graph.similar_events(company_id, event_id, limit=limit)
+    if not hits:
+        return []
+    sim_by_id = {h["event_id"]: float(h["similarity"]) for h in hits}
+    rows = await session.execute(
+        text(
+            """
+            SELECT id, source, type, content FROM events
+            WHERE company_id = :c AND id = ANY(:ids)
+            """
+        ),
+        {"c": company_id, "ids": list(sim_by_id)},
+    )
+    return [
+        {"id": r.id, "source": r.source, "type": r.type, "content": r.content,
+         "sim": sim_by_id[r.id]}
+        for r in rows
+    ]
+
+
 async def resolve(
-    session: AsyncSession, event: Event, entity_rules: dict
+    session: AsyncSession,
+    event: Event,
+    things_cfg: dict,
+    links_cfg: dict,
 ) -> list[ResolvedEntity]:
-    """Link ``event`` to existing events/entities and write graph nodes+edges.
+    """Link ``event`` into the graph using profile-supplied rules.
 
-    Uses the vertical-supplied ``entity_rules``:
-      - explicit ID match (regex)           -> SAME_AS (method "id")
-      - embedding cosine >= similarity_hard  -> SAME_AS (method "embedding")
-      - keyword rule + cosine >= soft        -> MENTIONS (method "keyword")
-    Also records AUTHORED (person->event) and CLOSES (PR->incident) edges.
-    Requires the event's embedding to already exist in event_embeddings.
+      - explicit ID match (regex)            -> same_as link (method "id")
+      - embedding cosine >= similarity_hard  -> same_as link (method "embedding")
+      - keyword rule + cosine >= soft        -> mentions link (method "keyword")
+      - the profile's `closes` rule          -> its directional link type
+
+    Requires the event's :Event mirror + embedding to already exist in Neo4j
+    (the pipeline embeds before it resolves).
     """
-    node_type = _node_type(event, entity_rules)
+    rules = things_cfg.get("entity_rules", {})
+    ttype = thing_type_for(event.source, event.type, things_cfg)
     label = event.content.strip().splitlines()[0][:90] if event.content.strip() else event.id
+    status_field = things_cfg.get("status_field", "status")
 
-    # 1) the event as a node
-    await upsert_node(
-        session,
-        GraphNode(
-            id=event.id,
-            company_id=event.company_id,
-            type=node_type,
-            key=f"{event.source}:{event.metadata.get('number', event.id)}",
-            label=label,
-            source=event.source,
-            metadata={
-                "actor_id": event.actor.id,
-                "actor_name": event.actor.name,
-                "timestamp": event.timestamp.isoformat(),
-                "event_type": event.type,
-                "content": event.content,
-                "url": event.metadata.get("url"),
-            },
-        ),
+    # 1) the event's Thing + the ABOUT edge from its mirror
+    await graph.upsert_thing(
+        company_id=event.company_id,
+        thing_id=event.id,
+        thing_type=ttype,
+        title=label,
+        status=event.metadata.get(status_field),
+        last_activity=event.timestamp,
+        properties={"url": event.metadata.get("url"), "source": event.source},
     )
+    await graph.link_event_to_thing(event.company_id, event.id, event.id)
 
-    # 2) the person as a node + AUTHORED edge
-    person_id = f"person:{event.actor.id}"
-    await upsert_node(
-        session,
-        GraphNode(
-            id=person_id,
+    # 2) the actor as a Thing (type from profile) + authored link
+    actor_cfg = things_cfg.get("actor_thing")
+    if actor_cfg:
+        actor_id = f"actor:{event.actor.id}"
+        await graph.upsert_thing(
             company_id=event.company_id,
-            type="Person",
-            key=event.actor.id,
-            label=event.actor.name,
-            source=None,
-            metadata={"name": event.actor.name},
-        ),
-    )
-    await upsert_edge(
-        session,
-        GraphEdge(
-            company_id=event.company_id,
-            src_id=person_id,
-            dst_id=event.id,
-            type="AUTHORED",
-            weight=1.0,
-        ),
-    )
+            thing_id=actor_id,
+            thing_type=str(actor_cfg.get("type", "Person")),
+            title=event.actor.name,
+        )
+        await graph.link_things(
+            event.company_id, actor_id, event.id,
+            links_cfg.get("authored", "AUTHORED"),
+        )
 
     # 3) candidate links against already-ingested events
-    patterns = entity_rules.get("id_patterns", [])
-    keyword_rules = entity_rules.get("keyword_rules", [])
-    hard = float(entity_rules.get("similarity_hard", 0.62))
-    soft = float(entity_rules.get("similarity_soft", 0.50))
-    limit = int(entity_rules.get("candidate_limit", 25))
+    patterns = rules.get("id_patterns", [])
+    keyword_rules = rules.get("keyword_rules", [])
+    hard = float(rules.get("similarity_hard", 0.62))
+    soft = float(rules.get("similarity_soft", 0.50))
+    limit = int(rules.get("candidate_limit", 25))
 
-    self_tokens = _id_tokens(event.content, patterns)
-    is_pr = event.type == "pull_request"
-    self_fixish = bool(re.search(r"\b(fix|fixes|fixed|close[sd]?|resolve[sd]?)\b", event.content, re.I))
-
-    rows = await session.execute(
-        _CANDIDATES, {"self": event.id, "c": event.company_id, "limit": limit}
+    same_as = links_cfg.get("same_as", "SAME_AS")
+    mentions = links_cfg.get("mentions", "MENTIONS")
+    closes_cfg = links_cfg.get("closes") or {}
+    closes_when = closes_cfg.get("when", {})
+    closes_pattern = closes_when.get("content_pattern")
+    self_closish = (
+        ttype == closes_when.get("source_thing")
+        and closes_pattern is not None
+        and re.search(closes_pattern, event.content, re.I) is not None
     )
 
+    self_tokens = _id_tokens(event.content, patterns)
+    candidates = await _candidate_rows(session, event.company_id, event.id, limit)
+
     resolved: list[ResolvedEntity] = []
-    for r in rows:
-        sim = float(r.sim)
-        shared_id = bool(self_tokens & _id_tokens(r.content, patterns))
-        kw = _keyword_hit(event.content, r.content, keyword_rules)
+    for cand in candidates:
+        sim = cand["sim"]
+        shared_id = bool(self_tokens & _id_tokens(cand["content"], patterns))
+        kw = _keyword_hit(event.content, cand["content"], keyword_rules)
 
         method: str | None = None
-        edge_type: str | None = None
+        link_type: str | None = None
         confidence = sim
 
         if shared_id:
-            method, edge_type, confidence = "id", "SAME_AS", 1.0
+            method, link_type, confidence = "id", same_as, 1.0
         elif sim >= hard:
-            method, edge_type = "embedding", "SAME_AS"
+            method, link_type = "embedding", same_as
         elif kw and sim >= soft:
-            method, edge_type = "keyword", "MENTIONS"
+            method, link_type = "keyword", mentions
 
-        if edge_type is None or method is None:
+        if link_type is None or method is None:
             continue
 
-        # canonical ordering for symmetric edges so we never duplicate a pair
-        src_id, dst_id = event.id, r.id
-        if edge_type in _SYMMETRIC and src_id > dst_id:
+        # canonical ordering for symmetric links so a pair is never duplicated
+        src_id, dst_id = event.id, cand["id"]
+        if link_type in (same_as, mentions) and src_id > dst_id:
             src_id, dst_id = dst_id, src_id
 
-        await upsert_edge(
-            session,
-            GraphEdge(
-                company_id=event.company_id,
-                src_id=src_id,
-                dst_id=dst_id,
-                type=edge_type,
-                weight=round(confidence, 4),
-                metadata={"method": method},
-            ),
+        await graph.link_things(
+            event.company_id, src_id, dst_id, link_type,
+            confidence=round(confidence, 4), method=method,
         )
+        cand_type = thing_type_for(cand["source"], cand["type"], things_cfg)
         resolved.append(
             ResolvedEntity(
                 source_event_id=event.id,
-                target_node_id=r.id,
-                node_type=r.type,
+                target_node_id=cand["id"],
+                node_type=cand_type,
                 method=method,
-                edge_type=edge_type,
+                edge_type=link_type,
                 confidence=round(confidence, 4),
             )
         )
 
-        # PR that fixes an incident/issue -> directional CLOSES edge
-        if is_pr and self_fixish and r.type in ("Incident", "Feature") and (shared_id or kw):
-            await upsert_edge(
-                session,
-                GraphEdge(
-                    company_id=event.company_id,
-                    src_id=event.id,
-                    dst_id=r.id,
-                    type="CLOSES",
-                    weight=round(confidence, 4),
-                    metadata={"method": method},
-                ),
+        # the profile's directional rule, e.g. PR-CLOSES-Incident or
+        # Delivery-FULFILLS-PurchaseOrder — pure data, no domain in the engine
+        if (
+            self_closish
+            and cand_type in closes_when.get("target_types", [])
+            and (shared_id or kw)
+        ):
+            closes_type = str(closes_cfg.get("type"))
+            await graph.link_things(
+                event.company_id, event.id, cand["id"], closes_type,
+                confidence=round(confidence, 4), method=method,
             )
             resolved.append(
                 ResolvedEntity(
                     source_event_id=event.id,
-                    target_node_id=r.id,
-                    node_type=r.type,
+                    target_node_id=cand["id"],
+                    node_type=cand_type,
                     method=method,
-                    edge_type="CLOSES",
+                    edge_type=closes_type,
                     confidence=round(confidence, 4),
                 )
             )

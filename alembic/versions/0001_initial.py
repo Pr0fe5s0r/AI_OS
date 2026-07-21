@@ -1,4 +1,7 @@
-"""initial schema: partitioned events + embeddings + credentials + audit
+"""initial schema: partitioned events + credentials + audit
+
+Runs on PLAIN postgres:16 — no pgvector. Embeddings live in Neo4j
+(:Event.embedding + a native vector index), created by core.graph.bootstrap().
 
 Revision ID: 0001_initial
 Revises:
@@ -14,8 +17,6 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.execute("CREATE EXTENSION IF NOT EXISTS vector")
-
     # Append-only events, partitioned by month on timestamp. PK includes the
     # partition key (id, timestamp) as Postgres requires.
     op.execute(
@@ -61,23 +62,6 @@ def upgrade() -> None:
     op.execute("CREATE INDEX ix_events_id ON events (id)")
     op.execute("CREATE INDEX ix_events_tsv ON events USING GIN (content_tsv)")
 
-    op.execute(
-        """
-        CREATE TABLE event_embeddings (
-            event_id  TEXT PRIMARY KEY,
-            embedding VECTOR(1536) NOT NULL
-        )
-        """
-    )
-    op.execute(
-        """
-        CREATE INDEX ix_event_embeddings_vec
-        ON event_embeddings
-        USING ivfflat (embedding vector_cosine_ops)
-        WITH (lists = 100)
-        """
-    )
-
     # Encrypted connector credentials (tokens sealed via core.crypto — never plaintext).
     op.execute(
         """
@@ -111,5 +95,4 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.execute("DROP TABLE IF EXISTS audit_log")
     op.execute("DROP TABLE IF EXISTS credentials")
-    op.execute("DROP TABLE IF EXISTS event_embeddings")
     op.execute("DROP TABLE IF EXISTS events")

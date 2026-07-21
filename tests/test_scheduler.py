@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from verticals.software.scheduler import (
+from apps.common.scheduling import (
     ingest_timeout,
     scan_enabled,
     scan_interval,

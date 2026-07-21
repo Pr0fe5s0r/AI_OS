@@ -2,14 +2,16 @@ from __future__ import annotations
 
 from sqlalchemy import text
 
+from apps.common.analysis import extract_target
 from packages.core.db import Session
 from packages.core.tickets import close_ticket, create_ticket, list_tickets, ticket_for_situation
 from packages.core.tokens import consume_token, issue_token, peek_token
 from packages.shared.schema import Ticket
-from verticals.software.alerting import repo_and_number
+from tests.conftest import SOFTWARE_PROFILE
 
 _CO = "test-tokens"
-_PAYLOAD = {"situation_id": "needs_owner:gh-1", "assignee": "sam", "repo": "a/b", "number": "7"}
+_PAYLOAD = {"situation_id": "needs_owner:gh-1", "assignee": "sam",
+            "target": {"repo": "a/b", "number": "7"}}
 
 
 # ------------------------------- email tokens -------------------------------
@@ -21,7 +23,7 @@ async def test_token_round_trips_its_payload() -> None:
         await session.commit()
         body = await peek_token(session, token, "assign")
     assert body is not None
-    assert body["assignee"] == "sam" and body["repo"] == "a/b"
+    assert body["assignee"] == "sam" and body["target"]["repo"] == "a/b"
 
 
 async def test_peek_does_not_consume_so_mail_scanners_cannot_fire_it() -> None:
@@ -89,9 +91,10 @@ async def test_ticket_lifecycle_open_then_done() -> None:
         assert not await list_tickets(session, _CO, assignee="nobody")
 
 
-def test_the_github_issue_is_recoverable_from_the_ticket_url() -> None:
-    assert repo_and_number("https://github.com/karthikeyan846/Chatbot/issues/4") == (
-        "karthikeyan846/Chatbot", "4",
-    )
-    assert repo_and_number(None) is None
-    assert repo_and_number("https://example.com/nope") is None
+def test_the_action_target_is_recoverable_from_the_ticket_url() -> None:
+    """The profile's target_url_pattern, not the engine, knows the URL shape."""
+    assert extract_target(SOFTWARE_PROFILE, "https://github.com/karthikeyan846/Chatbot/issues/4") == {
+        "repo": "karthikeyan846/Chatbot", "number": "4",
+    }
+    assert extract_target(SOFTWARE_PROFILE, None) is None
+    assert extract_target(SOFTWARE_PROFILE, "https://example.com/nope") is None

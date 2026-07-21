@@ -37,9 +37,16 @@ def _schema(allowed_actions: list[str]) -> dict[str, Any]:
 
 
 def decide_action(
-    situation: Situation, allowed_actions: list[str], prompt_template: str
+    situation: Situation,
+    allowed_actions: list[str],
+    prompt_template: str,
+    action_help: str = "",
 ) -> ActionDecision:
-    """Choose an action for a situation. Never raises — failure means escalate."""
+    """Choose an action for a situation. Never raises — failure means escalate.
+
+    ``action_help`` is caller-supplied text describing what each action's
+    `argument` must contain — profile data, not engine knowledge.
+    """
     evidence = "\n".join(
         f"- {e.source}:{e.event_id} {e.url or ''}\n  {e.excerpt}" for e in situation.evidence
     )
@@ -50,6 +57,7 @@ def decide_action(
         recommended_action=situation.recommended_action or "none",
         evidence=evidence or "none",
         actions=", ".join(allowed_actions),
+        action_help=action_help or "none provided",
     )
 
     try:

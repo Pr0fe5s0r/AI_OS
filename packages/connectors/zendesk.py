@@ -3,6 +3,22 @@ from __future__ import annotations
 import base64
 
 import httpx
+from pydantic import BaseModel, Field
+
+
+class ZendeskTicketRaw(BaseModel):
+    """What Zendesk's tickets API guarantees per ticket."""
+
+    model_config = {"extra": "allow"}
+    id: int
+    status: str
+    created_at: str
+    subject: str | None = None
+    description: str | None = None
+    requester_id: int | None = None
+    priority: str | None = None
+    tags: list = Field(default_factory=list)
+    assignee_id: int | None = None
 
 
 class ZendeskConnector:
@@ -45,3 +61,9 @@ class ZendeskConnector:
             )
             out.append(ticket)
         return out
+
+    async def backfill(self, since_days: int) -> list[dict]:
+        """Zendesk's incremental ticket export API supports real deep
+        pagination by `start_time`; not wired up yet (this connector is a
+        stub). Falls back to the same recent window fetch_raw returns."""
+        return await self.fetch_raw()

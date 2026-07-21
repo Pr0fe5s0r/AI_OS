@@ -31,6 +31,7 @@ class Event(BaseModel):
     content: str  # the text we embed + full-text index
     metadata: dict[str, Any] = Field(default_factory=dict)
     raw: dict[str, Any] = Field(default_factory=dict)  # untouched source payload
+    backfilled: bool = False  # from history walk vs. a live sync/webhook
 
     model_config = {"extra": "forbid"}
 
@@ -81,12 +82,15 @@ class NormBaseline(BaseModel):
     company_id: str
     metric: str
     unit: str
-    n: int
-    median: float
-    mean: float
-    std: float
+    n: int  # sample count BEFORE outlier trimming — what maturity gates on
+    median: float  # of the outlier-trimmed observations
+    mean: float  # trend-adjusted "right now" estimate, not a flat historical average
+    std: float  # of the outlier-trimmed observations
+    trend_per_period: float = 0.0  # slope: metric units per observation, oldest -> newest
+    maturity: str = "insufficient"  # insufficient | learning | stable | unmeasurable, gated on n
     window_days: int
     computed_at: datetime
+    scope: str = "business"  # "business" (customer rhythms) | "system" (self-monitoring)
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +108,20 @@ class Evidence(BaseModel):
     url: str | None = None
 
 
+class Choice(BaseModel):
+    """One option on a clarification situation — a genuine fork, not a nudge.
+
+    ``effect`` is a small closed vocabulary the core dispatches generically
+    (like a move's `kind`): "reset_norm" | "disable_source" | "snooze" | "none".
+    ``effect_args`` carries whatever that effect needs (e.g. {"metric": ...}).
+    """
+
+    id: str
+    label: str
+    effect: str = "none"
+    effect_args: dict[str, Any] = Field(default_factory=dict)
+
+
 class Situation(BaseModel):
     id: str
     company_id: str
@@ -116,6 +134,11 @@ class Situation(BaseModel):
     status: str = "open"  # open | delivered | acknowledged | resolved
     created_at: datetime
     resolved_at: datetime | None = None
+    kind: str = "business"  # business | system (hidden by default) | clarification
+    choices: list[Choice] | None = None  # only set for kind="clarification"
+    resolved_choice: str | None = None  # the Choice.id the user picked
+    resolved_by: str | None = None
+    snoozed_until: datetime | None = None  # a "remind me later" choice sets this
 
 
 class ActionLink(BaseModel):
@@ -180,7 +203,10 @@ class ActionDecision(BaseModel):
 class ActionResult(BaseModel):
     id: int | None = None
     action: str
-    status: str  # pending_approval | executed | dry_run | rejected | failed
+    # pending_approval | executed | recorded | dry_run | rejected | failed
+    #   executed = a real external system was contacted
+    #   recorded = a `log` move: intent captured, nothing left the building
+    status: str
     detail: str = ""
     result: dict[str, Any] = Field(default_factory=dict)
 
@@ -209,6 +235,27 @@ class Ticket(BaseModel):
     closed_at: datetime | None = None
 
 
+class Message(BaseModel):
+    """One turn in a conversation. ``artifacts`` carries structured inline
+    blocks — a clarification, an evidence block, an approval request — the
+    same pattern regardless of which situation produced them."""
+
+    id: int | None = None
+    conversation_id: int
+    role: str  # user | agent | system
+    content: str = ""
+    artifacts: list[dict[str, Any]] = Field(default_factory=list)
+    created_at: datetime | None = None
+
+
+class Conversation(BaseModel):
+    id: int | None = None
+    company_id: str
+    title: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
 class TeamMember(BaseModel):
     """A person the system can notify or assign work to."""
 
@@ -219,3 +266,94 @@ class TeamMember(BaseModel):
     skills: list[str] = Field(default_factory=list)
     max_open_issues: int = 3
     assignable: bool = True
+
+
+# --------------------------------------------------------------------------
+# Workflows — saved agentic plans (Phase 2).
+# --------------------------------------------------------------------------
+
+
+class WorkflowStep(BaseModel):
+    """One step of a compiled plan. ``tool``/``args`` map onto a tool the agent
+    already has, so a plan can never propose something the engine can't do.
+    ``requires_approval`` is decided at plan time from the tool + the profile;
+    it is advisory — the real brake is still act()'s gate at run time.
+
+    ``select`` makes a run_action step DYNAMIC: instead of a fixed
+    ``args.situation_id`` captured when the plan was written, the step targets
+    every currently-open situation matching the selector, resolved fresh at run
+    time. This is what lets a saved/scheduled workflow ("label all unassigned
+    bugs each morning") act on today's items, not the ones that happened to be
+    open the day it was planned. Selector keys are generic: ``rule`` (a
+    watcher/profile rule name) and/or ``severity``."""
+
+    tool: str
+    args: dict[str, Any] = Field(default_factory=dict)
+    description: str = ""  # plain-language "what this step does", for the review UI
+    requires_approval: bool = False
+    select: dict[str, Any] | None = None  # run-action fan-out target, resolved at run time
+    enabled: bool = True  # a disabled node is kept in the graph but skipped at run time
+
+
+class WorkflowTrigger(BaseModel):
+    """What starts a workflow — the n8n 'trigger node'. Three kinds:
+      manual   — a human hits Run. config: {}
+      schedule — a cron cadence.     config: {"cron": "0 9 * * *", "label": "every morning"}
+      event    — a raised situation matches. config: {"rule"?: str, "severity"?: str}
+    Only manual runs today; schedule + event runtimes land in the triggers-runtime
+    build. Storing the config now means the graph and the plan are already whole."""
+
+    type: str = "manual"  # manual | schedule | event
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+class Workflow(BaseModel):
+    id: int | None = None
+    company_id: str
+    name: str
+    goal: str  # the natural-language intent the plan was compiled from
+    steps: list[WorkflowStep] = Field(default_factory=list)
+    trigger: WorkflowTrigger = Field(default_factory=WorkflowTrigger)
+    enabled: bool = True
+    created_by: str = "ui"
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    last_run_at: datetime | None = None
+
+
+class WorkflowStepResult(BaseModel):
+    """What actually happened when a step ran — the honest receipt, distinct
+    from the plan's intent. ``status`` mirrors act()'s vocabulary for action
+    steps (executed | dry_run | pending_approval | recorded | failed) and is
+    "done"/"failed" for read/control steps."""
+
+    tool: str
+    args: dict[str, Any] = Field(default_factory=dict)
+    status: str
+    detail: str = ""
+    result: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkflowRun(BaseModel):
+    id: int | None = None
+    workflow_id: int
+    company_id: str
+    status: str = "running"  # planning | running | needs_approval | done | failed
+    trigger: str = "manual"  # manual | scheduled
+    step_results: list[WorkflowStepResult] = Field(default_factory=list)
+    summary: str = ""
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
+class WorkflowPlan(BaseModel):
+    """The planner's output before anything is saved or run: the proposed
+    trigger + steps plus any questions that must be answered first. A plan with
+    open ``clarifications`` is not runnable — it asks at creation time, when the
+    person has the context, rather than guessing (the question-budget rule)."""
+
+    goal: str
+    name: str  # a short suggested name for the workflow
+    trigger: WorkflowTrigger = Field(default_factory=WorkflowTrigger)
+    steps: list[WorkflowStep] = Field(default_factory=list)
+    clarifications: list[str] = Field(default_factory=list)

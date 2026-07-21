@@ -1,6 +1,6 @@
 COMPOSE ?= docker compose
 
-.PHONY: up ingest analyze test lint down logs psql boundary
+.PHONY: up seed ingest analyze test lint down logs psql boundary
 
 ## Bring up postgres+redis+api+worker+web, wait for health, run migrations.
 up:
@@ -11,10 +11,15 @@ up:
 	$(COMPOSE) exec -T postgres psql -U aios -d aios -c "\dt"
 	@echo "\nNow open http://localhost:3000 -> Connections -> connect a repo -> Sync -> Run analysis"
 
+## Seed profile rows from profiles/*.yaml. No mock events — connect a real
+## source (Connections tab, or POST /api/ingest/push) to see anything ingest.
+seed:
+	$(COMPOSE) exec -T api python scripts/seed.py
+
 ## Pull real events from every connected source onto the arq pipeline.
 ingest:
-	$(COMPOSE) exec -T api python -m verticals.software.ingest
-	$(COMPOSE) exec -T postgres psql -U aios -d aios -c "SELECT (SELECT count(*) FROM events) AS events, (SELECT count(*) FROM event_embeddings) AS embeddings, (SELECT count(*) FROM nodes) AS nodes, (SELECT count(*) FROM edges) AS edges;"
+	curl -s -X POST "http://localhost:8000/api/ingest?company_id=default"
+	$(COMPOSE) exec -T postgres psql -U aios -d aios -c "SELECT company_id, count(*) AS events FROM events GROUP BY 1;"
 
 ## Learn norms -> detect situations -> assemble briefs -> deliver.
 analyze:
@@ -29,7 +34,7 @@ test:
 
 lint:
 	$(COMPOSE) exec -T api ruff check .
-	$(COMPOSE) exec -T api mypy packages apps verticals
+	$(COMPOSE) exec -T api mypy packages apps
 
 down:
 	$(COMPOSE) down -v

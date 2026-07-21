@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+from apps.common.analysis import free_members
+from apps.common.context import recipients_for, routing_config
 from packages.core.deliver import _render, _route, deliver
 from packages.shared.schema import Brief, Evidence
-from verticals.software.alerting import free_engineers
-from verticals.software.config import NOTIFY_ROLES, recipients_for, routing_config
+from tests.conftest import SOFTWARE_PROFILE
+
+_NOTIFY_ROLES = SOFTWARE_PROFILE.moves["team"]["notify_roles"]
 
 _ROSTER = [
     {"id": "alice", "name": "Alice", "email": "alice@x.com", "roles": ["engineer"],
@@ -37,32 +40,32 @@ def _brief(severity: str = "high", assigned: str | None = "alice") -> Brief:
 # ------------------------------- availability -------------------------------
 
 
-def test_only_free_assignable_engineers_are_offered() -> None:
+def test_only_free_assignable_members_are_offered() -> None:
     workload = {"alice": 2, "bob": 1}  # alice is at capacity (2/2)
-    free = {m["id"] for m in free_engineers(_ROSTER, workload)}
+    free = {m["id"] for m in free_members(SOFTWARE_PROFILE, _ROSTER, workload)}
     assert free == {"bob"}, "alice is full, cara is not an engineer, dan is not assignable"
 
 
-def test_an_idle_engineer_is_offered_with_their_workload() -> None:
-    free = free_engineers(_ROSTER, {})
+def test_an_idle_member_is_offered_with_their_workload() -> None:
+    free = free_members(SOFTWARE_PROFILE, _ROSTER, {})
     assert {m["id"] for m in free} == {"alice", "bob"}
     assert next(m for m in free if m["id"] == "alice")["open_issues"] == 0
 
 
 def test_nobody_free_means_no_candidates() -> None:
-    assert free_engineers(_ROSTER, {"alice": 2, "bob": 3}) == []
+    assert free_members(SOFTWARE_PROFILE, _ROSTER, {"alice": 2, "bob": 3}) == []
 
 
 # -------------------------------- notification --------------------------------
 
 
 def test_pm_and_team_lead_are_the_recipients() -> None:
-    to = recipients_for(NOTIFY_ROLES, _ROSTER)
+    to = recipients_for(_NOTIFY_ROLES, _ROSTER)
     assert set(to) == {"bob@x.com", "cara@x.com"}, "team lead + PM, not plain engineers"
 
 
 def test_every_severity_routes_to_email() -> None:
-    cfg = routing_config(dry_run=True, roster=_ROSTER)
+    cfg = routing_config(SOFTWARE_PROFILE, dry_run=True, roster=_ROSTER)
     for severity in ("critical", "high", "medium", "low"):
         channel, recipients = _route(severity, cfg)
         assert channel == "email"
@@ -70,7 +73,7 @@ def test_every_severity_routes_to_email() -> None:
 
 
 def test_an_empty_roster_degrades_to_console_instead_of_dropping_the_brief() -> None:
-    cfg = routing_config(dry_run=True, roster=[])
+    cfg = routing_config(SOFTWARE_PROFILE, dry_run=True, roster=[])
     assert _route("high", cfg)[0] == "console"
 
 
@@ -80,7 +83,7 @@ def test_email_falls_back_to_console_when_nobody_is_listed() -> None:
 
 
 def test_dry_run_composes_the_mail_but_does_not_send_it() -> None:
-    receipt = deliver(_brief(), routing_config(dry_run=True, roster=_ROSTER))
+    receipt = deliver(_brief(), routing_config(SOFTWARE_PROFILE, dry_run=True, roster=_ROSTER))
     assert receipt.channel == "email"
     assert receipt.status == "dry_run"
 

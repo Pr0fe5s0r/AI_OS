@@ -1,8 +1,20 @@
 from __future__ import annotations
 
 import httpx
+from pydantic import BaseModel, Field
 
 SLACK_API = "https://slack.com/api"
+
+
+class SlackMessageRaw(BaseModel):
+    """What Slack's conversations.history guarantees per message."""
+
+    model_config = {"extra": "allow"}
+    ts: str
+    text: str = ""
+    user: str | None = None
+    thread_ts: str | None = None
+    reactions: list = Field(default_factory=list)
 
 
 class SlackConnector:
@@ -60,3 +72,10 @@ class SlackConnector:
             msg["_channel_id"] = channel_id
             out.append(msg)
         return out
+
+    async def backfill(self, since_days: int) -> list[dict]:
+        """Slack's `conversations.history` supports an `oldest` cursor for
+        real deep pagination; not wired up yet (this connector is a stub —
+        see the module docstring). Falls back to the same recent window
+        fetch_raw returns rather than pretending to walk history it can't."""
+        return await self.fetch_raw()

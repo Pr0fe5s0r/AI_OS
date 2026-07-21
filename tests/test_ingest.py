@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+from apps.common.context import build_source_config
 from packages.connectors.github import GitHubConnector
 from packages.core.ingest import ingest
 from packages.shared.schema import Event
-from verticals.software.config import _github_source_config
+from tests.conftest import INVENTORY_PROFILE, SOFTWARE_PROFILE
 
-# Fixtures live here (not in the app) — no mock connector, no seed data. These
-# are real GitHub REST payload shapes, so CI runs offline.
+# Fixtures live here (not in the app) — real GitHub REST payload shapes, so CI
+# runs offline. The mapping under test comes from the PROFILE, not from code.
 
-_SOURCE_CONFIG = _github_source_config("acme/web-store")
+_GITHUB_DEF = next(s for s in SOFTWARE_PROFILE.sources if s["source"] == "github")
+_SOURCE_CONFIG = build_source_config(SOFTWARE_PROFILE, _GITHUB_DEF, {"repo": "acme/web-store"})
 
 _ISSUE = {
     "number": 4821,
@@ -59,6 +61,23 @@ def test_ingest_detects_pull_request_and_merge_time() -> None:
     assert ev.type == "pull_request"
     assert ev.id == "gh-web-store-4830"
     assert ev.metadata["merged_at"] == "2026-07-10T14:12:00Z"
+
+
+def test_the_same_engine_ingests_a_purchase_order_under_the_other_profile() -> None:
+    """Two-profile proof at the normalizer level: same ingest(), different data."""
+    ops_def = next(s for s in INVENTORY_PROFILE.sources if s["source"] == "ops")
+    config = build_source_config(INVENTORY_PROFILE, ops_def, {})
+    ev = ingest(config, {
+        "ref": "PO-9", "kind": "purchase_order", "status": "open",
+        "occurred_at": "2026-07-01T08:00:00Z", "expected_at": "2026-07-08T08:00:00Z",
+        "title": "PO-9 restock widgets", "notes": "500 units",
+        "supplier": "Vendaco", "sku": "SKU-1", "quantity": 500,
+        "actor": {"id": "vendaco", "name": "Vendaco"},
+    })
+    assert ev.id == "ops-PO-9"
+    assert ev.company_id == "acme-inventory"
+    assert ev.type == "purchase_order"
+    assert ev.metadata["supplier"] == "Vendaco"
 
 
 def test_connector_is_token_aware(monkeypatch) -> None:

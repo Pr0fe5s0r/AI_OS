@@ -55,8 +55,13 @@ def _parse_ts(value: Any) -> datetime:
     return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
 
 
-def ingest(source_config: dict, raw_payload: dict) -> Event:
-    """Normalize a raw source payload into the unified Event schema."""
+def ingest(source_config: dict, raw_payload: dict, backfilled: bool = False) -> Event:
+    """Normalize a raw source payload into the unified Event schema.
+
+    ``backfilled`` is plumbing, not profile data: it says how THIS call was
+    invoked (a history walk vs. a live sync/webhook), never something a
+    profile mapping could know about its own raw payload.
+    """
     mapping = source_config["mapping"]
     ctx = source_config.get("context", {})
 
@@ -79,4 +84,5 @@ def ingest(source_config: dict, raw_payload: dict) -> Event:
         content=str(m("content", "")).strip() or f"(no content) {m('id')}",
         metadata={k: _resolve(v, raw_payload, ctx) for k, v in mapping.get("metadata", {}).items()},
         raw=raw_payload,
+        backfilled=backfilled,
     )

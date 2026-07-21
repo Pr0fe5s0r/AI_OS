@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from packages.core.act import _execute
+from sqlalchemy import text
+
+from apps.common.analysis import default_argument, params_for_move
+from packages.core.act import _execute, act, open_action_id
+from packages.core.db import Session
 from packages.shared.schema import ActionRequest, Evidence, Situation
-from verticals.software.alerting import _default_argument, _params_for
+from tests.conftest import SOFTWARE_PROFILE
 
 _REQ = ActionRequest(
     company_id="test-act",
@@ -27,12 +31,32 @@ async def test_http_action_is_not_sent_when_dry_run() -> None:
     assert result["would_send"]["body"] == {"body": "hi"}
 
 
-async def test_log_action_executes() -> None:
+async def test_a_log_action_is_reported_as_recorded_not_executed() -> None:
+    """A `log` move reaches no external system. Reporting "executed" with the
+    template as the detail made a button labelled "page engineer" look like
+    somebody had actually been paged — the runtime must not imply an effect
+    it never had."""
     entry = {"kind": "log", "template": "PAGE about {repo}"}
     status, detail, result = await _execute(entry, _REQ, {"dry_run": True})
-    assert status == "executed"
-    assert detail == "PAGE about acme/web"
-    assert result["logged"] == "PAGE about acme/web"
+
+    assert status == "recorded", "a log move did not contact anything"
+    assert "no external system was contacted" in detail
+    assert result["external_effect"] is False
+    assert result["logged"] == "PAGE about acme/web"  # the intent is still captured
+
+
+def test_only_http_moves_claim_an_external_effect() -> None:
+    """The Feed labels a move by whether it really reaches outside. Every
+    `log` move in every shipped profile must be marked as having no external
+    effect, so no button can imply something it does not do."""
+    from tests.conftest import INVENTORY_PROFILE
+
+    for profile in (SOFTWARE_PROFILE, INVENTORY_PROFILE):
+        registry = profile.moves.get("registry", {}) or {}
+        for name, entry in registry.items():
+            external = entry.get("kind") == "http"
+            if entry.get("kind") == "log":
+                assert not external, f"{name} is a log move and must not claim an external effect"
 
 
 async def test_unknown_kind_fails_cleanly() -> None:
@@ -73,10 +97,73 @@ def _sit() -> Situation:
     )
 
 
+_ESCALATE_REGISTRY = {"page_engineer": {"kind": "log", "approval_required": True, "template": "PAGE {situation_id}"}}
+
+
+async def test_pending_approval_is_not_duplicated_across_repeated_passes() -> None:
+    """The bug: the watcher engine re-runs every 5 min, so an unchanged
+    escalation re-proposed each pass stacked up dozens of identical approval
+    cards. A pending ask must be reused, never re-queued."""
+    company = "test-act-dedupe"
+    async with Session() as session:
+        await session.execute(text("DELETE FROM actions WHERE company_id = :c"), {"c": company})
+        await session.commit()
+
+    def _req() -> ActionRequest:
+        return ActionRequest(
+            company_id=company, action="page_engineer",
+            params={"situation_id": "broken_rhythm:m:gh-1", "argument": "wake up"},
+            situation_id="broken_rhythm:m:gh-1", requested_by="ai",
+        )
+
+    async with Session() as session:
+        first = await act({"session": session}, _req(), _ESCALATE_REGISTRY, {"dry_run": True})
+        second = await act({"session": session}, _req(), _ESCALATE_REGISTRY, {"dry_run": True})
+        third = await act({"session": session}, _req(), _ESCALATE_REGISTRY, {"dry_run": True})
+        await session.commit()
+
+    assert first.status == "pending_approval"
+    assert second.id == first.id and third.id == first.id  # all reuse the one ask
+
+    async with Session() as session:
+        n = (
+            await session.execute(
+                text(
+                    "SELECT count(*) FROM actions WHERE company_id = :c "
+                    "AND situation_id = :s AND status = 'pending_approval'"
+                ),
+                {"c": company, "s": "broken_rhythm:m:gh-1"},
+            )
+        ).scalar_one()
+    assert n == 1, "exactly one pending approval, not three"
+
+
+async def test_open_action_id_finds_only_matching_status() -> None:
+    company = "test-act-open"
+    async with Session() as session:
+        await session.execute(text("DELETE FROM actions WHERE company_id = :c"), {"c": company})
+        req = ActionRequest(
+            company_id=company, action="page_engineer", params={},
+            situation_id="sit-1", requested_by="ai",
+        )
+        result = await act({"session": session}, req, _ESCALATE_REGISTRY, {"dry_run": True})
+        await session.commit()
+        assert result.status == "pending_approval"
+
+        found = await open_action_id(session, company, "sit-1", "page_engineer", ("pending_approval",))
+        assert found == result.id
+        # a status the row doesn't have -> no match
+        assert await open_action_id(session, company, "sit-1", "page_engineer", ("executed",)) is None
+        # a different situation -> no match
+        assert await open_action_id(session, company, "sit-2", "page_engineer", ("pending_approval",)) is None
+
+
 def test_a_ui_button_gets_the_params_its_action_needs() -> None:
-    """The Flags buttons only know a situation. The vertical must fill in the rest."""
+    """The Flags buttons only know a situation. The profile's move spec fills
+    in the rest — repo/number from the evidence URL, body from the template."""
     situation = _sit()
-    params = _params_for("comment_on_pr", _default_argument("comment_on_pr", situation), situation)
+    argument = default_argument(SOFTWARE_PROFILE, "comment_on_pr", situation)
+    params = params_for_move(SOFTWARE_PROFILE, "comment_on_pr", argument, situation)
     assert params is not None
     assert params["repo"] == "karthikeyan846/Chatbot" and params["number"] == "4"
     # the comment lands ON the existing issue and carries the whole analysis

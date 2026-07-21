@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -8,18 +9,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packages.shared.schema import Event
 
 # Append-only, month-partitioned events table (created by the migration).
-# store_event() and store_embedding() are separate so an event lands even if
-# embedding later fails (the pipeline embeds in a second, retryable job).
+# Postgres is the system of record for event CONTENT; the embedding lives on
+# the Neo4j :Event mirror (see core.graph), written by a retryable second job.
 
 _INSERT_EVENT = text(
     """
     INSERT INTO events
         (id, company_id, source, type, actor_id, actor_name, actor_email,
-         timestamp, content, metadata, raw, content_tsv)
+         timestamp, content, metadata, raw, content_tsv, backfilled)
     VALUES
         (:id, :company_id, :source, :type, :actor_id, :actor_name, :actor_email,
          :timestamp, :content, CAST(:metadata AS jsonb), CAST(:raw AS jsonb),
-         to_tsvector('english', :content))
+         to_tsvector('english', :content), :backfilled)
     ON CONFLICT (id, timestamp) DO UPDATE SET
         source      = EXCLUDED.source,
         type        = EXCLUDED.type,
@@ -30,21 +31,11 @@ _INSERT_EVENT = text(
         metadata    = EXCLUDED.metadata,
         raw         = EXCLUDED.raw,
         content_tsv = EXCLUDED.content_tsv
+        -- backfilled is deliberately NOT overwritten: it records how the
+        -- event was FIRST ingested, so a re-sync can never quietly relabel
+        -- a real live event as backfilled (or vice versa)
     """
 )
-
-_INSERT_EMBEDDING = text(
-    """
-    INSERT INTO event_embeddings (event_id, embedding)
-    VALUES (:event_id, CAST(:embedding AS vector))
-    ON CONFLICT (event_id) DO UPDATE SET embedding = EXCLUDED.embedding
-    """
-)
-
-
-def _to_vector_literal(embedding: list[float]) -> str:
-    return "[" + ",".join(repr(float(x)) for x in embedding) + "]"
-
 
 async def store_event(session: AsyncSession, event: Event) -> None:
     await session.execute(
@@ -61,25 +52,9 @@ async def store_event(session: AsyncSession, event: Event) -> None:
             "content": event.content,
             "metadata": json.dumps(event.metadata),
             "raw": json.dumps(event.raw),
+            "backfilled": event.backfilled,
         },
     )
-
-
-async def store_embedding(
-    session: AsyncSession, event_id: str, embedding: list[float]
-) -> None:
-    await session.execute(
-        _INSERT_EMBEDDING,
-        {"event_id": event_id, "embedding": _to_vector_literal(embedding)},
-    )
-
-
-async def insert_event(
-    session: AsyncSession, event: Event, embedding: list[float]
-) -> None:
-    """Convenience: store an event and its embedding together (used by tests)."""
-    await store_event(session, event)
-    await store_embedding(session, event.id, embedding)
 
 
 async def get_event(session: AsyncSession, company_id: str, event_id: str) -> Event | None:
@@ -90,7 +65,7 @@ async def get_event(session: AsyncSession, company_id: str, event_id: str) -> Ev
             text(
                 """
                 SELECT id, company_id, source, type, actor_id, actor_name, actor_email,
-                       timestamp, content, metadata, raw
+                       timestamp, content, metadata, raw, backfilled
                 FROM events WHERE company_id = :c AND id = :i LIMIT 1
                 """
             ),
@@ -99,6 +74,37 @@ async def get_event(session: AsyncSession, company_id: str, event_id: str) -> Ev
     ).first()
     if row is None:
         return None
+    return _row_to_event(row, Actor)
+
+
+async def get_events_by_ids(
+    session: AsyncSession, company_id: str, event_ids: list[str]
+) -> list[Event]:
+    """Batch form of get_event — one query, not N.
+
+    The graph mirror stores ids only, so any screen showing graph nodes with
+    their real content needs exactly this join back to the system of record.
+    """
+    from packages.shared.schema import Actor
+
+    if not event_ids:
+        return []
+    rows = (
+        await session.execute(
+            text(
+                """
+                SELECT id, company_id, source, type, actor_id, actor_name, actor_email,
+                       timestamp, content, metadata, raw, backfilled
+                FROM events WHERE company_id = :c AND id = ANY(:ids)
+                """
+            ),
+            {"c": company_id, "ids": list(event_ids)},
+        )
+    ).all()
+    return [_row_to_event(r, Actor) for r in rows]
+
+
+def _row_to_event(row: Any, actor_cls: Any) -> Event:
     md = row.metadata if isinstance(row.metadata, dict) else json.loads(row.metadata)
     raw = row.raw if isinstance(row.raw, dict) else json.loads(row.raw)
     return Event(
@@ -106,9 +112,10 @@ async def get_event(session: AsyncSession, company_id: str, event_id: str) -> Ev
         company_id=row.company_id,
         source=row.source,
         type=row.type,
-        actor=Actor(id=row.actor_id, name=row.actor_name, email=row.actor_email),
+        actor=actor_cls(id=row.actor_id, name=row.actor_name, email=row.actor_email),
         timestamp=row.timestamp,
         content=row.content,
         metadata=md or {},
         raw=raw or {},
+        backfilled=row.backfilled,
     )

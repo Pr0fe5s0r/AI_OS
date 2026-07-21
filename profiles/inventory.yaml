@@ -1,0 +1,251 @@
+# ============================================================================
+# Domain profile: INVENTORY / SUPPLY OPS. Same seven-slot schema as
+# software.yaml, different values — proving the engine is generic.
+# Events arrive via the generic `push` source (POST /api/ingest/push).
+# ============================================================================
+company_id: acme-inventory
+name: Acme Inventory Ops
+
+# ---------------------------------------------------------------- 1. sources
+sources:
+  - source: ops
+    kind: push
+    mapping:
+      id: {template: "ops-{ref}"}
+      type: {path: kind, default: event}
+      actor_id: {path: actor.id, default: unknown}
+      actor_name: {path: actor.name, default: unknown}
+      timestamp: {path: occurred_at}
+      content:
+        concat:
+          - {path: title, default: ""}
+          - {const: "\n\n"}
+          - {path: notes, default: ""}
+      metadata:
+        ref: {path: ref}
+        status: {path: status}
+        supplier: {path: supplier}
+        sku: {path: sku}
+        quantity: {path: quantity}
+        expected_at: {path: expected_at}
+        delivered_at: {path: delivered_at}
+        warehouse: {path: warehouse}
+
+# ---------------------------------------------------------------- 2. things
+things:
+  types:
+    - {name: PurchaseOrder, source: ops, event_type: purchase_order}
+    - {name: Delivery, source: ops, event_type: delivery}
+    - {name: StockCount, source: ops, event_type: stock_count}
+    - {name: SupplierNote, source: ops, event_type: supplier_message}
+  default_type: Event
+  status_field: status
+  actor_thing: {type: Contact}
+  entity_rules:
+    # PO refs are identity; SKU codes deliberately are NOT (two orders for the
+    # same SKU are different orders — a shared SKU must never imply FULFILLS)
+    id_patterns: ['\bPO-\d+\b']
+    similarity_hard: 0.70
+    similarity_soft: 0.60
+    candidate_limit: 25
+    keyword_rules:
+      - name: cold-chain
+        any: [refrigerated, cold chain, temperature, spoilage, perishable]
+
+# ---------------------------------------------------------------- 3. links
+links:
+  types: [AUTHORED, FULFILLS, MENTIONS, SAME_AS, DELAYED_BY]
+  same_as: SAME_AS
+  mentions: MENTIONS
+  authored: AUTHORED
+  closes:
+    type: FULFILLS
+    when:
+      source_thing: Delivery
+      content_pattern: '\b(delivered|received|fulfill(?:s|ed)?|arrived)\b'
+      target_types: [PurchaseOrder]
+
+# ---------------------------------------------------------------- 4. rhythms
+rhythms:
+  - {name: po_fulfillment_hours, unit: hours, window_days: 180,
+     source: ops, type: purchase_order, end_field: delivered_at}
+  - {name: supplier_reply_hours, unit: hours, window_days: 90,
+     source: ops, type: supplier_message, end_field: delivered_at}
+
+# ---------------------------------------------------------------- 5. watchers
+watchers:
+  - name: overdue_po
+    title: Purchase order past its expected date
+    severity: high
+    select:
+      source: ops
+      type: purchase_order
+      where:
+        - {field: metadata.status, op: eq, value: open}
+        - {field: metadata.expected_at, op: older_than_days, value: 0}
+    llm: true
+    prompt: overdue_po
+    limit: 5
+  - name: low_stock
+    title: Stock below reorder point
+    severity: critical
+    select:
+      source: ops
+      type: stock_count
+      where:
+        - {field: metadata.quantity, op: lt, value: 10}
+    llm: true
+    prompt: low_stock
+    limit: 5
+  - name: po_slower_than_normal
+    title: PO open far longer than this supplier's normal
+    severity: high
+    select:
+      source: ops
+      type: purchase_order
+      where:
+        - {field: metadata.status, op: eq, value: open}
+    norm: {metric: po_fulfillment_hours, k: 2.0}
+    llm: true
+    prompt: overdue_po
+    limit: 3
+  - name: unfulfilled_po
+    title: Purchase order with no linked delivery
+    severity: medium
+    graph: {thing_type: PurchaseOrder, missing_link_type: FULFILLS}
+    llm: false
+    recommended_action: Chase the supplier for a delivery confirmation.
+    limit: 5
+
+# ---------------------------------------------------------------- 6. moves
+moves:
+  registry:
+    notify_supplier:
+      kind: log
+      approval_required: false
+      template: "NOTIFY supplier about {situation_id}"
+      argument: "what to tell the supplier"
+    draft_reply:
+      kind: log
+      approval_required: false
+      template: "DRAFT reply prepared for {situation_id}"
+      argument: "the reply text"
+    reorder_stock:
+      kind: log
+      approval_required: true
+      template: "REORDER stock for {situation_id}"
+      argument: "SKU and quantity to reorder"
+    escalate_purchasing:
+      kind: log
+      approval_required: true
+      template: "ESCALATE to purchasing lead: {situation_id}"
+      argument: "why purchasing must decide now"
+  autonomy:
+    enabled: true
+    min_confidence: 0.7
+    escalate_severities: [critical]
+    # escalate_purchasing is the fallback only, never a normal choice — see
+    # the note in software.yaml. reorder_stock spends real money, so it stays
+    # approval_required even though the AI may propose it.
+    allowed_actions: [notify_supplier, draft_reply, reorder_stock]
+    assignment_requires_human: false
+    escalation_action: escalate_purchasing
+    max_actions_per_run: 5
+  approval_defaults: {default_require_approval: false, dry_run: true}
+  team:
+    roles: [ops_manager, buyer, warehouse]
+    notify_roles: [ops_manager]
+    assignable_role: buyer
+    workload:
+      source: ops
+      type: purchase_order
+      state_field: status
+      state_value: open
+      assignee_field: assignee
+
+# ------------------------------------------------------------ 7. vocabulary
+vocabulary:
+  terms:
+    thing: order
+    situation: supply risk
+    actor: supplier
+    workspace: warehouse
+  briefing_policy:
+    - mode: waiting_for_signal
+      when: [{field: events, op: eq, value: 0}]
+      headline: No inventory signals yet.
+      next_best_action: Push purchase orders, deliveries and stock counts into the ops feed.
+    - mode: needs_human
+      when: [{field: pending_approvals, op: gt, value: 0}]
+      headline: "{pending_approvals} purchasing action{pending_approvals_s} waiting for approval."
+      next_best_action: Approve or reject the prepared reorder.
+    - mode: triage_now
+      when: [{field: high_risk, op: gt, value: 0}]
+      headline: "{high_risk} supply risk{high_risk_s} need attention."
+      next_best_action: Review overdue orders and low stock.
+    - mode: monitoring
+      when: []
+      headline: Supply chain is inside its normal rhythm.
+      next_best_action: Keep monitoring deliveries against expected dates.
+  prompts:
+    overdue_po: |
+      You monitor supply risk for an inventory operation.
+      A purchase order is past its expected delivery date (or far slower than this supplier's norm).
+
+      Source: {source}
+      Supplier contact: {actor}
+      Order details:
+      {content}
+
+      Metadata: {metadata}
+      Supply norms: {norms}
+
+      Judge how serious the delay is for stock availability, summarize in two sentences, and recommend one concrete action (chase, reorder elsewhere, or escalate).
+    low_stock: |
+      You monitor stock levels for an inventory operation.
+      A stock count came in below the reorder point.
+
+      Source: {source}
+      Reported by: {actor}
+      Count details:
+      {content}
+
+      Metadata: {metadata}
+      Supply norms: {norms}
+
+      Judge how urgent the shortage is, summarize in two sentences, and recommend one concrete action naming the SKU and quantity.
+    choose_assignee: |
+      You assign purchasing work for an inventory team.
+      A supply risk needs an owner. Pick the single best person from the AVAILABLE buyers below — they all have spare capacity right now.
+
+      Situation: {title}
+      Severity: {severity}
+      Summary: {summary}
+
+      Evidence:
+      {evidence}
+
+      Available buyers (id, name, roles, skills, current workload / capacity):
+      {candidates}
+
+      Match the work to skills, and prefer whoever has the lightest workload. Answer with that person's id. Answer 'none' only if nobody listed can plausibly do this work.
+      Set confidence between 0 and 1.
+    choose_action: |
+      You are the autonomous operator of an inventory workspace.
+      A supply risk has been detected. Decide the single best action to resolve it.
+
+      Situation: {title}
+      Severity: {severity}
+      Summary: {summary}
+      Prior recommendation: {recommended_action}
+
+      Evidence:
+      {evidence}
+
+      You may choose exactly one of these actions: {actions}
+
+      Meaning of each action and what `argument` must contain:
+      {action_help}
+
+      Prefer the smallest reversible action that moves the work forward. Choose 'escalate' ONLY if a human judgement call is genuinely required and no action above is safe.
+      Set confidence between 0 and 1: how sure you are this is the right action.

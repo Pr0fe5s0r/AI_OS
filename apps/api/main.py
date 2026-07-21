@@ -1,67 +1,130 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import os
+from contextlib import asynccontextmanager
+from datetime import datetime
+from urllib.parse import quote
 
+from arq import create_pool
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from sqlalchemy import text
 
-from packages.core import audit
-from packages.core.act import decide, list_actions
-from packages.core.briefing import build_briefing
-from packages.core.credentials import delete_credential, list_connections, save_credential
-from packages.core.db import Session
-from packages.core.graph import query_graph
-from packages.core.norms import get_norms
-from packages.core.search import search
-from packages.core.settings import set_setting
-from packages.core.situations import get_situation, list_situations
-from packages.core.tenancy import company_scope
-from packages.core.tickets import close_ticket, get_ticket, list_tickets
-from packages.core.tokens import consume_token, peek_token
-from packages.core.webhooks import verify_signature
-from packages.core.workload import open_workload
-from packages.shared.schema import TeamMember
-from verticals.software.alerting import (
+from apps.common.analysis import (
     ASSIGN_PURPOSE,
     accept_assignment,
     complete_ticket,
-    free_engineers,
+    free_members,
     propose_assignment,
     request_action,
     run_analysis,
 )
-from verticals.software.config import (
-    ACTION_REGISTRY,
-    ASSIGNABLE_ROLE,
-    AUTONOMY_POLICY,
-    BRIEFING_POLICY,
-    COMPANY_ID,
+from apps.common.assistant_tools import answer
+from apps.common.clarifications import resolve_clarification
+from apps.common.context import (
     DRY_RUN_KEY,
-    GRAPH_SCHEMA,
-    NOTIFY_ROLES,
-    TEAM_ROLES,
-    WORKLOAD_SPEC,
+    ProfileNotFound,
     approval_policy,
+    get_profile,
     save_team_roster,
+    seed_all_profiles,
     team_roster,
 )
-from verticals.software.ingest import trigger_ingest
-from verticals.software.webhooks import (
-    EVENT_HEADER,
-    SIGNATURE_HEADER,
-    handle_github_webhook,
+from apps.common.discovery_flow import (
+    confirm_proposed,
+    list_versions,
+    propose_from_connector,
 )
+from apps.common.feed_stream import CHANNEL as FEED_CHANNEL
+from apps.common.ingestion import push_events, trigger_backfill, trigger_ingest
+from apps.common.understanding import describe
+from apps.common.webhooks import handle_github_webhook
+from apps.common.workflows_flow import (
+    apps_used,
+    edit_workflow,
+    plan_workflow,
+    run_workflow,
+    step_app,
+)
+from packages.connectors.base import (
+    SUPPORTED_SOURCES,
+    list_oauth_targets,
+    oauth_provider_for,
+)
+from packages.connectors.github import EVENT_HEADER, SIGNATURE_HEADER
+from packages.core import audit, graph
+from packages.core import connector_health as ch
+from packages.core import workflows as wf
+from packages.core.act import decide, list_actions
+from packages.core.briefing import build_briefing
+from packages.core.conversations import (
+    add_message,
+    get_or_create_default_conversation,
+    list_messages,
+)
+from packages.core.credentials import (
+    delete_credential,
+    get_credential,
+    list_connections,
+    save_credential,
+)
+from packages.core.db import Session
+from packages.core.erasure import (
+    confirm_deletion_request,
+    create_deletion_request,
+    get_latest_deletion_request,
+)
+from packages.core.items import item_facets, list_items
+from packages.core.norms import get_norms, norm_evidence, reset_norms
+from packages.core.oauth import OAuthError, authorize_url, exchange_code
+from packages.core.pipeline import redis_settings
+from packages.core.profile import Profile, load_profile, save_profile, set_source_enabled
+from packages.core.search import search
+from packages.core.settings import set_setting
+from packages.core.situations import (
+    ack_situation,
+    dismiss_situation,
+    get_situation,
+    list_situations,
+)
+from packages.core.store import get_events_by_ids
+from packages.core.tenancy import company_scope
+from packages.core.tickets import close_ticket, get_ticket, list_tickets
+from packages.core.tokens import consume_token, issue_token, peek_token
+from packages.core.webhooks import verify_signature
+from packages.core.workload import open_workload
+from packages.shared.schema import TeamMember, WorkflowStep, WorkflowTrigger
 
-app = FastAPI(title="AI OS")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Graph constraints/indexes/vector index are created idempotently on every
+    # boot; profile seeds land once (idempotent by content).
+    await graph.bootstrap()
+    async with Session() as session:
+        seeded = await seed_all_profiles(session)
+        await session.commit()
+    print(f"profiles ready: {', '.join(seeded) or 'none'}")
+    yield
+    await graph.close_driver()
+
+
+app = FastAPI(title="MarkOS", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
 
-SUPPORTED = ("github", "slack", "zendesk")
+
+async def profile_scope(company_id: str = Depends(company_scope)) -> Profile:
+    """Load the company's confirmed profile — the only door for domain data."""
+    async with Session() as session:
+        try:
+            return await get_profile(session, company_id)
+        except ProfileNotFound as exc:
+            raise HTTPException(404, str(exc)) from exc
 
 
 @app.get("/api/health")
@@ -73,7 +136,7 @@ async def health() -> dict[str, str]:
 
 
 @app.post("/api/webhooks/github")
-async def github_webhook(request: Request) -> dict:
+async def github_webhook(request: Request, company_id: str = Query("default")) -> dict:
     """Event-driven entry: GitHub pushes issue/PR changes the moment they happen.
 
     The body must be signed with GITHUB_WEBHOOK_SECRET — this URL is public, and
@@ -98,9 +161,10 @@ async def github_webhook(request: Request) -> dict:
         raise HTTPException(400, "body is not JSON") from exc
 
     async with Session() as session:
-        result = await handle_github_webhook(session, event_type, payload)
+        profile = await get_profile(session, company_id)
+        result = await handle_github_webhook(session, profile, event_type, payload)
         await audit.record(
-            session, COMPANY_ID, "github-webhook", "webhook.received",
+            session, company_id, "github-webhook", "webhook.received",
             target=event_type, metadata=result,
         )
         await session.commit()
@@ -111,10 +175,15 @@ async def github_webhook(request: Request) -> dict:
 
 
 @app.get("/api/briefing")
-async def briefing(company_id: str = Depends(company_scope)) -> dict:
-    """Workspace briefing: generic state summary + the vertical's briefing policy."""
+async def briefing(
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+) -> dict:
+    """Workspace briefing: generic state summary + the profile's briefing policy."""
     async with Session() as session:
-        return await build_briefing(session, company_id, BRIEFING_POLICY)
+        return await build_briefing(
+            session, company_id, profile.vocabulary.get("briefing_policy", [])
+        )
 
 
 # --------------------- One-click email actions + tickets ---------------------
@@ -132,15 +201,15 @@ def _page(title: str, body: str, tone: str = "#1f883d") -> HTMLResponse:
 
 @app.get("/api/act/{token}", response_class=HTMLResponse)
 async def confirm_email_action(token: str) -> HTMLResponse:
-    """Rendered when the PM clicks the link. Does NOT consume the token — mail
-    scanners pre-fetch links, and a GET must never change anything."""
+    """Rendered when the approver clicks the link. Does NOT consume the token —
+    mail scanners pre-fetch links, and a GET must never change anything."""
     async with Session() as session:
         payload = await peek_token(session, token, ASSIGN_PURPOSE)
     if payload is None:
         return _page("Link expired", "<p>This link is invalid, already used, or expired.</p>", "#d1242f")
     return _page(
         "Confirm assignment",
-        f"""<p>Assign <b>{payload['repo']}#{payload['number']}</b> to
+        f"""<p>Assign <b>{payload.get('item_label', 'this work')}</b> to
             <b>{payload['assignee']}</b>?</p>
         <p style="color:#57606a;font-size:13px">{payload.get('title','')}</p>
         <form method="post" action="/api/act/{token}">
@@ -154,28 +223,29 @@ async def confirm_email_action(token: str) -> HTMLResponse:
 
 @app.post("/api/act/{token}", response_class=HTMLResponse)
 async def perform_email_action(token: str) -> HTMLResponse:
-    """Burns the single-use token, assigns on GitHub, and opens a ticket."""
+    """Burns the single-use token, runs the profile's assign move, opens a ticket."""
     async with Session() as session:
         payload = await consume_token(session, token, ASSIGN_PURPOSE, used_by="email-link")
         if payload is None:
             await session.commit()
             return _page("Link expired", "<p>This link is invalid, already used, or expired.</p>", "#d1242f")
         company_id = payload["company_id"]
-        result = await accept_assignment(session, payload, company_id, clicked_by="project_manager")
+        profile = await get_profile(session, company_id)
+        result = await accept_assignment(session, profile, payload, clicked_by="approver")
         await audit.record(
-            session, company_id, "project_manager", "assignment.accepted",
+            session, company_id, "approver", "assignment.accepted",
             target=payload["assignee"], metadata={"ticket_id": result["ticket_id"],
                                                   "situation_id": payload["situation_id"]},
         )
         await session.commit()
 
-    note = "" if not result["dry_run"] else "<p style='color:#bf8700'>Practice mode: GitHub was not updated.</p>"
+    note = "" if not result["dry_run"] else "<p style='color:#bf8700'>Practice mode: nothing external was updated.</p>"
     return _page(
         "Assigned",
         f"""<p><b>{result['assignee']}</b> now owns
-            <b>{payload['repo']}#{payload['number']}</b>.</p>
+            <b>{payload.get('item_label', 'this work')}</b>.</p>
         <p>Ticket <b>#{result['ticket_id']}</b> was created for them.</p>
-        <p style="color:#57606a;font-size:13px">GitHub: {result['assign_status']} - {result['detail']}</p>
+        <p style="color:#57606a;font-size:13px">Source: {result['assign_status']} - {result['detail']}</p>
         {note}""",
     )
 
@@ -195,8 +265,9 @@ async def finish_ticket(
     ticket_id: int,
     payload: dict = Body(default={}),
     company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
 ) -> dict:
-    """The assignee finished. Close the ticket, then close the GitHub issue."""
+    """The assignee finished. Close the ticket, then close the source item."""
     by = str(payload.get("by") or "assignee")
     async with Session() as session:
         ticket = await get_ticket(session, company_id, ticket_id)
@@ -206,23 +277,27 @@ async def finish_ticket(
             raise HTTPException(400, "ticket already closed")
 
         closed = await close_ticket(session, company_id, ticket_id)
-        github = await complete_ticket(session, ticket, company_id, by)
+        source = await complete_ticket(session, profile, ticket, by)
         await audit.record(session, company_id, by, "ticket.closed", target=str(ticket_id),
-                           metadata={"github": github["github"]})
+                           metadata={"source": source["source"]})
         await session.commit()
-    return {"ticket": closed.model_dump(mode="json") if closed else None, "github": github}
+    return {"ticket": closed.model_dump(mode="json") if closed else None, "source": source}
 
 
 # ------------------------------- Team --------------------------------
 
 
 @app.get("/api/team")
-async def get_team(company_id: str = Depends(company_scope)) -> dict:
+async def get_team(
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+) -> dict:
     """The roster, annotated with each person's live workload and availability."""
+    team = profile.moves.get("team", {}) or {}
     async with Session() as session:
         roster = await team_roster(session, company_id)
-        workload = await open_workload(session, company_id, WORKLOAD_SPEC)
-    free = {m["id"] for m in free_engineers(roster, workload)}
+        workload = await open_workload(session, company_id, team.get("workload", {}))
+    free = {m["id"] for m in free_members(profile, roster, workload)}
     members = [
         {
             **m,
@@ -233,24 +308,24 @@ async def get_team(company_id: str = Depends(company_scope)) -> dict:
     ]
     return {
         "members": members,
-        "roles": TEAM_ROLES,
-        "notify_roles": NOTIFY_ROLES,
-        "assignable_role": ASSIGNABLE_ROLE,
+        "roles": team.get("roles", []),
+        "notify_roles": team.get("notify_roles", []),
+        "assignable_role": team.get("assignable_role", ""),
     }
 
 
-def _validate_member(payload: dict) -> dict:
+def _validate_member(payload: dict, roles: list[str]) -> dict:
     try:
         member = TeamMember(**payload)
     except Exception as exc:
         raise HTTPException(400, f"invalid member: {exc}") from exc
     if "@" not in member.email:
         raise HTTPException(400, "email must be a real address")
-    unknown = [r for r in member.roles if r not in TEAM_ROLES]
+    unknown = [r for r in member.roles if r not in roles]
     if unknown:
-        raise HTTPException(400, f"unknown role(s): {unknown}. allowed: {TEAM_ROLES}")
+        raise HTTPException(400, f"unknown role(s): {unknown}. allowed: {roles}")
     if not member.roles:
-        raise HTTPException(400, f"give the member at least one role: {TEAM_ROLES}")
+        raise HTTPException(400, f"give the member at least one role: {roles}")
     if member.max_open_issues < 1:
         raise HTTPException(400, "max_open_issues must be at least 1")
     return member.model_dump()
@@ -260,12 +335,14 @@ def _validate_member(payload: dict) -> dict:
 async def upsert_member(
     payload: dict = Body(...),
     company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
 ) -> dict:
-    member = _validate_member(payload)
+    roles = (profile.moves.get("team", {}) or {}).get("roles", [])
+    member = _validate_member(payload, roles)
     async with Session() as session:
         roster = await team_roster(session, company_id)
         roster = [m for m in roster if m["id"] != member["id"]] + [member]
-        await save_team_roster(session, roster, company_id)
+        await save_team_roster(session, company_id, roster)
         await audit.record(session, company_id, "ui", "team.member.saved",
                            target=member["id"], metadata={"roles": member["roles"]})
         await session.commit()
@@ -279,7 +356,7 @@ async def remove_member(member_id: str, company_id: str = Depends(company_scope)
         if not any(m["id"] == member_id for m in roster):
             raise HTTPException(404, f"no team member {member_id!r}")
         roster = [m for m in roster if m["id"] != member_id]
-        await save_team_roster(session, roster, company_id)
+        await save_team_roster(session, company_id, roster)
         await audit.record(session, company_id, "ui", "team.member.removed", target=member_id)
         await session.commit()
     return {"members": roster}
@@ -289,20 +366,156 @@ async def remove_member(member_id: str, company_id: str = Depends(company_scope)
 
 
 @app.get("/api/connections")
-async def get_connections(company_id: str = Depends(company_scope)) -> dict:
+async def get_connections(
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+) -> dict:
+    supported = [s["source"] for s in profile.sources if s.get("kind") == "connector"]
     async with Session() as session:
         conns = await list_connections(session, company_id)
     connected = {c.source: c for c in conns}
+    def _oauth_state(source: str) -> dict:
+        """Whether this source offers "sign in with…" — asked of the connector
+        registry, so the UI never hardcodes which tools have OAuth."""
+        provider = oauth_provider_for(source)
+        return {
+            "oauth": provider is not None,
+            # configured=False means the operator hasn't registered an OAuth
+            # app yet; the UI falls back to the token field and says why
+            "oauth_configured": bool(provider and provider.configured),
+        }
+
     return {
         "connections": [
             {
                 "source": s,
                 "connected": s in connected,
                 "config": connected[s].config if s in connected else {},
+                **_oauth_state(s),
             }
-            for s in SUPPORTED
+            for s in supported
         ]
     }
+
+
+# ------------------------------ OAuth connect ------------------------------
+# "Sign in with GitHub" instead of pasting a Personal Access Token. The token
+# lands in exactly the same sealed credential store a pasted one does, so
+# nothing downstream changes.
+
+OAUTH_PURPOSE = "oauth_state"
+_OAUTH_STATE_TTL_MINUTES = 10
+
+
+def _oauth_redirect_uri(source: str) -> str:
+    """Where the provider sends the human back. Must byte-match the callback
+    URL registered on the provider's side."""
+    return f"{os.getenv('PUBLIC_BASE_URL', 'http://localhost:8000').rstrip('/')}/api/oauth/{source}/callback"
+
+
+def _web_url(params: str = "") -> str:
+    """A FIXED destination for post-callback redirects. Deliberately not taken
+    from a query parameter — echoing a caller-supplied URL here is exactly how
+    an OAuth callback becomes an open redirect."""
+    return f"{os.getenv('WEB_BASE_URL', 'http://localhost:3000').rstrip('/')}/{params}"
+
+
+def _oauth_provider_or_400(source: str):
+    provider = oauth_provider_for(source)
+    if provider is None:
+        raise HTTPException(400, f"{source} has no OAuth flow — connect it with a token instead")
+    if not provider.configured:
+        raise HTTPException(
+            503,
+            f"{source} OAuth is not configured. Register an OAuth app with callback "
+            f"{_oauth_redirect_uri(source)} and set {source.upper()}_CLIENT_ID / "
+            f"{source.upper()}_CLIENT_SECRET.",
+        )
+    return provider
+
+
+@app.get("/api/oauth/{source}/start")
+async def oauth_start(source: str, company_id: str = Depends(company_scope)) -> RedirectResponse:
+    """Send the human to the provider to say yes.
+
+    `state` is a single-use, expiring, sealed token (the same machinery the
+    one-click email links use). It carries the company_id, so the callback
+    learns WHO this grant belongs to from a value it minted itself rather than
+    trusting a query parameter an attacker could set.
+    """
+    provider = _oauth_provider_or_400(source)
+    async with Session() as session:
+        state = await issue_token(
+            session, company_id, OAUTH_PURPOSE, {"source": source},
+            ttl_minutes=_OAUTH_STATE_TTL_MINUTES,
+        )
+        await audit.record(session, company_id, "ui", "oauth.started", target=source)
+        await session.commit()
+    return RedirectResponse(
+        authorize_url(provider, state=state, redirect_uri=_oauth_redirect_uri(source)),
+        status_code=307,
+    )
+
+
+@app.get("/api/oauth/{source}/callback")
+async def oauth_callback(
+    source: str,
+    code: str | None = Query(None),
+    state: str | None = Query(None),
+    error: str | None = Query(None),
+) -> RedirectResponse:
+    """Where the provider drops the human back. Burns the state, trades the
+    code for a token server-side, and seals it into the credential store.
+
+    Note there is no company_scope here: the company comes from the state we
+    issued, never from the URL.
+    """
+    if error:
+        return RedirectResponse(_web_url(f"?connect_error={quote(error)}"), status_code=303)
+    if not code or not state:
+        return RedirectResponse(_web_url("?connect_error=missing_code"), status_code=303)
+
+    provider = _oauth_provider_or_400(source)
+    async with Session() as session:
+        body = await consume_token(session, state, OAUTH_PURPOSE, used_by="oauth-callback")
+        if body is None or body.get("source") != source:
+            await session.commit()
+            # expired, replayed, forged, or for a different source
+            return RedirectResponse(_web_url("?connect_error=invalid_state"), status_code=303)
+        company_id = str(body["company_id"])
+
+        try:
+            token = await exchange_code(provider, code, _oauth_redirect_uri(source))
+        except OAuthError as exc:
+            await session.commit()
+            return RedirectResponse(_web_url(f"?connect_error={quote(str(exc))}"), status_code=303)
+
+        # keep any config already chosen (e.g. the repo) across a re-auth
+        existing = await get_credential(session, company_id, source)
+        config = existing[1] if existing else {}
+        await save_credential(session, company_id, source, token, config)
+        await audit.record(
+            session, company_id, "oauth", "connection.saved", target=source,
+            # the token itself is NEVER recorded — only that a grant happened
+            metadata={"via": "oauth", "scope": provider.scope},
+        )
+        await session.commit()
+    return RedirectResponse(_web_url(f"?connected={source}"), status_code=303)
+
+
+@app.get("/api/oauth/{source}/targets")
+async def oauth_targets(source: str, company_id: str = Depends(company_scope)) -> dict:
+    """What the granted token can watch (e.g. repos), so the UI offers a
+    picker instead of a free-text `owner/name` field."""
+    async with Session() as session:
+        cred = await get_credential(session, company_id, source)
+    if cred is None or not cred[0]:
+        raise HTTPException(400, f"{source} is not connected")
+    try:
+        targets = await list_oauth_targets(source, cred[0])
+    except Exception as exc:
+        raise HTTPException(502, f"could not list {source} targets: {exc}") from exc
+    return {"source": source, "targets": targets, "selected": cred[1].get("repo")}
 
 
 @app.post("/api/connections/{source}")
@@ -311,10 +524,31 @@ async def connect(
     payload: dict = Body(...),
     company_id: str = Depends(company_scope),
 ) -> dict:
-    if source not in SUPPORTED:
+    """Save a connection.
+
+    A company that already has a profile may only connect a source that
+    profile declares — the profile is the contract. But a company being
+    ONBOARDED has no profile yet (that's what discovery is for), so before
+    one exists we validate against the connector registry instead. Requiring
+    a profile here would make it impossible to ever connect the first tool.
+    """
+    async with Session() as session:
+        existing = await load_profile(session, company_id)
+    if existing is not None:
+        supported = [s["source"] for s in existing.sources if s.get("kind") == "connector"]
+        if source not in supported:
+            raise HTTPException(400, f"unsupported source: {source}")
+    elif source not in SUPPORTED_SOURCES:
         raise HTTPException(400, f"unsupported source: {source}")
     token = payload.pop("token", "") or ""
     async with Session() as session:
+        # An empty token means "I'm only changing config" (e.g. picking which
+        # repo to watch after an OAuth grant) — NOT "throw my token away".
+        # Keep whatever is already sealed; clearing a credential is what the
+        # DELETE endpoint is for.
+        if not token:
+            current = await get_credential(session, company_id, source)
+            token = current[0] if current else ""
         await save_credential(session, company_id, source, token, payload)
         await audit.record(session, company_id, "api", "connection.saved", target=source,
                            metadata={"config": payload})
@@ -331,11 +565,39 @@ async def disconnect(source: str, company_id: str = Depends(company_scope)) -> d
     return {"source": source, "connected": False}
 
 
+@app.post("/api/connections/{source}/watching")
+async def set_watching(
+    source: str,
+    payload: dict = Body(...),
+    company_id: str = Depends(company_scope),
+) -> dict:
+    """Resume (or stop) watching a source. The clarification card's "this is
+    expected, stop watching" choice disables a source; this is how it — and
+    its sibling "help me reconnect" — get undone, as a new profile version."""
+    if "enabled" not in payload:
+        raise HTTPException(400, 'body must be {"enabled": true|false}')
+    enabled = bool(payload["enabled"])
+    async with Session() as session:
+        updated = await set_source_enabled(session, company_id, source, enabled)
+        if updated is None:
+            raise HTTPException(404, f"no source {source!r} in this company's profile")
+        await audit.record(
+            session, company_id, "ui", "connection.watching",
+            target=source, metadata={"enabled": enabled, "profile_version": updated.version},
+        )
+        await session.commit()
+    return {"source": source, "enabled": enabled, "profile_version": updated.version}
+
+
 @app.post("/api/connections/{source}/sync")
-async def sync(source: str, company_id: str = Depends(company_scope)) -> dict:
+async def sync(
+    source: str,
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+) -> dict:
     async with Session() as session:
         try:
-            counts = await trigger_ingest(session, company_id, only_source=source)
+            counts = await trigger_ingest(session, profile, only_source=source)
         except Exception as exc:  # surface connector errors to the UI
             raise HTTPException(502, f"{source} sync failed: {exc}") from exc
         await audit.record(session, company_id, "api", "ingest.trigger", target=source,
@@ -344,13 +606,62 @@ async def sync(source: str, company_id: str = Depends(company_scope)) -> dict:
     return {"enqueued": counts}
 
 
-@app.post("/api/ingest")
-async def ingest_all(company_id: str = Depends(company_scope)) -> dict:
+@app.post("/api/connections/{source}/backfill")
+async def backfill(
+    source: str,
+    since_days: int = Query(90, ge=1, le=730),
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+) -> dict:
+    """Checkpoint 2, part A: walk this source's real history (not just the
+    live sync's recent window) so norms have real depth to learn from.
+    Queued as a low-priority worker job — see packages.core.pipeline.backfill_source."""
     async with Session() as session:
-        counts = await trigger_ingest(session, company_id)
+        queued = await trigger_backfill(session, profile, only_source=source, since_days=since_days)
+        if not queued:
+            raise HTTPException(400, f"{source} is not connected")
+        await audit.record(session, company_id, "api", "ingest.backfill", target=source,
+                           metadata={"since_days": since_days})
+        await session.commit()
+    return {"queued": queued, "since_days": since_days}
+
+
+@app.post("/api/ingest")
+async def ingest_all(
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+) -> dict:
+    async with Session() as session:
+        counts = await trigger_ingest(session, profile)
         await audit.record(session, company_id, "api", "ingest.trigger", metadata=counts)
         await session.commit()
     return {"enqueued": counts}
+
+
+@app.post("/api/ingest/push")
+async def ingest_push(
+    payload: dict = Body(...),
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+) -> dict:
+    """Generic push feed for `kind: push` profile sources.
+
+    Body: {"source": "<push source name>", "events": [<raw payload>, ...]}
+    Payloads ride the same pipeline as connector pulls.
+    """
+    source = str(payload.get("source", ""))
+    raws = payload.get("events", [])
+    if not source or not isinstance(raws, list) or not raws:
+        raise HTTPException(400, 'body must be {"source": ..., "events": [...]}')
+    try:
+        count = await push_events(profile, source, raws)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    async with Session() as session:
+        await audit.record(session, company_id, "api", "ingest.push", target=source,
+                           metadata={"count": count})
+        await session.commit()
+    return {"enqueued": {source: count}}
 
 
 # ------------------------------ Events ------------------------------
@@ -359,48 +670,42 @@ async def ingest_all(company_id: str = Depends(company_scope)) -> dict:
 @app.get("/api/events")
 async def events(
     company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
     source: str | None = None,
     type: str | None = None,
     state: str | None = None,
     limit: int = Query(50, ge=1, le=200),
 ) -> dict:
-    clauses = ["company_id = :c"]
-    params: dict = {"c": company_id, "l": limit}
-    if source:
-        clauses.append("source = :s")
-        params["s"] = source
-    if type:
-        clauses.append("type = :t")
-        params["t"] = type
-    if state:
-        clauses.append("metadata->>'state' = :st")
-        params["st"] = state
-
+    """Raw events. ``state`` filters on whatever field the PROFILE says holds
+    a record's status (`things.status_field`) — this used to hardcode
+    `metadata->>'state'`, which is GitHub's word and silently matched nothing
+    for a profile that calls it `status`."""
+    status_field = (profile.things or {}).get("status_field")
     async with Session() as session:
-        rows = await session.execute(
-            text(
-                f"""
-                SELECT id, source, type, actor_name, timestamp, content, metadata
-                FROM events WHERE {" AND ".join(clauses)}
-                ORDER BY timestamp DESC LIMIT :l
-                """
-            ),
-            params,
+        rows = await list_items(
+            session, company_id, status_field=status_field,
+            source=source, type_=type, status=state, limit=limit,
         )
-        out = []
-        for r in rows:
-            md = r.metadata if isinstance(r.metadata, dict) else json.loads(r.metadata)
-            out.append(
-                {
-                    "id": r.id,
-                    "source": r.source,
-                    "type": r.type,
-                    "actor": {"id": r.actor_name, "name": r.actor_name},
-                    "timestamp": r.timestamp.isoformat(),
-                    "content": r.content,
-                    "metadata": md or {},
-                }
-            )
+        raw = await session.execute(
+            text("SELECT id, content, metadata FROM events WHERE company_id = :c AND id = ANY(:ids)"),
+            {"c": company_id, "ids": [r["id"] for r in rows]},
+        )
+    detail = {
+        r.id: (r.content, r.metadata if isinstance(r.metadata, dict) else json.loads(r.metadata))
+        for r in raw
+    }
+    out = [
+        {
+            "id": r["id"],
+            "source": r["source"],
+            "type": r["type"],
+            "actor": {"id": r["actor"], "name": r["actor"]},
+            "timestamp": r["timestamp"],
+            "content": detail.get(r["id"], ("", {}))[0],
+            "metadata": detail.get(r["id"], ("", {}))[1] or {},
+        }
+        for r in rows
+    ]
     return {"count": len(out), "events": out}
 
 
@@ -426,9 +731,13 @@ async def related(
     company_id: str = Depends(company_scope),
     hops: int = Query(2, ge=1, le=4),
 ) -> dict:
-    async with Session() as session:
-        result = await query_graph(session, company_id, event_id, GRAPH_SCHEMA, hops)
+    result = await graph.query_graph(company_id, event_id, hops)
     return result.model_dump()
+
+
+@app.get("/api/graph/stats")
+async def graph_stats(company_id: str = Depends(company_scope)) -> dict:
+    return await graph.count_nodes(company_id)
 
 
 @app.get("/api/norms")
@@ -442,24 +751,697 @@ async def norms(company_id: str = Depends(company_scope)) -> dict:
 
 
 @app.post("/api/analyze")
-async def analyze(company_id: str = Depends(company_scope)) -> dict:
+async def analyze(
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+) -> dict:
     """Learn norms -> detect situations -> assemble briefs -> deliver."""
     async with Session() as session:
-        summary = await run_analysis(session, company_id)
+        summary = await run_analysis(session, profile)
         await audit.record(session, company_id, "api", "analyze.run", metadata=summary)
         await session.commit()
     return summary
 
 
 @app.get("/api/situations")
-async def situations(company_id: str = Depends(company_scope)) -> dict:
+async def situations(
+    company_id: str = Depends(company_scope),
+    include_system: bool = Query(False, description="include kind=system self-monitoring situations"),
+) -> dict:
     async with Session() as session:
-        items = await list_situations(session, company_id)
+        items = await list_situations(session, company_id, include_system=include_system)
     return {"count": len(items), "situations": [s.model_dump(mode="json") for s in items]}
 
 
+@app.post("/api/situations/{situation_id}/ack")
+async def ack_situation_route(
+    situation_id: str, company_id: str = Depends(company_scope)
+) -> dict:
+    async with Session() as session:
+        ok = await ack_situation(session, company_id, situation_id)
+        if not ok:
+            raise HTTPException(404, "no open situation with that id")
+        await audit.record(session, company_id, "ui", "situation.ack", target=situation_id)
+        await session.commit()
+    return {"status": "acknowledged", "situation_id": situation_id}
+
+
+@app.post("/api/situations/{situation_id}/dismiss")
+async def dismiss_situation_route(
+    situation_id: str, company_id: str = Depends(company_scope)
+) -> dict:
+    async with Session() as session:
+        ok = await dismiss_situation(session, company_id, situation_id)
+        if not ok:
+            raise HTTPException(404, "no open situation with that id")
+        await audit.record(session, company_id, "ui", "situation.dismiss", target=situation_id)
+        await session.commit()
+    return {"status": "dismissed", "situation_id": situation_id}
+
+
+# ------------------------------ Feed (CP2 part C/D) ------------------------------
+
+
+@app.get("/api/feed")
+async def feed(
+    company_id: str = Depends(company_scope),
+    include_system: bool = Query(False),
+) -> dict:
+    """The watcher engine's output, ready for the Feed page: situations +
+    pending/recent actions in one round trip."""
+    async with Session() as session:
+        situations = await list_situations(session, company_id, include_system=include_system)
+        actions = await list_actions(session, company_id)
+    return {
+        "situations": [s.model_dump(mode="json") for s in situations],
+        "actions": actions,
+    }
+
+
+@app.get("/api/items")
+async def items(
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+    source: str | None = None,
+    type: str | None = None,
+    status: str | None = None,
+    limit: int = Query(100, ge=1, le=500),
+) -> dict:
+    """The work itself, with facet counts — the answer to "what have I got?",
+    as opposed to /api/feed's "what needs me?".
+
+    Which metadata key holds a record's status is PROFILE data
+    (`things.status_field`), so this endpoint never knows that GitHub calls it
+    "state" and an inventory profile calls it "status". The label the UI shows
+    for one record comes from the profile's vocabulary too.
+    """
+    status_field = (profile.things or {}).get("status_field")
+    async with Session() as session:
+        rows = await list_items(
+            session, company_id, status_field=status_field,
+            source=source, type_=type, status=status, limit=limit,
+        )
+        facets = await item_facets(
+            session, company_id, status_field=status_field,
+            source=source, type_=type, status=status,
+        )
+    return {
+        "items": rows,
+        "facets": facets,
+        # what this company calls one record ("issue", "order", ...) so the UI
+        # can label the view without guessing
+        "noun": (profile.vocabulary.get("terms", {}) or {}).get("thing", "item"),
+    }
+
+
+@app.get("/api/learning")
+async def learning(
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+) -> dict:
+    """What the system learned, WITH the working shown.
+
+    Each baseline comes back with the real records that produced it, which
+    ones were discarded as outliers, and the line past which it raises an
+    alert — so a person can check the maths against their own work instead of
+    taking a number on trust. Also returns what was inferred about the shape
+    of the data (which field means "finished", who the actor is), and the size
+    of the knowledge graph built from it.
+    """
+    async with Session() as session:
+        measurements = [
+            await norm_evidence(session, company_id, defn) for defn in profile.rhythms
+        ]
+        facets = await item_facets(
+            session, company_id, status_field=(profile.things or {}).get("status_field")
+        )
+    graph_counts = await graph.count_nodes(company_id)
+
+    source_defs = {s["source"]: s for s in profile.sources if s.get("kind") == "connector"}
+    inferred = []
+    for rhythm in profile.rhythms:
+        mapping = (source_defs.get(rhythm.get("source"), {}) or {}).get("mapping", {})
+        inferred.append(
+            {
+                "type": rhythm.get("type"),
+                "source": rhythm.get("source"),
+                "finished_when": rhythm.get("end_field"),
+                "timestamp_from": (mapping.get("timestamp") or {}).get("path"),
+                "actor_from": (mapping.get("actor_name") or {}).get("path"),
+                "status_from": (profile.things or {}).get("status_field"),
+            }
+        )
+
+    return {
+        "measurements": measurements,
+        "inferred": inferred,
+        "records": {"total": sum(f["count"] for f in facets["sources"]), "by_type": facets["types"]},
+        "graph": {
+            "things": graph_counts.get("Thing", 0),
+            "events": graph_counts.get("Event", 0),
+            "total": graph_counts.get("total", 0),
+        },
+        "terms": profile.vocabulary.get("terms", {}) or {},
+        "profile_version": profile.version,
+    }
+
+
+@app.get("/api/knowledge")
+async def knowledge(
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+) -> dict:
+    """The company as the system sees it: the profile as readable data, plus
+    the real graph built from real events.
+
+    This is a VIEWER, not an editor. The seven slots are rendered as facts
+    ("you have 4 kinds of thing, here they are") — never as form fields, which
+    would just be YAML in a browser. Changing any of it goes through the agent,
+    which records who changed what and why.
+    """
+    picture = await graph.company_graph(company_id)
+    async with Session() as session:
+        company_name = (
+            await session.execute(
+                text("SELECT name FROM companies WHERE id = :company_id"),
+                {"company_id": company_id},
+            )
+        ).scalar_one_or_none()
+    things_slot = profile.things or {}
+    links_slot = profile.links or {}
+
+    # Which thing types actually showed up in the data, vs merely declared.
+    seen: dict[str, int] = {}
+    for t in picture["things"]:
+        key = t["thing_type"] or "unknown"
+        seen[key] = seen.get(key, 0) + 1
+
+    return {
+        "company": {
+            "id": company_id,
+            "name": company_name or company_id,
+            "version": profile.version,
+            "status": profile.status,
+        },
+        "sources": [
+            {
+                "source": s.get("source"),
+                "kind": s.get("kind"),
+                "enabled": s.get("enabled", True),
+                "produces": [
+                    t.get("event_type")
+                    for t in things_slot.get("types", [])
+                    if t.get("source") == s.get("source")
+                ],
+            }
+            for s in profile.sources
+        ],
+        "thing_types": [
+            {
+                "name": t.get("name"),
+                "source": t.get("source"),
+                "from_event": t.get("event_type"),
+                "count": seen.get(t.get("name"), 0),
+            }
+            for t in things_slot.get("types", [])
+        ],
+        "link_types": links_slot.get("types", []),
+        "rhythms": [
+            {"name": r.get("name"), "type": r.get("type"), "finished_when": r.get("end_field")}
+            for r in profile.rhythms
+        ],
+        "terms": profile.vocabulary.get("terms", {}) or {},
+        "graph": picture,
+    }
+
+
+@app.get("/api/knowledge/things/{thing_id:path}")
+async def knowledge_thing(
+    thing_id: str,
+    company_id: str = Depends(company_scope),
+) -> dict:
+    """One thing's own page: its neighbours and every event about it.
+
+    The graph mirror holds ids and times only, so the event *content* is
+    joined back from Postgres here — the mirror stays thin and cannot drift.
+    """
+    detail = await graph.thing_detail(company_id, thing_id)
+    if not detail:
+        raise HTTPException(404, "thing not found")
+
+    event_ids = [e["event_id"] for e in detail["events"]]
+    if event_ids:
+        async with Session() as session:
+            rows = await get_events_by_ids(session, company_id, event_ids)
+        by_id = {e.id: e for e in rows}
+        for e in detail["events"]:
+            full = by_id.get(e["event_id"])
+            if full is not None:
+                e["content"] = full.content
+                e["actor_name"] = full.actor.name
+                e["type"] = full.type
+                e["url"] = (full.metadata or {}).get("url")
+    return detail
+
+
+@app.get("/api/understanding")
+async def understanding(
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+) -> dict:
+    """Everything the system knows about this company, in one answer — what
+    it watches, what it learned, what it checks for, what it may do, and
+    whether Practice mode is protecting you. All of this existed already but
+    had no screen, which is what made the product feel unknowable."""
+    async with Session() as session:
+        return await describe(session, profile)
+
+
+@app.get("/api/feed/stream")
+async def feed_stream(company_id: str = Depends(company_scope)) -> StreamingResponse:
+    """SSE: a nudge to refetch /api/feed, published (Redis pub/sub) every
+    time the watcher engine finishes a pass for this company — whichever
+    cadence triggered it (webhook, the business scan, or the watcher
+    engine's own 5-min cron). Carries no situation data itself, so it can
+    never drift out of sync with Postgres, the system of record."""
+
+    async def events():
+        pool = await create_pool(redis_settings())
+        pubsub = pool.pubsub()
+        channel = FEED_CHANNEL.format(company_id=company_id)
+        await pubsub.subscribe(channel)
+        try:
+            yield "event: ready\ndata: {}\n\n"
+            while True:
+                message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=25.0)
+                if message is None:
+                    yield ": keep-alive\n\n"  # SSE comment — holds the connection through proxies
+                    continue
+                data = message["data"]
+                if isinstance(data, bytes):
+                    data = data.decode()
+                yield f"data: {data}\n\n"
+        finally:
+            await pubsub.unsubscribe(channel)
+            await pool.aclose()
+
+    return StreamingResponse(events(), media_type="text/event-stream")
+
+
+@app.get("/api/connector-health")
+async def connector_health_route(company_id: str = Depends(company_scope)) -> dict:
+    async with Session() as session:
+        rows = await ch.get_health(session, company_id)
+    return {"company_id": company_id, "connectors": rows}
+
+
+@app.post("/api/situations/{situation_id}/resolve")
+async def resolve_situation_choice(
+    situation_id: str,
+    payload: dict = Body(...),
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+) -> dict:
+    choice = str(payload.get("choice") or payload.get("choice_id") or "")
+    if not choice:
+        raise HTTPException(400, "body must include choice")
+    async with Session() as session:
+        result = await resolve_clarification(
+            session, profile, situation_id, choice, resolved_by=str(payload.get("by") or "ui")
+        )
+        if result["status"] == "not_found":
+            raise HTTPException(404, "situation not found")
+        if result["status"] == "invalid_choice":
+            raise HTTPException(400, "invalid clarification choice")
+        await session.commit()
+    return result
+
+
+@app.get("/api/conversations/default/messages")
+async def default_messages(company_id: str = Depends(company_scope)) -> dict:
+    async with Session() as session:
+        conversation_id = await get_or_create_default_conversation(session, company_id)
+        messages = await list_messages(session, company_id, conversation_id)
+        await session.commit()
+    return {
+        "conversation_id": conversation_id,
+        "messages": [m.model_dump(mode="json") for m in messages],
+    }
+
+
+@app.post("/api/conversations/default/messages")
+async def post_default_message(
+    payload: dict = Body(...),
+    company_id: str = Depends(company_scope),
+) -> dict:
+    """Persist one chat turn (user or agent). The Agent UI calls this for
+    BOTH sides of every exchange, so a refresh never loses the thread —
+    there is no local-only chat state left in the frontend."""
+    role = str(payload.get("role") or "")
+    if role not in ("user", "agent", "system"):
+        raise HTTPException(400, 'role must be "user", "agent", or "system"')
+    content = str(payload.get("content") or "")
+    artifacts = payload.get("artifacts") or []
+    if not isinstance(artifacts, list):
+        raise HTTPException(400, "artifacts must be a list")
+    async with Session() as session:
+        conversation_id = await get_or_create_default_conversation(session, company_id)
+        message = await add_message(session, conversation_id, role, content, artifacts)
+        await session.commit()
+    return message.model_dump(mode="json")
+
+
+# --------------------------- Profile discovery (CP5) ---------------------------
+
+
+@app.get("/api/profile")
+async def get_profile_route(company_id: str = Depends(company_scope)) -> dict:
+    """The company's profile versions + whichever one is live."""
+    async with Session() as session:
+        versions = await list_versions(session, company_id)
+        active = await load_profile(session, company_id)
+    return {
+        "company_id": company_id,
+        "versions": versions,
+        "active": active.model_dump(mode="json") if active else None,
+    }
+
+
+@app.post("/api/profile/induce")
+async def induce_profile_route(
+    payload: dict = Body(default={}),
+    company_id: str = Depends(company_scope),
+) -> dict:
+    """Checkpoint 5: look at what a connected source really returns and
+    PROPOSE a profile for this company. Saves a `proposed` version and
+    activates nothing — the engine keeps running on the confirmed profile
+    until a human calls /api/profile/confirm.
+
+    Body: {"source": "github", "template_company_id": "<whose connection to
+    read through, for a company that has none yet>", "limit": 30}
+    """
+    source = str(payload.get("source") or "")
+    if not source:
+        raise HTTPException(400, 'body must include "source"')
+    async with Session() as session:
+        try:
+            result = await propose_from_connector(
+                session, company_id, source,
+                template_company_id=payload.get("template_company_id"),
+                limit=int(payload.get("limit") or 30),
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        await audit.record(
+            session, company_id, "api", "profile.induced", target=source,
+            metadata={"version": result["version"], "valid": result["valid"]},
+        )
+        await session.commit()
+    return result
+
+
+@app.post("/api/profile/confirm")
+async def confirm_profile_route(
+    payload: dict = Body(...),
+    company_id: str = Depends(company_scope),
+) -> dict:
+    """The human's yes: promote a proposed profile to confirmed, as a new
+    version (the prior versions are never overwritten)."""
+    version = payload.get("version")
+    if version is None:
+        raise HTTPException(400, 'body must include "version"')
+    async with Session() as session:
+        try:
+            profile = await confirm_proposed(session, company_id, int(version))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        await audit.record(
+            session, company_id, str(payload.get("by") or "ui"), "profile.confirmed",
+            target=str(version), metadata={"confirmed_version": profile.version},
+        )
+        await session.commit()
+    return {"status": "confirmed", "version": profile.version, "profile": profile.model_dump(mode="json")}
+
+
+@app.post("/api/agent/chat")
+async def agent_chat(
+    payload: dict = Body(...),
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+) -> dict:
+    """Checkpoint 4: one turn of the real tool-use agent. The model grounds
+    its answer in the company's data via read tools and can take action via
+    run_action — which rides the same approval brake as the Feed buttons.
+
+    Both turns are persisted through the same conversations/messages backbone
+    the rest of the chat uses, so the thread survives a refresh and stays the
+    single source of truth."""
+    message = str(payload.get("message") or "").strip()
+    if not message:
+        raise HTTPException(400, "message is required")
+    async with Session() as session:
+        conversation_id = await get_or_create_default_conversation(session, company_id)
+        prior = await list_messages(session, company_id, conversation_id, limit=20)
+        history = [
+            {"role": "assistant" if m.role == "agent" else "user", "content": m.content}
+            for m in prior
+            if m.content and m.role in ("user", "agent")
+        ]
+        user_msg = await add_message(session, conversation_id, "user", message, [])
+        result = await answer(session, profile, message, history=history)
+        agent_msg = await add_message(
+            session, conversation_id, "agent", result["reply"], result["artifacts"]
+        )
+        await audit.record(
+            session, company_id, "agent", "agent.chat", target=message[:120],
+            metadata={"tools": [s["tool"] for s in result["steps"]]},
+        )
+        await session.commit()
+    return {
+        "reply": result["reply"],
+        "artifacts": result["artifacts"],
+        "message": agent_msg.model_dump(mode="json"),
+        "user_message": user_msg.model_dump(mode="json"),
+        # what the turn VERIFIABLY did, independent of what the reply claims
+        "tools_used": result["tools_used"],
+        "changed": result["changed"],
+    }
+
+
+# ------------------------------ Workflows (Phase 2) ------------------------------
+
+
+def _with_apps(profile: Profile, workflow: wf.Workflow) -> dict:
+    """A workflow serialized with its per-node app annotations — the 'which app
+    for what' the n8n graph shows on each node."""
+    data = workflow.model_dump(mode="json")
+    data["apps_used"] = apps_used(profile, workflow.steps)
+    data["steps"] = [
+        {**s.model_dump(mode="json"), **{"app_info": app}}
+        for s, app in zip(workflow.steps, [step_app(profile, s) for s in workflow.steps], strict=True)
+    ]
+    return data
+
+
+@app.post("/api/workflows/plan")
+async def plan_workflow_route(
+    payload: dict = Body(...),
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+) -> dict:
+    """Compile a natural-language goal into a reviewable plan (trigger + steps +
+    which app does what). Nothing is saved or run — the 'what I'm going to do'
+    the user approves first."""
+    goal = str(payload.get("goal") or "").strip()
+    if not goal:
+        raise HTTPException(400, "goal is required")
+    async with Session() as session:
+        plan = await plan_workflow(session, profile, goal)
+    data = plan.model_dump(mode="json")
+    data["apps_used"] = apps_used(profile, plan.steps)
+    data["steps"] = [
+        {**s.model_dump(mode="json"), "app_info": step_app(profile, s)} for s in plan.steps
+    ]
+    return data
+
+
+@app.get("/api/workflows")
+async def list_workflows_route(
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+) -> dict:
+    async with Session() as session:
+        rows = await wf.list_workflows(session, company_id)
+    return {"workflows": [_with_apps(profile, w) for w in rows]}
+
+
+@app.post("/api/workflows")
+async def create_workflow_route(
+    payload: dict = Body(...),
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+) -> dict:
+    """Save a reviewed plan as a named, trigger-based workflow."""
+    name = str(payload.get("name") or "").strip()
+    goal = str(payload.get("goal") or "").strip()
+    if not name or not goal:
+        raise HTTPException(400, "name and goal are required")
+    try:
+        steps = [WorkflowStep(**s) for s in (payload.get("steps") or [])]
+        trigger = WorkflowTrigger(**payload["trigger"]) if payload.get("trigger") else WorkflowTrigger()
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, f"invalid plan: {exc}") from exc
+    async with Session() as session:
+        workflow = await wf.save_workflow(
+            session, company_id, name, goal, steps,
+            trigger=trigger, created_by=str(payload.get("by") or "ui"),
+        )
+        await audit.record(
+            session, company_id, str(payload.get("by") or "ui"), "workflow.saved",
+            target=name, metadata={"workflow_id": workflow.id, "steps": len(steps), "trigger": trigger.type},
+        )
+        await session.commit()
+    return _with_apps(profile, workflow)
+
+
+@app.patch("/api/workflows/{workflow_id}")
+async def update_workflow_route(
+    workflow_id: int,
+    payload: dict = Body(...),
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+) -> dict:
+    changes: dict = {k: payload[k] for k in ("name", "goal", "enabled") if k in payload}
+    if "steps" in payload:
+        try:
+            changes["steps"] = [WorkflowStep(**s) for s in payload["steps"]]
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, f"invalid steps: {exc}") from exc
+    if "trigger" in payload:
+        try:
+            changes["trigger"] = WorkflowTrigger(**payload["trigger"])
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, f"invalid trigger: {exc}") from exc
+    async with Session() as session:
+        updated = await wf.update_workflow(session, company_id, workflow_id, **changes)
+        if updated is None:
+            raise HTTPException(404, "workflow not found")
+        await session.commit()
+    return _with_apps(profile, updated)
+
+
+@app.post("/api/workflows/{workflow_id}/edit")
+async def edit_workflow_route(
+    workflow_id: int,
+    payload: dict = Body(...),
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+) -> dict:
+    """The per-workflow edit chat: apply a natural-language instruction to THIS
+    workflow ('add a step to assign it to me', 'change the trigger to every
+    morning'). Re-plans and saves in place. Editing never runs anything — running
+    stays separately gated — so applying an edit immediately is safe.
+
+    If the instruction is ambiguous, returns clarifications and changes nothing."""
+    instruction = str(payload.get("instruction") or "").strip()
+    if not instruction:
+        raise HTTPException(400, "instruction is required")
+    async with Session() as session:
+        workflow = await wf.get_workflow(session, company_id, workflow_id)
+        if workflow is None:
+            raise HTTPException(404, "workflow not found")
+        plan = await edit_workflow(session, profile, workflow, instruction)
+        if plan.clarifications:
+            return {"applied": False, "clarifications": plan.clarifications}
+        updated = await wf.update_workflow(
+            session, company_id, workflow_id,
+            name=plan.name, steps=plan.steps, trigger=plan.trigger,
+        )
+        if updated is None:
+            raise HTTPException(404, "workflow not found")
+        await audit.record(
+            session, company_id, "agent", "workflow.edited",
+            target=plan.name, metadata={"workflow_id": workflow_id, "instruction": instruction[:120]},
+        )
+        await session.commit()
+    return {"applied": True, "workflow": _with_apps(profile, updated)}
+
+
+@app.delete("/api/workflows/{workflow_id}")
+async def delete_workflow_route(
+    workflow_id: int, company_id: str = Depends(company_scope)
+) -> dict:
+    async with Session() as session:
+        ok = await wf.delete_workflow(session, company_id, workflow_id)
+        if not ok:
+            raise HTTPException(404, "workflow not found")
+        await session.commit()
+    return {"deleted": workflow_id}
+
+
+@app.post("/api/workflows/{workflow_id}/run")
+async def run_workflow_route(
+    workflow_id: int,
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+) -> dict:
+    """Run a saved workflow now. External actions ride the same approval/dry-run
+    brake as a click, plus the allowlist gate for anything not sanctioned to run
+    unattended."""
+    async with Session() as session:
+        result = await run_workflow(session, profile, workflow_id, trigger="manual")
+    if "error" in result:
+        raise HTTPException(404, result["error"])
+    return result
+
+
+@app.get("/api/workflows/{workflow_id}/runs")
+async def list_workflow_runs_route(
+    workflow_id: int, company_id: str = Depends(company_scope)
+) -> dict:
+    async with Session() as session:
+        runs = await wf.list_runs(session, company_id, workflow_id)
+    return {"runs": [r.model_dump(mode="json") for r in runs]}
+
+
+@app.post("/api/norms/reset")
+async def reset_norm_route(
+    payload: dict = Body(...),
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+) -> dict:
+    metric = str(payload.get("metric") or "")
+    raw_date = payload.get("before_date")
+    if not metric or not raw_date:
+        raise HTTPException(400, "body must include metric and before_date")
+    try:
+        before_date = datetime.fromisoformat(str(raw_date).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(400, "before_date must be ISO-8601") from exc
+    defn = next((r for r in profile.rhythms if r.get("name") == metric), None)
+    async with Session() as session:
+        baseline = await reset_norms(
+            session, company_id, metric, before_date, reset_by=str(payload.get("by") or "agent"), defn=defn
+        )
+        version = await save_profile(session, profile, status="confirmed")
+        await audit.record(
+            session, company_id, str(payload.get("by") or "agent"), "norm.reset",
+            target=metric, metadata={"before_date": before_date.isoformat(), "profile_version": version},
+        )
+        await session.commit()
+    return {
+        "metric": metric,
+        "reset_before": before_date.isoformat(),
+        "profile_version": version,
+        "baseline": baseline.model_dump(mode="json") if baseline else None,
+    }
+
 @app.post("/api/situations/{situation_id}/propose")
-async def propose(situation_id: str, company_id: str = Depends(company_scope)) -> dict:
+async def propose(
+    situation_id: str,
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+) -> dict:
     """The Flags screen's Assign button: same candidates, same AI pick, same
     single-use links as the email brief."""
     async with Session() as session:
@@ -467,7 +1449,7 @@ async def propose(situation_id: str, company_id: str = Depends(company_scope)) -
         if situation is None:
             raise HTTPException(404, "situation not found")
         roster = await team_roster(session, company_id)
-        proposal = await propose_assignment(session, situation, company_id, roster)
+        proposal = await propose_assignment(session, profile, situation, roster)
         await session.commit()  # the minted tokens must survive this request
     return {
         **{k: v for k, v in proposal.items() if k != "links"},
@@ -479,32 +1461,52 @@ async def propose(situation_id: str, company_id: str = Depends(company_scope)) -
 
 
 @app.get("/api/actions")
-async def actions(company_id: str = Depends(company_scope)) -> dict:
+async def actions(
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+) -> dict:
     async with Session() as session:
         items = await list_actions(session, company_id)
-        policy = await approval_policy(session, company_id)
+        policy = await approval_policy(session, profile)
     return {"count": len(items), "actions": items, "dry_run": policy["dry_run"]}
 
 
 @app.get("/api/actions/registry")
-async def action_registry(company_id: str = Depends(company_scope)) -> dict:
+async def action_registry(
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+) -> dict:
     async with Session() as session:
-        policy = await approval_policy(session, company_id)
+        policy = await approval_policy(session, profile)
+    registry = profile.moves.get("registry", {}) or {}
     return {
         "actions": [
-            {"name": k, "approval_required": v.get("approval_required", True), "kind": v.get("kind")}
-            for k, v in ACTION_REGISTRY.items()
+            {
+                "name": k,
+                "approval_required": v.get("approval_required", True),
+                # `log` kinds never reach an external system — the UI must be
+                # able to say so on the button rather than implying an effect
+                "kind": v.get("kind"),
+                "external_effect": v.get("kind") == "http",
+            }
+            for k, v in registry.items()
         ],
         "policy": policy,
-        "autonomy": AUTONOMY_POLICY,
+        "autonomy": profile.moves.get("autonomy", {}),
+        # the words THIS business uses, so the UI stops saying "situation"
+        # to a warehouse that calls it a supply risk
+        "terms": profile.vocabulary.get("terms", {}) or {},
     }
 
 
 @app.get("/api/settings")
-async def get_settings(company_id: str = Depends(company_scope)) -> dict:
+async def get_settings(
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+) -> dict:
     async with Session() as session:
-        policy = await approval_policy(session, company_id)
-    return {"dry_run": policy["dry_run"], "autonomy": AUTONOMY_POLICY}
+        policy = await approval_policy(session, profile)
+    return {"dry_run": policy["dry_run"], "autonomy": profile.moves.get("autonomy", {})}
 
 
 @app.post("/api/settings/dry_run")
@@ -531,37 +1533,113 @@ async def set_dry_run(
 async def create_action(
     payload: dict = Body(...),
     company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
 ) -> dict:
     action = str(payload.get("action", ""))
-    if action not in ACTION_REGISTRY:
+    if action not in (profile.moves.get("registry") or {}):
         raise HTTPException(400, f"unknown action: {action}")
     async with Session() as session:
         result = await request_action(
             session,
+            profile,
             action=action,
             params=payload.get("params", {}),
             situation_id=payload.get("situation_id"),
-            company_id=company_id,
             requested_by=payload.get("requested_by", "ui"),
         )
     return result.model_dump()
 
 
 @app.post("/api/actions/{action_id}/{verdict}")
-async def decide_action(
+async def decide_action_route(
     action_id: int,
     verdict: str,
     company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
 ) -> dict:
     if verdict not in ("approve", "reject"):
         raise HTTPException(400, "verdict must be approve or reject")
     async with Session() as session:
-        policy = await approval_policy(session, company_id)
+        policy = await approval_policy(session, profile)
         result = await decide(
-            session, action_id, verdict == "approve", "ui", ACTION_REGISTRY, policy
+            session, action_id, verdict == "approve", "ui",
+            profile.moves.get("registry", {}), policy,
         )
         await session.commit()
     return result.model_dump()
+
+
+# --------------------------- Data deletion (CP6 part C) ---------------------------
+
+
+@app.post("/api/company/delete")
+async def request_company_deletion(
+    payload: dict = Body(default={}),
+    company_id: str = Depends(company_scope),
+) -> dict:
+    """Two-step erasure, deliberately not a single irreversible call.
+
+    First call (no ``confirm``): creates a pending request, returns a
+    confirmation token, deletes nothing. Second call, with
+    ``{"confirm": true, "confirmation_token": "<the token>"}``: queues the
+    real deletion as a worker job. Progress is tracked in deletion_requests,
+    pollable via GET /api/company/delete.
+    """
+    confirm = bool(payload.get("confirm"))
+    token = str(payload.get("confirmation_token") or "")
+    requested_by = str(payload.get("requested_by") or "ui")
+
+    async with Session() as session:
+        if confirm:
+            req = await confirm_deletion_request(session, company_id, token)
+            if req is None:
+                raise HTTPException(
+                    400, "no pending deletion request matches that confirmation_token"
+                )
+            await audit.record(
+                session, company_id, requested_by, "company.delete.confirmed",
+                target=company_id, metadata={"request_id": req["id"]},
+            )
+            await session.commit()
+        else:
+            existing = await get_latest_deletion_request(session, company_id)
+            if existing is not None and existing["status"] in ("pending_confirmation", "queued", "running"):
+                req = existing
+            else:
+                req = await create_deletion_request(session, company_id, requested_by)
+                await audit.record(
+                    session, company_id, requested_by, "company.delete.requested",
+                    target=company_id, metadata={"request_id": req["id"]},
+                )
+                await session.commit()
+            if req["status"] == "pending_confirmation":
+                return {
+                    "status": "pending_confirmation",
+                    "request_id": req["id"],
+                    "confirmation_token": req["confirmation_token"],
+                    "message": (
+                        "This permanently erases ALL data for this company from Neo4j and "
+                        "Postgres. Call POST /api/company/delete again with "
+                        '{"confirm": true, "confirmation_token": "<this token>"} to proceed.'
+                    ),
+                }
+            return {"status": req["status"], "request_id": req["id"]}
+
+    pool = await create_pool(redis_settings())
+    try:
+        await pool.enqueue_job("delete_company_job", req["id"])
+    finally:
+        await pool.aclose()
+    return {"status": "queued", "request_id": req["id"]}
+
+
+@app.get("/api/company/delete")
+async def company_deletion_status(company_id: str = Depends(company_scope)) -> dict:
+    async with Session() as session:
+        req = await get_latest_deletion_request(session, company_id)
+    if req is None:
+        raise HTTPException(404, "no deletion request for this company")
+    return req
 
 
 @app.get("/api/audit")
@@ -587,3 +1665,7 @@ async def audit_log(company_id: str = Depends(company_scope), limit: int = 50) -
             for r in rows
         ]
     return {"count": len(out), "entries": out}
+
+
+
+

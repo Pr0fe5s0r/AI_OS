@@ -3,10 +3,19 @@ from __future__ import annotations
 import hashlib
 import hmac
 
+from apps.common.context import build_source_config
+from apps.common.webhooks import _analysis_job_id
+from packages.connectors.github import webhook_raws as github_webhook_raws
 from packages.core.ingest import ingest
 from packages.core.webhooks import verify_signature
-from verticals.software.config import _github_source_config
-from verticals.software.webhooks import _analysis_job_id, github_webhook_raws
+from tests.conftest import SOFTWARE_PROFILE
+
+_GITHUB_DEF = next(s for s in SOFTWARE_PROFILE.sources if s["source"] == "github")
+
+
+def _github_source_config(repo: str, company_id: str = "default") -> dict:
+    cfg = build_source_config(SOFTWARE_PROFILE, _GITHUB_DEF, {"repo": repo})
+    return {**cfg, "company_id": company_id}
 
 # --------------------------- signature (core) ---------------------------
 

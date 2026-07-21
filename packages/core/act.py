@@ -66,6 +66,28 @@ async def _insert(session: AsyncSession, req: ActionRequest, status: str, detail
     return int(row.scalar_one())
 
 
+async def open_action_id(
+    session: AsyncSession, company_id: str, situation_id: str, action: str, statuses: tuple[str, ...]
+) -> int | None:
+    """The id of an existing action for this (situation, action) whose status
+    is one of ``statuses`` — the basis for not queuing the same ask twice.
+    Newest first, so a caller reusing it points at the most recent."""
+    row = (
+        await session.execute(
+            text(
+                """
+                SELECT id FROM actions
+                WHERE company_id = :c AND situation_id = :sid AND action = :a
+                  AND status = ANY(:st)
+                ORDER BY requested_at DESC LIMIT 1
+                """
+            ),
+            {"c": company_id, "sid": situation_id, "a": action, "st": list(statuses)},
+        )
+    ).first()
+    return int(row.id) if row is not None else None
+
+
 async def _auth_headers(session: AsyncSession | None, entry: dict, company_id: str) -> dict[str, str]:
     """Fetch the sealed token for this action's source at call time. Never stored."""
     auth = entry.get("auth")
@@ -87,11 +109,20 @@ async def _execute(
     dry_run = bool(approval_policy.get("dry_run", True))
 
     if kind == "log":
+        # A `log` move RECORDS an intention; it does not reach any external
+        # system. Saying "executed" with the template as the detail reads like
+        # the thing happened — a button labelled "page engineer" would imply
+        # somebody was actually paged. Report what is true instead, and mark
+        # it so the UI can say so too.
         try:
             msg = str(entry.get("template", req.action)).format(**{**req.params, "action": req.action})
         except KeyError as missing:
             return "failed", f"missing parameter {missing} for {req.action!r}", {}
-        return "executed", msg, {"logged": msg}
+        return (
+            "recorded",
+            f"recorded only — no external system was contacted: {msg}",
+            {"logged": msg, "external_effect": False},
+        )
 
     if kind == "http":
         try:
@@ -143,6 +174,19 @@ async def act(
         return ActionResult(action=action.action, status="failed", detail="action not registered")
 
     if needs_approval(entry, approval_policy):
+        # The approval queue is a set of LIVE asks, not a log — one pending
+        # action per (situation, action). A repeated detection pass that keeps
+        # proposing the same escalation must reuse the ask already waiting on a
+        # human, never stack up a fresh copy every scan.
+        if action.situation_id:
+            existing = await open_action_id(
+                session, action.company_id, action.situation_id, action.action, ("pending_approval",)
+            )
+            if existing is not None:
+                return ActionResult(
+                    id=existing, action=action.action, status="pending_approval",
+                    detail="already awaiting human approval",
+                )
         action_id = await _insert(session, action, "pending_approval", "awaiting human approval", {})
         await audit.record(
             session, action.company_id, action.requested_by, "action.requested",

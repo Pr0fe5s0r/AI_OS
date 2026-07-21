@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "AI OS - Software Command Deck",
-  description: "Operating system for software-company signals, risks, and action queues",
+  title: "MarkOS",
+  description: "The AI work agent that watches your tools, links what happened, and acts with your approval",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

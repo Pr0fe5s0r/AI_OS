@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from packages.core.briefing import evaluate_policy
-from verticals.software.config import BRIEFING_POLICY
+from tests.conftest import SOFTWARE_PROFILE
+
+BRIEFING_POLICY = SOFTWARE_PROFILE.vocabulary["briefing_policy"]
 
 
 def _state(**stats) -> dict:
