@@ -83,6 +83,66 @@ def decide_action(
     )
 
 
+def _reply_schema(candidate_ids: list[str]) -> dict[str, Any]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "reply_intent",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    # "reassign" -> hand it to `assignee`; "keep" -> leave as is;
+                    # "unclear" -> a human should read this reply
+                    "action": {"type": "string", "enum": ["reassign", "keep", "unclear"]},
+                    "assignee": {"type": "string", "enum": [*candidate_ids, "none"]},
+                    "confidence": {"type": "number"},
+                    "rationale": {"type": "string"},
+                },
+                "required": ["action", "assignee", "confidence", "rationale"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def interpret_reply(
+    reply_text: str, candidates: list[dict], current_assignee: str | None, prompt_template: str
+) -> dict[str, Any]:
+    """Read a human's email reply to an assignment and decide what they want:
+    reassign it (to whom, from the roster), keep it, or that it's unclear.
+
+    Returns a plain dict {action, assignee, confidence, rationale}. Never raises
+    — an error or an unknown name degrades to ``unclear`` so a person reads it,
+    rather than guessing a reassignment nobody asked for."""
+    ids = [str(c["id"]) for c in candidates]
+    roster = "\n".join(
+        f"- {c['id']} ({c.get('name', c['id'])}) roles={c.get('roles', [])} skills={c.get('skills', [])}"
+        for c in candidates
+    )
+    prompt = prompt_template.format(
+        reply=reply_text.strip()[:2000],
+        current=current_assignee or "nobody",
+        candidates=roster or "none",
+    )
+    try:
+        raw = chat([{"role": "user", "content": prompt}], response_format=_reply_schema(ids))
+        parsed = json.loads(raw)
+    except Exception as exc:
+        return {"action": "unclear", "assignee": "none", "confidence": 0.0, "rationale": f"parse failed: {exc}"}
+
+    action = str(parsed.get("action", "unclear"))
+    assignee = str(parsed.get("assignee", "none"))
+    if action == "reassign" and assignee not in ids:
+        return {"action": "unclear", "assignee": "none", "confidence": 0.0, "rationale": "named someone not on the roster"}
+    return {
+        "action": action,
+        "assignee": assignee,
+        "confidence": min(max(float(parsed.get("confidence", 0.0)), 0.0), 1.0),
+        "rationale": str(parsed.get("rationale", "")),
+    }
+
+
 def _assignee_schema(candidate_ids: list[str]) -> dict[str, Any]:
     return {
         "type": "json_schema",

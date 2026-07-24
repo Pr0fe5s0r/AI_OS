@@ -79,7 +79,7 @@ async def test_stalled_thing_evidence_carries_the_real_url() -> None:
                                      timestamp, content, content_tsv, metadata)
                 VALUES ('url-thing-1', :c, 'github', 'issue', 'u', 'u', :ts, 'x', to_tsvector('x'), CAST(:md AS jsonb)),
                        ('url-ev-2', :c, 'github', 'issue', 'u', 'u', :ts, 'x', to_tsvector('x'), '{}'::jsonb)
-                ON CONFLICT (id, timestamp) DO NOTHING
+                ON CONFLICT (company_id, id, timestamp) DO NOTHING
                 """
             ),
             {"c": _CO, "ts": old, "md": json.dumps({"url": "https://github.com/acme/repo/issues/42"})},
@@ -202,7 +202,7 @@ async def test_broken_rhythm_fires_when_open_item_exceeds_norm_threshold() -> No
                 INSERT INTO events (id, company_id, source, type, actor_id, actor_name,
                                      timestamp, content, metadata, content_tsv, backfilled)
                 VALUES ('broken-ev-1', :c, 'github', 'issue', 'u', 'u', :ts, 'x', CAST(:md AS jsonb), to_tsvector('x'), false)
-                ON CONFLICT (id, timestamp) DO NOTHING
+                ON CONFLICT (company_id, id, timestamp) DO NOTHING
                 """
             ),
             {"c": _CO, "ts": old_ts, "md": json.dumps({"url": "https://github.com/acme/repo/issues/7"})},
@@ -231,7 +231,7 @@ async def test_broken_rhythm_ignores_already_resolved_items() -> None:
                 INSERT INTO events (id, company_id, source, type, actor_id, actor_name,
                                      timestamp, content, metadata, content_tsv, backfilled)
                 VALUES ('broken-ev-2', :c, 'github', 'issue', 'u', 'u', :ts, 'x', CAST(:md AS jsonb), to_tsvector('x'), false)
-                ON CONFLICT (id, timestamp) DO NOTHING
+                ON CONFLICT (company_id, id, timestamp) DO NOTHING
                 """
             ),
             {"c": _CO, "ts": old_ts, "md": json.dumps({"closed_at": datetime.now(UTC).isoformat()})},
@@ -255,7 +255,7 @@ async def test_broken_rhythm_ignores_backfilled_events() -> None:
                 INSERT INTO events (id, company_id, source, type, actor_id, actor_name,
                                      timestamp, content, metadata, content_tsv, backfilled)
                 VALUES ('broken-ev-3', :c, 'github', 'issue', 'u', 'u', :ts, 'x', '{}'::jsonb, to_tsvector('x'), true)
-                ON CONFLICT (id, timestamp) DO NOTHING
+                ON CONFLICT (company_id, id, timestamp) DO NOTHING
                 """
             ),
             {"c": _CO, "ts": old_ts},
@@ -291,7 +291,7 @@ async def test_volume_anomaly_fires_on_sustained_spike() -> None:
                     INSERT INTO events (id, company_id, source, type, actor_id, actor_name,
                                          timestamp, content, content_tsv, backfilled)
                     VALUES (:id, :c, 'github', 'issue', 'u', 'u', :ts, 'x', to_tsvector('x'), false)
-                    ON CONFLICT (id, timestamp) DO NOTHING
+                    ON CONFLICT (company_id, id, timestamp) DO NOTHING
                     """
                 ),
                 {"id": f"vol-ev-{i}", "c": _CO, "ts": now - timedelta(minutes=5)},
@@ -338,7 +338,7 @@ async def test_event_candidates_are_live_only_not_backfilled() -> None:
                                      timestamp, content, content_tsv, backfilled)
                 VALUES ('live-ev', :c, 'github', 'issue', 'u', 'u', :ts, 'x', to_tsvector('x'), false),
                        ('old-ev', :c, 'github', 'issue', 'u', 'u', :ts, 'x', to_tsvector('x'), true)
-                ON CONFLICT (id, timestamp) DO NOTHING
+                ON CONFLICT (company_id, id, timestamp) DO NOTHING
                 """
             ),
             {"c": _CO, "ts": now},

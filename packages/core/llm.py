@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from functools import lru_cache
 from typing import Any
 
@@ -94,3 +95,64 @@ def chat_with_tools(
             {"id": call.id, "name": call.function.name, "arguments": call.function.arguments or "{}"}
         )
     return {"content": message.content or "", "tool_calls": calls}
+
+
+def stream_chat_with_tools(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    *,
+    model: str | None = None,
+    temperature: float = 0.0,
+    tool_choice: str = "auto",
+) -> Iterator[dict[str, Any]]:
+    """The streaming twin of ``chat_with_tools``. Yields
+    ``{"type": "text", "delta": str}`` as prose arrives, then exactly one
+    ``{"type": "done", "content": str, "tool_calls": [...]}`` with the same
+    shape the non-streaming call returns — so a caller can swap between them
+    without changing how it reads the result.
+
+    Tool calls arrive as index-keyed fragments across chunks (the name usually
+    whole in the first, the arguments a character at a time), so they are
+    reassembled here rather than in every caller. This is a blocking generator
+    like the rest of the module; driving it off the event loop is the caller's
+    job (see core.assistant).
+    """
+    client, _ = _client()
+    kwargs: dict[str, Any] = {
+        "model": model or os.getenv("CHAT_MODEL", "gpt-4o-mini"),
+        "messages": messages,
+        "temperature": temperature,
+        "stream": True,
+    }
+    if tools:
+        kwargs["tools"] = tools
+        kwargs["tool_choice"] = tool_choice
+
+    parts: list[str] = []
+    calls: dict[int, dict[str, str]] = {}
+    for chunk in client.chat.completions.create(**kwargs):
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+        if delta is None:
+            continue
+        if delta.content:
+            parts.append(delta.content)
+            yield {"type": "text", "delta": delta.content}
+        for call in delta.tool_calls or []:
+            slot = calls.setdefault(call.index, {"id": "", "name": "", "arguments": ""})
+            if call.id:
+                slot["id"] = call.id
+            if call.function is not None:
+                if call.function.name:
+                    slot["name"] += call.function.name
+                if call.function.arguments:
+                    slot["arguments"] += call.function.arguments
+
+    yield {
+        "type": "done",
+        "content": "".join(parts),
+        "tool_calls": [
+            {**calls[i], "arguments": calls[i]["arguments"] or "{}"} for i in sorted(calls)
+        ],
+    }

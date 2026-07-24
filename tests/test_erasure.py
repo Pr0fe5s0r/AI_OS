@@ -30,7 +30,7 @@ async def _seed_postgres(session) -> int:
             INSERT INTO events (id, company_id, source, type, actor_id, actor_name,
                                  timestamp, content, content_tsv)
             VALUES ('era-1', :c, 'github', 'issue', 'u', 'u', now(), 'x', to_tsvector('x'))
-            ON CONFLICT (id, timestamp) DO NOTHING
+            ON CONFLICT (company_id, id, timestamp) DO NOTHING
             """
         ),
         {"c": _CO},

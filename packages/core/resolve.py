@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime
+from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -63,6 +65,42 @@ async def _candidate_rows(
     ]
 
 
+def _last_activity(event: Event, things_cfg: dict) -> datetime:
+    """When this thing last MOVED — not when it was created.
+
+    Every stall watcher hangs off `last_activity`, and this used to be
+    `event.timestamp`, which the induced mapping fills from the record's
+    creation date. So "opened, then never touched again" was really measuring
+    "opened a while ago", and a pull request edited an hour ago was aging at
+    exactly the same rate as one nobody had opened since. The engine's own
+    primer says age since last activity matters more than age since creation;
+    it was measuring the thing it says not to.
+
+    We poll snapshots rather than a change feed, so the record's own
+    "last updated" stamp is the only witness to activity between two scans.
+    Which field that is comes from the profile (`things.activity_field`) —
+    GitHub says `updated_at`, another tool will say something else. Falls back
+    to the event timestamp when a source has no such field, which is the old
+    behaviour and the best available answer.
+    """
+    field = things_cfg.get("activity_field")
+    if field:
+        raw = event.metadata.get(field)
+        if raw:
+            try:
+                return _parse_activity(raw)
+            except (TypeError, ValueError):
+                pass  # a malformed stamp must never lose the event
+    return event.timestamp
+
+
+def _parse_activity(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
 async def resolve(
     session: AsyncSession,
     event: Event,
@@ -91,7 +129,7 @@ async def resolve(
         thing_type=ttype,
         title=label,
         status=event.metadata.get(status_field),
-        last_activity=event.timestamp,
+        last_activity=_last_activity(event, things_cfg),
         properties={"url": event.metadata.get("url"), "source": event.source},
     )
     await graph.link_event_to_thing(event.company_id, event.id, event.id)

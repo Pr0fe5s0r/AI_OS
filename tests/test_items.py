@@ -37,7 +37,7 @@ async def _seed(session) -> None:
                                      timestamp, content, metadata, content_tsv, backfilled)
                 VALUES (:id, :c, :s, :t, 'u', 'u', :ts, :content, CAST(:md AS jsonb),
                         to_tsvector('english', :content), :bf)
-                ON CONFLICT (id, timestamp) DO NOTHING
+                ON CONFLICT (company_id, id, timestamp) DO NOTHING
                 """
             ),
             {
@@ -131,7 +131,7 @@ async def test_title_falls_back_to_the_id_when_there_is_no_content() -> None:
                 INSERT INTO events (id, company_id, source, type, actor_id, actor_name,
                                      timestamp, content, content_tsv)
                 VALUES ('blank-1', :c, 'github', 'issue', 'u', 'u', now(), '', to_tsvector(''))
-                ON CONFLICT (id, timestamp) DO NOTHING
+                ON CONFLICT (company_id, id, timestamp) DO NOTHING
                 """
             ),
             {"c": _CO},

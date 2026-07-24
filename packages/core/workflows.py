@@ -275,6 +275,31 @@ def _cron_field(spec: str, low: int, high: int) -> set[int]:
     return out
 
 
+def _parse_cron(expr: str) -> tuple[set[int], set[int], set[int], set[int], set[int]] | None:
+    """Expand a 5-field cron into its matching sets, or None if it's malformed."""
+    fields = (expr or "").split()
+    if len(fields) != 5:
+        return None
+    try:
+        return (
+            _cron_field(fields[0], 0, 59),
+            _cron_field(fields[1], 0, 23),
+            _cron_field(fields[2], 1, 31),
+            _cron_field(fields[3], 1, 12),
+            _cron_field(fields[4], 0, 7),
+        )
+    except ValueError:
+        return None
+
+
+def valid_cron(expr: str) -> bool:
+    """Is this a cron expression that can ever fire? The API rejects a schedule
+    that isn't, because the alternative — accepting it and silently never
+    running — is the worst possible failure for something a person set up and
+    then trusted."""
+    return _parse_cron(expr) is not None
+
+
 def cron_matches(expr: str, when: datetime) -> bool:
     """Does a 5-field cron expression fire at ``when`` (minute resolution)?
 
@@ -283,17 +308,11 @@ def cron_matches(expr: str, when: datetime) -> bool:
     weight for nothing. A malformed expression returns False — a workflow the
     planner mis-wrote silently does nothing rather than firing at every tick.
     """
-    fields = (expr or "").split()
-    if len(fields) != 5:
+    parsed = _parse_cron(expr)
+    if parsed is None:
         return False
-    try:
-        minutes = _cron_field(fields[0], 0, 59)
-        hours = _cron_field(fields[1], 0, 23)
-        doms = _cron_field(fields[2], 1, 31)
-        months = _cron_field(fields[3], 1, 12)
-        dows = _cron_field(fields[4], 0, 7)
-    except ValueError:
-        return False
+    minutes, hours, doms, months, dows = parsed
+    fields = expr.split()
     if 7 in dows:  # both 0 and 7 mean Sunday
         dows.add(0)
     if when.minute not in minutes or when.hour not in hours or when.month not in months:

@@ -84,6 +84,14 @@ async def list_items(
                 "type": r.type,
                 "status": r.status,
                 "title": content.splitlines()[0][:120] if content else r.id,
+                # Everything the record says BEYOND its first line. A title is
+                # whatever was typed the day something was opened; the rest is
+                # where a description, and anything a connector appended about
+                # what has happened since, actually lives. Without it the agent
+                # was told a pull request's name and nothing else, and reported
+                # a PR with two commits as "completely untouched since
+                # creation" — confidently, because it had no way to know.
+                "detail": "\n".join(content.splitlines()[1:]).strip()[:600],
                 "actor": r.actor_name,
                 "timestamp": r.timestamp.isoformat(),
                 "url": (md or {}).get("url"),

@@ -7,7 +7,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.common.analysis import request_action
 from apps.common.assistant_tools import _make_dispatch, build_tools
-from apps.common.context import approval_policy
 from packages.core import workflows as wf
 from packages.core.assistant import Dispatch
 from packages.core.llm import chat
@@ -53,19 +52,17 @@ def _tool_catalog(tools: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def _allowed_actions(profile: Profile) -> set[str]:
-    return set((profile.moves.get("autonomy") or {}).get("allowed_actions") or [])
-
-
-def _requires_approval(profile: Profile, step: WorkflowStep) -> bool:
-    """Advisory flag for the review UI. The real brake is at run time; this just
-    lets a person see, before saving, which steps will pause for them."""
+def _acts_live(profile: Profile, step: WorkflowStep) -> bool:
+    """Advisory flag for the review UI: does this step take a REAL outward
+    action when the workflow runs? A saved workflow runs autonomously and for
+    real, so a person reviewing one before enabling it needs to see which steps
+    actually touch their tools — not to gate them, but to know what they are
+    turning on. True for any run_action whose move hits an external system."""
     if step.tool != "run_action":
         return False
     action = str(step.args.get("action", ""))
-    registry = profile.moves.get("registry", {}) or {}
-    entry = registry.get(action, {})
-    return bool(entry.get("approval_required")) or action not in _allowed_actions(profile)
+    entry = (profile.moves.get("registry", {}) or {}).get(action, {})
+    return entry.get("kind") == "http"
 
 
 # Which connected app a step touches, and a one-line purpose — the "which app
@@ -160,7 +157,7 @@ def _plan_from_data(profile: Profile, goal: str, data: dict, tool_names: set[str
             description=str(raw_step.get("description", "")),
             select=select if tool == "run_action" else None,  # select is meaningless off run_action
         )
-        step.requires_approval = _requires_approval(profile, step)
+        step.acts_live = _acts_live(profile, step)
         steps.append(step)
     return WorkflowPlan(
         goal=goal,
@@ -209,7 +206,7 @@ async def edit_workflow(
     current = {
         "name": workflow.name,
         "trigger": workflow.trigger.model_dump(),
-        "steps": [s.model_dump(exclude={"requires_approval"}) for s in workflow.steps],
+        "steps": [s.model_dump(exclude={"acts_live"}) for s in workflow.steps],
     }
     prompt = (
         f"{_PLANNER_SYSTEM}\n\nAVAILABLE TOOLS:\n{_tool_catalog(tools)}\n\n"
@@ -240,10 +237,18 @@ async def edit_workflow(
 def _make_workflow_dispatch(
     session: AsyncSession, profile: Profile, base: Dispatch
 ) -> Dispatch:
-    """Wrap the agent's dispatcher with the allowlist gate. Every tool behaves
-    exactly as in chat EXCEPT run_action: an action not on the autonomy
-    allowlist is forced into the approval queue instead of running unattended."""
-    allowed = _allowed_actions(profile)
+    """Wrap the agent's dispatcher for a SAVED workflow. Every tool behaves
+    exactly as in chat EXCEPT run_action, which runs FULLY AUTONOMOUSLY: no
+    per-step approval, no autonomy-allowlist requirement, and for real even in
+    Practice mode.
+
+    A workflow is not the agent improvising — it is a flow a person built,
+    reviewed and enabled. That act is the authorization for every step in it,
+    so re-asking per action (the chat path) would only be friction, and
+    rehearsing it forever (Practice mode) would mean it never does its job.
+    The single guard that remains is the human deciding to create and enable
+    the workflow at all; once enabled, it acts.
+    """
 
     async def dispatch(name: str, args: dict[str, Any]) -> dict[str, Any]:
         if name != "run_action":
@@ -251,19 +256,17 @@ def _make_workflow_dispatch(
         action = str(args.get("action", ""))
         if action not in (profile.moves.get("registry") or {}):
             return {"error": f"unknown action {action!r}"}
-        on_allowlist = action in allowed
         result = await request_action(
             session, profile, action=action,
             params={"argument": str(args.get("argument", ""))} if args.get("argument") else {},
             situation_id=args.get("situation_id"),
             requested_by="workflow",
-            pre_approved=False,
-            force_approval=not on_allowlist,  # the gate: off-allowlist ⇒ queue, never fire
+            pre_approved=True,   # the workflow itself is the approval
+            force_live=True,     # a saved workflow executes, it does not rehearse
         )
-        policy = await approval_policy(session, profile)
         return {
             "action": action, "status": result.status, "detail": result.detail,
-            "dry_run": policy["dry_run"], "on_allowlist": on_allowlist,
+            "autonomous": True,
         }
 
     return dispatch
@@ -311,7 +314,7 @@ async def _expand_steps(
                         tool=step.tool,
                         args={**step.args, "situation_id": sit.id},
                         description=step.description,
-                        requires_approval=step.requires_approval,
+                        acts_live=step.acts_live,
                     )
                 )
     return expanded
@@ -346,6 +349,7 @@ async def run_workflow(
     workflow_id: int,
     trigger: str = "manual",
     only_situation_id: str | None = None,
+    on_event: wf.StepEvent | None = None,
 ) -> dict[str, Any]:
     """Execute a saved workflow now. Returns the run id, final status, per-step
     results and a summary. External actions ride act()'s approval/dry-run brake
@@ -360,7 +364,7 @@ async def run_workflow(
     steps = await _expand_steps(session, profile, workflow.steps, only_situation_id)
     base = _make_dispatch(session, profile)
     dispatch = _make_workflow_dispatch(session, profile, base)
-    results = await wf.execute_plan(steps, dispatch)
+    results = await wf.execute_plan(steps, dispatch, on_event=on_event)
     status = _run_status(results)
     summary = _summarize(results)
     await wf.finish_run(session, run_id, status, results, summary)

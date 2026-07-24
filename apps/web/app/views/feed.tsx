@@ -2,8 +2,8 @@
 
 import { useEffect, useState } from "react";
 import {
-  Action, Card, CardLabel, CheckIcon, DoneChip, Dot, EvidenceRow, Facet, FilledBtn, Item,
-  ItemFacets, OutlineBtn, Registry, SEVERITY_LABEL, Situation, SourceDots, TextBtn,
+  Action, Card, CardLabel, CheckIcon, DoneChip, Dot, Empty, EvidenceRow, Facet, FilledBtn, Item,
+  ItemFacets, OutlineBtn, Page, PrimaryBtn, Registry, ReviewFinding, SEVERITY_LABEL, Situation, SourceDots, TextBtn,
   humanize, plural, relativeTime, sourceColor, statusColor, term,
 } from "../lib";
 
@@ -29,6 +29,12 @@ type Props = {
   itemFilters: ItemFilters;
   onFilterItems: (next: ItemFilters) => void;
   onRunMove: (move: string, situationId: string) => void;
+  onRequestReview: (thingId: string) => void;
+  reviews: Record<string, ReviewFinding[]>;
+  onRunReview: (thingId: string) => void;
+  onLoadReview: (thingId: string) => void;
+  onDismissFinding: (thingId: string, findingId: string) => void;
+  busy: string | null;
   onDecide: (actionId: number, verdict: "approve" | "reject") => void;
   onResolveClarification: (situationId: string, choiceId: string) => void;
   onDismiss: (situationId: string) => void;
@@ -40,14 +46,28 @@ type Props = {
   onTourSkip: () => void;
 };
 
-function weekday() {
-  return new Date().toLocaleDateString(undefined, { weekday: "long" });
-}
+/* Which moves a card offers, from the profile registry (never invented).
 
-/* Which moves a card offers, from the profile registry (never invented). */
-function movesFor(registry: Registry | null, severity: string): { primary: string | null; alts: string[] } {
+   Filtered by the record this card is actually about. Some moves only work on
+   one kind of thing behind an otherwise identical URL — "request changes on
+   pull request" on a plain issue was being offered here, and it can only ever
+   fail: the server refuses to build it (params_for_move), so the button's one
+   possible outcome was an error after someone had chosen it. The connector
+   declares the pattern; the card just checks its own evidence against it. */
+function movesFor(
+  registry: Registry | null, severity: string, evidenceUrl?: string | null,
+): { primary: string | null; alts: string[] } {
   if (!registry) return { primary: null, alts: [] };
-  const allowed = registry.autonomy?.allowed_actions ?? registry.actions.map((a) => a.name);
+  const applicable = new Set(
+    registry.actions
+      .filter((a) => {
+        if (!a.applies_to_url) return true;
+        return !!evidenceUrl && new RegExp(a.applies_to_url).test(evidenceUrl);
+      })
+      .map((a) => a.name),
+  );
+  const allowed = (registry.autonomy?.allowed_actions ?? registry.actions.map((a) => a.name))
+    .filter((name) => applicable.has(name));
   const escalation = registry.autonomy?.escalation_action;
   const urgent = severity === "critical" || severity === "high";
   const primary = urgent && escalation && allowed.includes(escalation) ? escalation : allowed[0] ?? null;
@@ -120,7 +140,7 @@ function SituationCard({
   const [expanded, setExpanded] = useState(false);
   const done = !!handledMove || s.status === "resolved";
   const sev = SEVERITY_LABEL[s.severity] ?? SEVERITY_LABEL.low;
-  const { primary, alts } = movesFor(registry, s.severity);
+  const { primary, alts } = movesFor(registry, s.severity, s.evidence[0]?.url);
   const urgent = s.severity === "critical" || s.severity === "high";
 
   return (
@@ -278,48 +298,180 @@ function FacetRow({ label, facets, active, onPick }: {
   );
 }
 
-function ItemRow({ it }: { it: Item }) {
+/* Kind of record gets TABS, not chips. Issues and pull requests are different
+   work with different questions ("who owns this?" vs "who reviews this?"), and
+   a chip in a row of three filters reads as one more refinement rather than as
+   the two piles the day is actually made of. Same data as the Type facet it
+   replaces — promoted, because where something lives should be obvious before
+   it is filtered. Falls back to nothing when a workspace has only one kind:
+   a tab bar with one tab is furniture. */
+function TypeTabs({ facets, active, onPick }: {
+  facets: Facet[]; active?: string; onPick: (key?: string) => void;
+}) {
+  if (facets.length <= 1) return null;
+  const total = facets.reduce((n, f) => n + f.count, 0);
+  const tab = (key: string | undefined, text: string, count: number) => {
+    const on = active === key;
+    return (
+      <button
+        key={text}
+        onClick={() => onPick(key)}
+        className="flex-none whitespace-nowrap border-b-2 px-1 pb-2 text-[13px]"
+        style={{
+          borderColor: on ? "#3fb950" : "transparent",
+          color: on ? "#ededed" : "#8b8b8b",
+        }}
+      >
+        {text} <span className="ml-0.5 text-[11.5px] text-subtle">{count}</span>
+      </button>
+    );
+  };
   return (
-    <div
-      className="grid items-center gap-3 border-b border-edge px-1 py-[10px]"
-      style={{ gridTemplateColumns: "auto 1fr auto auto" }}
-    >
-      <span title={it.status ?? "no status"}><Dot color={statusColor(it.status)} size={7} /></span>
-      <span className="min-w-0 truncate text-[13px] text-ink">
-        {it.title}
-        {it.url && (
-          <a href={it.url} target="_blank" rel="noreferrer" className="ml-1.5 font-mono text-[11px]">↗</a>
-        )}
-      </span>
-      <span className="flex items-center gap-1.5 whitespace-nowrap text-[11.5px] text-subtle">
-        <Dot color={sourceColor(it.source)} size={5} />
-        <span className="capitalize">{it.source}</span>
-        <span>·</span>
-        <span>{humanize(it.type)}</span>
-      </span>
-      <span className="w-[74px] text-right text-[11.5px] text-subtle">{relativeTime(it.timestamp)}</span>
+    <div className="flex flex-wrap items-center gap-5 border-b border-edge">
+      {tab(undefined, "All", total)}
+      {facets.map((f) => tab(f.key, `${humanize(f.key)}s`, f.count))}
     </div>
   );
 }
 
-function WorkPanel({ items, facets, noun, filters, onFilter }: {
+const SEV_COLOR: Record<string, string> = {
+  critical: "#f85149", high: "#f0883e", medium: "#d29922", low: "#8b949e", info: "#8b949e",
+};
+
+/* What the reviewer did, shown where GitHub shows it: grouped by file, each
+   finding pinned to its line with severity, concern and the fix. This is the
+   whole point — the reviewer's work made visible, step by step, not buried as
+   scattered feed cards. */
+function ReviewPanel({ thingId, findings, running, onRunReview, onRequestReview, onDismissFinding }: {
+  thingId: string; findings: ReviewFinding[] | undefined; running: boolean;
+  onRunReview: (id: string) => void; onRequestReview: (id: string) => void;
+  onDismissFinding: (thingId: string, findingId: string) => void;
+}) {
+  const byFile: Record<string, ReviewFinding[]> = {};
+  (findings ?? []).forEach((f) => { (byFile[f.file_path ?? "(general)"] ??= []).push(f); });
+  const files = Object.keys(byFile);
+  return (
+    <div className="border-t border-edge bg-black/20 px-3.5 py-3">
+      <div className="mb-3 flex flex-wrap items-center gap-2.5">
+        <OutlineBtn onClick={() => onRunReview(thingId)}>
+          {running ? "Reviewing…" : findings && findings.length ? "Re-review" : "Review now"}
+        </OutlineBtn>
+        {findings && findings.length > 0 && (
+          <FilledBtn onClick={() => onRequestReview(thingId)}>Request changes on PR</FilledBtn>
+        )}
+        {findings && (
+          <span className="text-[11.5px] text-subtle">
+            {findings.length} finding{findings.length === 1 ? "" : "s"}
+          </span>
+        )}
+      </div>
+
+      {findings === undefined && <div className="text-[12.5px] text-subtle">Loading review…</div>}
+      {findings && findings.length === 0 && (
+        <div className="py-1 text-[12.5px] text-muted">
+          Nothing flagged yet — press “Review now” to read this diff.
+        </div>
+      )}
+
+      {files.map((file) => (
+        <div key={file} className="mb-3 last:mb-0">
+          <div className="mb-1.5 font-mono text-[11.5px] text-subtle">{file}</div>
+          <div className="flex flex-col gap-1.5">
+            {byFile[file].map((f) => (
+              <div key={f.id} className="rounded-md border border-edge bg-panel px-3 py-2.5">
+                <div className="mb-1 flex flex-wrap items-center gap-2">
+                  <Dot color={SEV_COLOR[f.severity] ?? "#8b949e"} size={7} />
+                  <span className="text-[10.5px] font-semibold uppercase tracking-[0.5px]"
+                        style={{ color: SEV_COLOR[f.severity] ?? "#8b949e" }}>{f.severity}</span>
+                  <span className="rounded bg-edge px-1.5 py-0.5 text-[10.5px] text-subtle">{humanize(f.concern)}</span>
+                  {f.line != null && <span className="font-mono text-[11px] text-subtle">line {f.line}</span>}
+                </div>
+                <div className="text-[13px] font-medium leading-snug text-ink">{f.title}</div>
+                {f.rationale && <div className="mt-1 text-[12.5px] leading-relaxed text-muted">{f.rationale}</div>}
+                <div className="mt-1.5"><TextBtn onClick={() => onDismissFinding(thingId, f.id)}>Dismiss</TextBtn></div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ItemRow({ it, reviewable, reviews, running, onRunReview, onLoadReview, onRequestReview, onDismissFinding }: {
+  it: Item; reviewable: boolean; reviews: Record<string, ReviewFinding[]>; running: boolean;
+  onRunReview: (id: string) => void; onLoadReview: (id: string) => void;
+  onRequestReview: (id: string) => void; onDismissFinding: (thingId: string, findingId: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const findings = reviews[it.id];
+  const count = findings?.length;
+  useEffect(() => {
+    if (open && findings === undefined) onLoadReview(it.id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+  return (
+    <div className="border-b border-edge">
+      <div className="grid items-center gap-3 px-1 py-[10px]"
+           style={{ gridTemplateColumns: "auto 1fr auto auto auto" }}>
+        <span title={it.status ?? "no status"}><Dot color={statusColor(it.status)} size={7} /></span>
+        <span className="min-w-0 truncate text-[13px] text-ink">
+          {it.title}
+          {it.url && <a href={it.url} target="_blank" rel="noreferrer" className="ml-1.5 font-mono text-[11px]">↗</a>}
+        </span>
+        <span className="flex items-center gap-1.5 whitespace-nowrap text-[11.5px] text-subtle">
+          <Dot color={sourceColor(it.source)} size={5} />
+          <span className="capitalize">{it.source}</span><span>·</span><span>{humanize(it.type)}</span>
+        </span>
+        {reviewable ? (
+          <button onClick={() => setOpen((v) => !v)}
+                  className="whitespace-nowrap rounded border border-edge px-2 py-[3px] text-[11.5px] text-ink transition-colors hover:bg-edge">
+            {count != null && count > 0
+              ? <span className="text-danger">Review · {count}</span>
+              : "Review"}
+            <span className="ml-1 text-subtle">{open ? "▲" : "▼"}</span>
+          </button>
+        ) : <span />}
+        <span className="w-[74px] text-right text-[11.5px] text-subtle">{relativeTime(it.timestamp)}</span>
+      </div>
+      {open && reviewable && (
+        <ReviewPanel thingId={it.id} findings={findings} running={running}
+                     onRunReview={onRunReview} onRequestReview={onRequestReview}
+                     onDismissFinding={onDismissFinding} />
+      )}
+    </div>
+  );
+}
+
+function WorkPanel({ items, facets, noun, filters, onFilter, reviewableTypes, reviews, busy,
+                    onRunReview, onLoadReview, onRequestReview, onDismissFinding }: {
   items: Item[]; facets: ItemFacets | null; noun: string;
   filters: ItemFilters; onFilter: (next: ItemFilters) => void;
+  reviewableTypes: string[]; reviews: Record<string, ReviewFinding[]>; busy: string | null;
+  onRunReview: (id: string) => void; onLoadReview: (id: string) => void;
+  onRequestReview: (id: string) => void; onDismissFinding: (thingId: string, findingId: string) => void;
 }) {
   if (!facets) return <div className="pt-8 text-[13px] text-muted">Loading…</div>;
   return (
     <div className="flex flex-col gap-3">
+      <TypeTabs facets={facets.types} active={filters.type}
+                onPick={(k) => onFilter({ ...filters, type: k })} />
+
       <div className="flex flex-col gap-2 rounded-lg border border-edge bg-panel px-3.5 py-3">
         <FacetRow label="Source" facets={facets.sources} active={filters.source}
                   onPick={(k) => onFilter({ ...filters, source: k })} />
-        <FacetRow label="Type" facets={facets.types} active={filters.type}
-                  onPick={(k) => onFilter({ ...filters, type: k })} />
         <FacetRow label="Status" facets={facets.statuses} active={filters.status}
                   onPick={(k) => onFilter({ ...filters, status: k })} />
       </div>
 
       <div>
-        {items.map((it) => <ItemRow key={it.id} it={it} />)}
+        {items.map((it) => (
+          <ItemRow key={it.id} it={it}
+                   reviewable={reviewableTypes.includes(it.type)}
+                   reviews={reviews} running={busy === `runreview:${it.id}`}
+                   onRunReview={onRunReview} onLoadReview={onLoadReview}
+                   onRequestReview={onRequestReview} onDismissFinding={onDismissFinding} />
+        ))}
         {items.length === 0 && (
           <div className="pt-10 text-center text-[13px] text-muted">
             No {noun}s match these filters.
@@ -371,11 +523,12 @@ function attentionSources(sources: string[]) {
   return Array.from(new Set(sources.filter(Boolean)));
 }
 
-function AttentionDetail({ item, registry, handled, onRunMove, onDecide, onResolveClarification, onDismiss, onDiscuss }: {
+function AttentionDetail({ item, registry, handled, onRunMove, onRequestReview, onDecide, onResolveClarification, onDismiss, onDiscuss }: {
   item: AttentionItem;
   registry: Registry | null;
   handled: Record<string, string>;
   onRunMove: Props["onRunMove"];
+  onRequestReview: Props["onRequestReview"];
   onDecide: Props["onDecide"];
   onResolveClarification: Props["onResolveClarification"];
   onDismiss: Props["onDismiss"];
@@ -414,7 +567,7 @@ function AttentionDetail({ item, registry, handled, onRunMove, onDecide, onResol
   const s = item.situation;
   const isQuestion = item.category === "question";
   const choices = s.choices ?? [];
-  const { primary, alts } = movesFor(registry, s.severity);
+  const { primary, alts } = movesFor(registry, s.severity, s.evidence[0]?.url);
   const done = !!handled[s.id] || s.status === "resolved";
   return (
     <div className="flex min-h-[430px] flex-col p-5 sm:p-7">
@@ -440,6 +593,12 @@ function AttentionDetail({ item, registry, handled, onRunMove, onDecide, onResol
       <div className="mt-auto flex flex-wrap items-center gap-3 pt-7">
         {done ? <DoneChip>{handled[s.id] ? `${humanize(handled[s.id])} completed` : "Resolved"}</DoneChip> : isQuestion ? (
           choices.slice(0, 4).map((choice) => <OutlineBtn key={choice.id} onClick={() => onResolveClarification(s.id, choice.id)}>{choice.label}</OutlineBtn>)
+        ) : s.rule.startsWith("review.") && s.evidence[0]?.event_id ? (
+          // A review finding: the useful action is not a single move but
+          // posting ALL of this PR's findings back as one inline review, gated
+          // for approval. The per-finding registry moves would each post their
+          // own top-level review — noise — so they are deliberately not offered.
+          <FilledBtn onClick={() => onRequestReview(s.evidence[0].event_id)}>Request changes on PR</FilledBtn>
         ) : (
           <>
             {primary && (item.category === "decision"
@@ -455,12 +614,13 @@ function AttentionDetail({ item, registry, handled, onRunMove, onDecide, onResol
   );
 }
 
-function AttentionCenter({ live, pending, registry, handled, onRunMove, onDecide, onResolveClarification, onDismiss, onDiscuss, onGoWork, totalItems, itemNoun }: {
+function AttentionCenter({ live, pending, registry, handled, onRunMove, onRequestReview, onDecide, onResolveClarification, onDismiss, onDiscuss, onGoWork, totalItems, itemNoun }: {
   live: Situation[];
   pending: Action[];
   registry: Registry | null;
   handled: Record<string, string>;
   onRunMove: Props["onRunMove"];
+  onRequestReview: Props["onRequestReview"];
   onDecide: Props["onDecide"];
   onResolveClarification: Props["onResolveClarification"];
   onDismiss: Props["onDismiss"];
@@ -542,7 +702,7 @@ function AttentionCenter({ live, pending, registry, handled, onRunMove, onDecide
           })}
         </div>
         <div className="min-w-0 bg-[#0d0d0d]">
-          {selected && <AttentionDetail item={selected} registry={registry} handled={handled} onRunMove={onRunMove} onDecide={onDecide} onResolveClarification={onResolveClarification} onDismiss={onDismiss} onDiscuss={onDiscuss} />}
+          {selected && <AttentionDetail item={selected} registry={registry} handled={handled} onRunMove={onRunMove} onRequestReview={onRequestReview} onDecide={onDecide} onResolveClarification={onResolveClarification} onDismiss={onDismiss} onDiscuss={onDiscuss} />}
         </div>
       </div>
     </>
@@ -553,7 +713,8 @@ export default function FeedView(props: Props) {
   const {
     mode, situations, actions, registry, dismissed, handled, eventsToday, connectedCount,
     items, itemFacets, itemNoun, itemFilters, onFilterItems,
-    onRunMove, onDecide, onResolveClarification, onDismiss, onDiscuss, onGoConnections, onGoWork,
+    onRunMove, onRequestReview, reviews, onRunReview, onLoadReview, onDismissFinding, busy,
+    onDecide, onResolveClarification, onDismiss, onDiscuss, onGoConnections, onGoWork,
   } = props;
 
   if (situations === null || actions === null) {
@@ -562,12 +723,18 @@ export default function FeedView(props: Props) {
 
   if (connectedCount === 0 && eventsToday === 0) {
     return (
-      <div className="flex flex-col items-center px-10 pt-[110px] text-center">
-        <span className="mb-[18px]"><Dot color="#3fb950" /></span>
-        <div className="mb-2 text-[16px] font-semibold">Connect your first tool and I&apos;ll start learning your normal</div>
-        <div className="mb-[22px] max-w-[400px] text-[13.5px] leading-relaxed text-muted">MarkOS watches quietly, links events together, and only speaks up when something breaks the pattern.</div>
-        <FilledBtn onClick={onGoConnections}>Connect a tool</FilledBtn>
-      </div>
+      <Page
+        title={mode === "work" ? "Work" : "Attention"}
+        purpose={mode === "work"
+          ? "Every record from every connected app, kept separate from anything the AI concluded."
+          : "What needs a person right now — and nothing else."}
+      >
+        <Empty
+          title="Nothing is connected yet"
+          next="MarkOS watches quietly, links events together, and only speaks up when something breaks your pattern. Connect a tool and it starts learning what normal looks like here."
+          action={<PrimaryBtn onClick={onGoConnections}>Connect a tool</PrimaryBtn>}
+        />
+      </Page>
     );
   }
 
@@ -577,25 +744,43 @@ export default function FeedView(props: Props) {
   const needCount = live.length + pending.length;
   const totalItems = (itemFacets?.sources ?? []).reduce((n, f) => n + f.count, 0);
 
-  return (
-    <div className={`mx-auto px-5 pb-16 pt-7 sm:px-8 sm:pt-9 ${mode === "work" ? "max-w-[920px]" : "max-w-[1120px]"}`}>
-      <header className="mb-6">
-        <div className="text-[11px] uppercase tracking-[1px] text-subtle">{weekday()}</div>
-        <h1 className="mb-0 mt-1 text-[22px] font-semibold text-ink">{mode === "work" ? "Work" : "Attention"}</h1>
-        <p className="mb-0 mt-1 text-[13px] leading-relaxed text-muted">
-          {mode === "work"
-            ? `${totalItems} ${itemNoun}${totalItems === 1 ? "" : "s"} from every connected app, kept separate from AI judgments.`
-            : needCount > 0
-              ? `${needCount} ${needCount === 1 ? "item needs" : "items need"} your input. Choose a category, then handle one item without losing the rest.`
-              : `Everything is quiet across ${eventsToday.toLocaleString()} watched events.`}
-        </p>
-      </header>
+  /* What to CALL what's on screen. `itemNoun` is the vocabulary's single word
+     for this company's work ("issue"), which was fine while a source returned
+     one kind of thing — but the moment a repo has pull requests too, the header
+     read "10 issues" over a list containing a PR, and "1 issue" over a screen
+     showing exactly one pull request. Name the filtered kind when one is
+     selected; fall back to a neutral word when several kinds are mixed. */
+  const kinds = itemFacets?.types ?? [];
+  const shownNoun = itemFilters.type
+    ? humanize(itemFilters.type)
+    : kinds.length > 1 ? "record" : itemNoun;
 
+  return (
+    <Page
+      title={mode === "work" ? "Work" : "Attention"}
+      purpose={mode === "work"
+        ? `Every ${shownNoun} from every connected app, kept separate from anything the AI concluded.`
+        : "What needs a person right now. Handle one without losing the rest."}
+      stats={mode === "work"
+        ? [
+            { label: totalItems === 1 ? shownNoun : `${shownNoun}s`, value: totalItems, tone: "ok" },
+            { label: "apps", value: (itemFacets?.sources ?? []).length, tone: "ok" },
+          ]
+        : [
+            { label: "need you", value: needCount, tone: needCount ? "waiting" : "ok" },
+            { label: "waiting for approval", value: pending.length,
+              tone: pending.length ? "waiting" : "idle" },
+            { label: "events watched", value: eventsToday.toLocaleString(), tone: "ok" },
+          ]}
+    >
       {mode === "work" ? (
-        <WorkPanel items={items} facets={itemFacets} noun={itemNoun} filters={itemFilters} onFilter={onFilterItems} />
+        <WorkPanel items={items} facets={itemFacets} noun={itemNoun} filters={itemFilters} onFilter={onFilterItems}
+                   reviewableTypes={registry?.reviewable_types ?? []} reviews={reviews} busy={busy}
+                   onRunReview={onRunReview} onLoadReview={onLoadReview}
+                   onRequestReview={onRequestReview} onDismissFinding={onDismissFinding} />
       ) : (
-        <AttentionCenter live={live} pending={pending} registry={registry} handled={handled} onRunMove={onRunMove} onDecide={onDecide} onResolveClarification={onResolveClarification} onDismiss={onDismiss} onDiscuss={onDiscuss} onGoWork={onGoWork} totalItems={totalItems} itemNoun={itemNoun} />
+        <AttentionCenter live={live} pending={pending} registry={registry} handled={handled} onRunMove={onRunMove} onRequestReview={onRequestReview} onDecide={onDecide} onResolveClarification={onResolveClarification} onDismiss={onDismiss} onDiscuss={onDiscuss} onGoWork={onGoWork} totalItems={totalItems} itemNoun={itemNoun} />
       )}
-    </div>
+    </Page>
   );
 }

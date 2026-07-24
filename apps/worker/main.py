@@ -6,6 +6,7 @@ from apps.common.deletion import delete_company_job
 from apps.common.health import evaluate_connector_health
 from apps.common.scheduling import (
     analyze_company,
+    first_sync,
     scan_enabled,
     scan_minutes,
     scheduled_scan,
@@ -93,7 +94,7 @@ class WorkerSettings:
     functions = [
         ingest_raw, embed_event, resolve_event, analyze_company,
         evaluate_connector_health, delete_company_job, backfill_source,
-        run_scheduled_workflows,
+        run_scheduled_workflows, first_sync,
     ]
     cron_jobs = ([_SCAN] if scan_enabled() else []) + [
         _HEALTH_SCAN, _WATCHER_SCAN, _WORKFLOW_SCAN,

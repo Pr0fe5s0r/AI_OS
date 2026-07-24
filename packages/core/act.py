@@ -37,6 +37,22 @@ def needs_approval(entry: dict, approval_policy: dict) -> bool:
     # step without adding safety — dry_run still applies downstream.
     if approval_policy.get("pre_approved", False):
         return False
+    # `public` is a connector-declared property of the ACTION — this writes
+    # where teammates or customers read it (a comment, a review, a new issue) —
+    # not a policy about who may run it, which is why it lives in capability.
+    # Until now nothing read it, so it described a risk the system did not
+    # actually take: an operator could allowlist `comment_on_issue` for
+    # autonomy and the agent would post to a customer-visible thread with no
+    # one in the loop. Something irreversible in public is the clearest case
+    # there is for a person deciding, so it defaults to asking.
+    #
+    # Overridable, but only out loud: `allow_public_actions` in the autonomy
+    # policy. That keeps the decision where decisions belong (policy the
+    # operator sets) while the fact stays where facts belong (the connector),
+    # and makes "yes, post without me" a thing someone chose rather than a
+    # default nobody noticed.
+    if entry.get("public") and not approval_policy.get("allow_public_actions", False):
+        return True
     if entry.get("approval_required", approval_policy.get("default_require_approval", True)):
         return True
     return bool(approval_policy.get("force_approval", False))
@@ -174,6 +190,18 @@ async def act(
         return ActionResult(action=action.action, status="failed", detail="action not registered")
 
     if needs_approval(entry, approval_policy):
+        # Say WHICH brake stopped this. The queue only ever recorded "awaiting
+        # human approval", so the agent, asked to comment, reported that it was
+        # waiting "because the system is in Practice mode" — a confident guess
+        # at the wrong reason, since Practice mode is a different brake
+        # entirely (it rehearses, it does not queue). A person deciding whether
+        # to approve needs to know what tripped, and a model with no reason in
+        # the tool result will supply one.
+        reason = (
+            "this posts where other people can read it"
+            if entry.get("public") and not approval_policy.get("allow_public_actions", False)
+            else "this action is set to require approval"
+        )
         # The approval queue is a set of LIVE asks, not a log — one pending
         # action per (situation, action). A repeated detection pass that keeps
         # proposing the same escalation must reuse the ask already waiting on a
@@ -185,16 +213,16 @@ async def act(
             if existing is not None:
                 return ActionResult(
                     id=existing, action=action.action, status="pending_approval",
-                    detail="already awaiting human approval",
+                    detail=f"already awaiting approval — {reason}",
                 )
-        action_id = await _insert(session, action, "pending_approval", "awaiting human approval", {})
+        action_id = await _insert(session, action, "pending_approval", f"waiting for a person — {reason}", {})
         await audit.record(
             session, action.company_id, action.requested_by, "action.requested",
             target=action.action, metadata={"action_id": action_id, "situation_id": action.situation_id},
         )
         return ActionResult(
             id=action_id, action=action.action, status="pending_approval",
-            detail="awaiting human approval",
+            detail=f"waiting for a person — {reason}",
         )
 
     status, detail, result = await _execute(entry, action, approval_policy, session)
@@ -247,7 +275,11 @@ async def decide(
         return ActionResult(id=action_id, action=row.action, status="rejected", detail="rejected by human")
 
     entry = action_registry.get(row.action, {})
-    status, detail, result = await _execute(entry, req, approval_policy, session)
+    # An explicit human approval is a real decision — it runs for real, never a
+    # rehearsal, whatever mode the workspace is in. Practice mode governs whether
+    # the AI acts ON ITS OWN, not whether your own click does its job. Approving
+    # something and watching nothing happen is the "puppet app" feeling we refuse.
+    status, detail, result = await _execute(entry, req, {**approval_policy, "dry_run": False}, session)
     await session.execute(
         text(
             """

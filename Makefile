@@ -1,6 +1,6 @@
 COMPOSE ?= docker compose
 
-.PHONY: up seed ingest analyze test lint down logs psql boundary
+.PHONY: up ingest analyze test lint down logs psql boundary
 
 ## Bring up postgres+redis+api+worker+web, wait for health, run migrations.
 up:
@@ -10,11 +10,6 @@ up:
 	@echo "----- tables -----"
 	$(COMPOSE) exec -T postgres psql -U aios -d aios -c "\dt"
 	@echo "\nNow open http://localhost:3000 -> Connections -> connect a repo -> Sync -> Run analysis"
-
-## Seed profile rows from profiles/*.yaml. No mock events — connect a real
-## source (Connections tab, or POST /api/ingest/push) to see anything ingest.
-seed:
-	$(COMPOSE) exec -T api python scripts/seed.py
 
 ## Pull real events from every connected source onto the arq pipeline.
 ingest:

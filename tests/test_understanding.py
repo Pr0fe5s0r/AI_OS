@@ -34,7 +34,7 @@ async def test_it_reports_what_it_watches_and_what_it_learned() -> None:
                                      timestamp, content, metadata, content_tsv)
                 VALUES ('u-1', :c, 'github', 'issue', 'u', 'u', now(), 'x',
                         '{"state": "open"}'::jsonb, to_tsvector('x'))
-                ON CONFLICT (id, timestamp) DO NOTHING
+                ON CONFLICT (company_id, id, timestamp) DO NOTHING
                 """
             ),
             {"c": profile.company_id},

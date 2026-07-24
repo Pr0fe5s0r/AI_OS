@@ -20,17 +20,20 @@ from packages.shared.schema import Choice, DeliveryReceipt, Evidence, Situation
 
 _COLUMNS = (
     "id, company_id, rule, severity, title, summary, recommended_action, evidence, "
-    "status, created_at, resolved_at, kind, choices, resolved_choice, resolved_by, snoozed_until"
+    "status, created_at, resolved_at, kind, choices, resolved_choice, resolved_by, snoozed_until, "
+    "file_path, line_start, line_end, confidence, category"
 )
 
 _UPSERT = text(
     """
     INSERT INTO situations
         (id, company_id, rule, severity, title, summary, recommended_action,
-         evidence, status, created_at, resolved_at, kind, choices)
+         evidence, status, created_at, resolved_at, kind, choices,
+         file_path, line_start, line_end, confidence, category)
     VALUES
         (:id, :company_id, :rule, :severity, :title, :summary, :recommended_action,
-         CAST(:evidence AS jsonb), :status, :created_at, NULL, :kind, CAST(:choices AS jsonb))
+         CAST(:evidence AS jsonb), :status, :created_at, NULL, :kind, CAST(:choices AS jsonb),
+         :file_path, :line_start, :line_end, :confidence, :category)
     ON CONFLICT (id) DO UPDATE SET
         severity = EXCLUDED.severity,
         summary = EXCLUDED.summary,
@@ -40,7 +43,12 @@ _UPSERT = text(
         status = EXCLUDED.status,
         resolved_at = NULL,
         kind = EXCLUDED.kind,
-        choices = EXCLUDED.choices
+        choices = EXCLUDED.choices,
+        file_path = EXCLUDED.file_path,
+        line_start = EXCLUDED.line_start,
+        line_end = EXCLUDED.line_end,
+        confidence = EXCLUDED.confidence,
+        category = EXCLUDED.category
     """
 )
 
@@ -65,6 +73,11 @@ def _situation_from_row(r: Any) -> Situation:
         resolved_choice=r.resolved_choice,
         resolved_by=r.resolved_by,
         snoozed_until=r.snoozed_until,
+        file_path=r.file_path,
+        line_start=r.line_start,
+        line_end=r.line_end,
+        confidence=r.confidence,
+        category=r.category,
     )
 
 
@@ -84,6 +97,11 @@ async def save_situation(session: AsyncSession, s: Situation) -> None:
             "created_at": s.created_at,
             "kind": s.kind,
             "choices": json.dumps([c.model_dump(mode="json") for c in s.choices]) if s.choices else None,
+            "file_path": s.file_path,
+            "line_start": s.line_start,
+            "line_end": s.line_end,
+            "confidence": s.confidence,
+            "category": s.category,
         },
     )
 

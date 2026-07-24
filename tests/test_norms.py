@@ -96,7 +96,7 @@ async def _seed_hourly_events(session, n_per_hour: int, hours_ago_start: int, ho
                 INSERT INTO events (id, company_id, source, type, actor_id, actor_name,
                                      timestamp, content, content_tsv)
                 VALUES (:id, :c, 'github', 'issue', 'u', 'u', :ts, 'x', to_tsvector('x'))
-                ON CONFLICT (id, timestamp) DO NOTHING
+                ON CONFLICT (company_id, id, timestamp) DO NOTHING
                 """
             ),
             {"id": eid, "c": _CO, "ts": ts},
@@ -156,7 +156,7 @@ async def _seed_issues(session, company_id: str, count: int, oldest_days: float,
                 INSERT INTO events (id, company_id, source, type, actor_id, actor_name,
                                      timestamp, content, content_tsv, metadata)
                 VALUES (:id, :c, 'github', 'issue', 'u', 'u', :ts, 'x', to_tsvector('x'), CAST(:md AS jsonb))
-                ON CONFLICT (id, timestamp) DO NOTHING
+                ON CONFLICT (company_id, id, timestamp) DO NOTHING
                 """
             ),
             {"id": f"unm-{i}", "c": company_id, "ts": ts, "md": json.dumps(md)},

@@ -17,6 +17,88 @@ from packages.shared.schema import Message
 # management is a CP4 UI concern, not needed for this checkpoint's proof.
 
 
+async def create_conversation(
+    session: AsyncSession, company_id: str, title: str = "New thread"
+) -> int:
+    """Start a fresh thread.
+
+    Not a nicety. Every turn replays the last 20 messages, so a single endless
+    thread meant an answer from when a workspace was empty was still being fed
+    to the model days later — and the only way to escape it was for somebody to
+    delete rows. A new thread is how a person says "forget that, start again".
+    """
+    row = (
+        await session.execute(
+            text(
+                "INSERT INTO conversations (company_id, title) VALUES (:c, :t) RETURNING id"
+            ),
+            {"c": company_id, "t": (title or "New thread").strip()[:120]},
+        )
+    ).one()
+    return int(row.id)
+
+
+async def list_conversations(
+    session: AsyncSession, company_id: str, limit: int = 50
+) -> list[dict[str, Any]]:
+    """Every thread in this workspace, most recently used first, with enough
+    to render a history list without a second query per row."""
+    rows = await session.execute(
+        text(
+            """
+            SELECT c.id, c.title, c.created_at, c.updated_at,
+                   count(m.id) AS message_count,
+                   max(m.created_at) AS last_message_at,
+                   (
+                     SELECT content FROM messages
+                     WHERE conversation_id = c.id AND role = 'user'
+                     ORDER BY created_at LIMIT 1
+                   ) AS opening
+            FROM conversations c
+            LEFT JOIN messages m ON m.conversation_id = c.id
+            WHERE c.company_id = :c
+            GROUP BY c.id
+            ORDER BY coalesce(max(m.created_at), c.created_at) DESC
+            LIMIT :l
+            """
+        ),
+        {"c": company_id, "l": limit},
+    )
+    out = []
+    for r in rows:
+        # A thread nobody titled is named by what was asked first — far more
+        # use in a list than "New thread" repeated eleven times.
+        opening = (r.opening or "").strip().splitlines()[0][:80] if r.opening else ""
+        out.append(
+            {
+                "id": int(r.id),
+                "title": opening or (r.title or "New thread"),
+                "message_count": int(r.message_count or 0),
+                "created_at": r.created_at.isoformat(),
+                "last_message_at": r.last_message_at.isoformat() if r.last_message_at else None,
+            }
+        )
+    return out
+
+
+async def conversation_exists(session: AsyncSession, company_id: str, conversation_id: int) -> bool:
+    """Scoped: a thread id from another workspace must not resolve."""
+    row = (
+        await session.execute(
+            text("SELECT 1 FROM conversations WHERE id = :i AND company_id = :c"),
+            {"i": conversation_id, "c": company_id},
+        )
+    ).first()
+    return row is not None
+
+
+async def touch_conversation(session: AsyncSession, conversation_id: int) -> None:
+    await session.execute(
+        text("UPDATE conversations SET updated_at = now() WHERE id = :i"),
+        {"i": conversation_id},
+    )
+
+
 async def get_or_create_default_conversation(session: AsyncSession, company_id: str) -> int:
     row = (
         await session.execute(

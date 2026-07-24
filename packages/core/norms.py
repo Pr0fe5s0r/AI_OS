@@ -100,6 +100,13 @@ def learn_norms(metric_config: dict, observations: list[float]) -> NormBaseline:
         n_t = len(trimmed)
         # regression line evaluated at the last (most recent) index
         mean = statistics.fmean(trimmed) + trend * (n_t - 1) / 2.0
+        # ...but never outside the values we actually measured. Every metric
+        # here is a duration or a count, so nothing can be negative, and on a
+        # short window a steep trend happily projects one: five resolutions
+        # getting faster produced a "typical -1.10 hours", which the Learning
+        # page then showed to a human as evidence. Extrapolating past the data
+        # is a guess, not a baseline — hold the line at the observed range.
+        mean = min(max(mean, min(trimmed)), max(trimmed))
 
     return NormBaseline(
         company_id=metric_config.get("company_id", "default"),

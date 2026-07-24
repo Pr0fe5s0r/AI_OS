@@ -1,7 +1,7 @@
 ﻿"use client";
 
 import { useEffect, useRef, useState } from "react";
-import { CheckIcon, Dot, EvidenceRow, Artifact, Markdown, TraceStep, WorkflowPlan, appColor } from "../lib";
+import { CheckIcon, Dot, EvidenceRow, Artifact, Markdown, Thread, TraceStep, WorkflowPlanArtifact, appColor } from "../lib";
 import { WorkflowGraph } from "./workflow-graph";
 
 /* The Agent thread — Claude-style: restrained, no heavy chrome. Every message
@@ -11,10 +11,26 @@ import { WorkflowGraph } from "./workflow-graph";
    Feed buttons. Both turns are persisted server-side, so what you see here is
    exactly what GET .../messages returns and a refresh never diverges. */
 
-export type Msg = { id?: string; kind: "user" | "context" | "agent"; text: string; artifacts?: Artifact[] };
+export type Msg = {
+  id?: string;
+  kind: "user" | "context" | "agent";
+  text: string;
+  artifacts?: Artifact[];
+  /* live-turn state: `streaming` while the answer is still arriving, `working`
+     naming the tool running right now (so a pause is explained, not blank) */
+  streaming?: boolean;
+  working?: string;
+};
 
 type Props = {
   messages: Msg[];
+  /* Chat history. Every turn replays the last 20 messages, so which thread you
+     are in decides what the agent believes — that makes the thread list a
+     control, not decoration. */
+  threads: Thread[];
+  threadId: number | null;
+  onOpenThread: (id: number | null) => void;
+  onNewThread: () => void;
   onAsk: (text: string) => Promise<void>;
   onResolveClarification: (situationId: string, choiceId: string) => void;
   /* A half-written sentence handed over from another screen ("this looks
@@ -27,8 +43,8 @@ type Props = {
   mode?: "chat" | "workflow";
   onModeChange?: (m: "chat" | "workflow") => void;
   onCreateWorkflow?: (goal: string) => Promise<void>;
-  onSaveWorkflowPlan?: (plan: WorkflowPlan) => Promise<void>;
-  onRunWorkflowPlan?: (plan: WorkflowPlan) => Promise<void>;
+  onSaveWorkflowPlan?: (a: WorkflowPlanArtifact) => Promise<void>;
+  onRunWorkflowPlan?: (a: WorkflowPlanArtifact) => Promise<void>;
 };
 
 /* Prompt starters — none presuppose a business scenario. "Search your
@@ -86,18 +102,23 @@ function TraceBlock({ steps }: { steps: TraceStep[] }) {
   );
 }
 
-function WorkflowPlanBlock({ plan, saved, onSave, onRun }: {
-  plan: WorkflowPlan; saved?: boolean;
-  onSave?: (p: WorkflowPlan) => Promise<void>; onRun?: (p: WorkflowPlan) => Promise<void>;
+function WorkflowPlanBlock({ artifact, onSave, onRun }: {
+  artifact: WorkflowPlanArtifact;
+  onSave?: (a: WorkflowPlanArtifact) => Promise<void>;
+  onRun?: (a: WorkflowPlanArtifact) => Promise<void>;
 }) {
+  const plan = artifact.plan;
   const [busy, setBusy] = useState<string | null>(null);
-  const [done, setDone] = useState<string | null>(saved ? "saved" : null);
+  const [ran, setRan] = useState(false);
+  // saved-ness comes from the THREAD, not local state, so a remount can't
+  // re-arm Save and create the workflow a second time
+  const done = ran ? "ran" : artifact.saved ? "saved" : null;
   const blocked = plan.clarifications.length > 0 || plan.steps.length === 0;
 
-  async function act(kind: "save" | "run", fn?: (p: WorkflowPlan) => Promise<void>) {
-    if (!fn) return;
+  async function act(kind: "save" | "run", fn?: (a: WorkflowPlanArtifact) => Promise<void>) {
+    if (!fn || busy || done) return;
     setBusy(kind);
-    try { await fn(plan); setDone(kind === "run" ? "ran" : "saved"); }
+    try { await fn(artifact); if (kind === "run") setRan(true); }
     finally { setBusy(null); }
   }
 
@@ -165,7 +186,7 @@ function ArtifactBlock({ artifact, onResolveClarification, onSaveWorkflowPlan, o
   }
 
   if (artifact.type === "workflow_plan") {
-    return <WorkflowPlanBlock plan={artifact.plan} saved={artifact.saved} onSave={onSaveWorkflowPlan} onRun={onRunWorkflowPlan} />;
+    return <WorkflowPlanBlock artifact={artifact} onSave={onSaveWorkflowPlan} onRun={onRunWorkflowPlan} />;
   }
 
   if (artifact.type === "chip") {
@@ -228,7 +249,7 @@ function ArtifactBlock({ artifact, onResolveClarification, onSaveWorkflowPlan, o
 }
 
 export default function AgentView({
-  messages, onAsk, onResolveClarification, prefill, onPrefillUsed,
+  messages, threads, threadId, onOpenThread, onNewThread, onAsk, onResolveClarification, prefill, onPrefillUsed,
   mode = "chat", onModeChange, onCreateWorkflow, onSaveWorkflowPlan, onRunWorkflowPlan,
 }: Props) {
   const [composer, setComposer] = useState("");
@@ -271,6 +292,41 @@ export default function AgentView({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
+      {/* Thread bar. Deliberately above the conversation and always visible:
+          which thread you are in decides what the agent remembers, so it is
+          not something to hide behind a menu. */}
+      <div className="flex flex-none items-center gap-2 border-b border-edge px-4 py-2">
+        <button
+          onClick={onNewThread}
+          className="flex-none whitespace-nowrap rounded-md border border-edgeStrong bg-transparent px-2.5 py-[5px] text-[12.5px] text-muted hover:bg-elevated hover:text-ink"
+          title="Start a thread the agent has no history for"
+        >
+          ＋ New thread
+        </button>
+        {threads.length > 0 && (
+          <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto">
+            {threads.map((t) => {
+              const on = t.id === threadId;
+              return (
+                <button
+                  key={t.id}
+                  onClick={() => onOpenThread(t.id)}
+                  title={`${t.title} · ${t.message_count} message${t.message_count === 1 ? "" : "s"}`}
+                  className="flex-none max-w-[190px] truncate rounded-full border px-2.5 py-1 text-[12px]"
+                  style={{
+                    borderColor: on ? "#3fb950" : "#242424",
+                    color: on ? "#3fb950" : "#8b8b8b",
+                    background: on ? "rgba(63,185,80,0.08)" : "transparent",
+                  }}
+                >
+                  {t.title}
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
       <div ref={threadRef} className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
         <div className="mx-auto flex max-w-[720px] flex-col gap-[26px] px-7 pb-4 pt-9">
           {messages.length === 0 && (
@@ -308,7 +364,16 @@ export default function AgentView({
             const hasPlan = m.artifacts?.some((a) => a.type === "workflow_plan");
             return (
               <div key={m.id ?? i} className="card-in flex flex-col gap-3">
-                {trace ? (
+                {/* While a turn is live the trace doesn't exist yet. This must
+                    ALWAYS render something until the first token lands: the
+                    gap between sending and the model's first byte is seconds
+                    long, and showing nothing there reads as "it's broken". */}
+                {m.streaming && !m.text ? (
+                  <div className="flex items-center gap-[7px] text-[12.5px] text-muted">
+                    <span className="h-[6px] w-[6px] rounded-full bg-accent" style={{ animation: "blink 1.2s infinite" }} />
+                    <span>{m.working ?? "Thinking"}…</span>
+                  </div>
+                ) : trace ? (
                   <ArtifactBlock artifact={trace} onResolveClarification={onResolveClarification} />
                 ) : !hasPlan ? (
                   <div className="flex items-center gap-[7px] text-[12.5px] text-muted">
@@ -319,6 +384,7 @@ export default function AgentView({
                 {m.text && (
                   <div className="text-[14.5px] leading-[1.65] text-ink">
                     <Markdown text={m.text} />
+                    {m.streaming && <span className="ml-[2px] inline-block h-[14px] w-[7px] translate-y-[2px] bg-muted" style={{ animation: "blink 1.1s infinite" }} />}
                   </div>
                 )}
                 {rest.map((a, j) => (
@@ -334,7 +400,9 @@ export default function AgentView({
             );
           })}
 
-          {typing && (
+          {/* the dots are for "nothing has come back yet"; once a live bubble
+              is on screen it speaks for itself */}
+          {typing && !messages.some((m) => m.streaming) && (
             <div className="flex gap-[5px] py-1">
               {[0, 0.2, 0.4].map((d) => (
                 <span

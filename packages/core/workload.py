@@ -12,8 +12,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 #         "assignee_field": "assignee"}
 
 
+_WORKLOAD_KEYS = ("source", "type", "state_field", "state_value", "assignee_field")
+
+
 async def open_workload(session: AsyncSession, company_id: str, spec: dict) -> dict[str, int]:
-    """How many pieces of active work each person currently owns."""
+    """How many pieces of active work each person currently owns.
+
+    An incomplete spec (a workspace that hasn't told us what "active" means)
+    yields an empty map — everyone reads as free — rather than a KeyError. That
+    is the safe default: capacity limits simply don't bind until configured."""
+    if not all(spec.get(k) for k in _WORKLOAD_KEYS):
+        return {}
     rows = await session.execute(
         text(
             """

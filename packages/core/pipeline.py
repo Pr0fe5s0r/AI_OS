@@ -63,7 +63,11 @@ async def ingest_raw(
 
     event = ingest(source_config, raw, backfilled=backfilled)
     async with Session() as session:
-        await store_event(session, event)
+        # which metadata key holds a record's state is profile data, and the
+        # store needs it to notice open -> merged
+        await store_event(
+            session, event, status_field=(resolve_cfg or {}).get("things", {}).get("status_field")
+        )
         await session.commit()
     await ctx["redis"].enqueue_job(
         "embed_event",

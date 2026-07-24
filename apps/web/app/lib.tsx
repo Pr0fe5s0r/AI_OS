@@ -5,7 +5,6 @@
    edgeStrong #333 · ink #e8e8e8 · muted #8b8b8b · subtle #6a6a6a ·
    accent #3fb950 · warn #d29922 · danger #f85149 · info #58a6ff */
 
-export const COMPANY = "default";
 
 export const SOURCE_COLOR: Record<string, string> = {
   github: "#8b949e",
@@ -35,7 +34,17 @@ export type Artifact =
   | { type: "evidence"; title?: string; items: Evidence[] }
   | { type: "chip"; label: string }
   | { type: "trace"; steps: TraceStep[] }
-  | { type: "workflow_plan"; plan: WorkflowPlan; saved?: boolean };
+  | WorkflowPlanArtifact;
+/* A plan drafted in the chat. `planKey` identifies THIS draft so saving it can
+   mark it saved in the thread, and `workflowId` records what it became — without
+   both, a remount re-arms the Save button and you get a duplicate workflow. */
+export type WorkflowPlanArtifact = {
+  type: "workflow_plan";
+  plan: WorkflowPlan;
+  planKey: string;
+  saved?: boolean;
+  workflowId?: number;
+};
 export type Message = { id?: number; role: string; content: string; artifacts: Artifact[]; created_at?: string | null };
 export type Situation = {
   id: string; rule: string; severity: string; title: string; summary: string;
@@ -62,6 +71,13 @@ export type Item = {
   id: string; source: string; type: string; status: string | null;
   title: string; actor: string; timestamp: string; url: string | null; backfilled: boolean;
 };
+/* One thing the reviewer found, pinned to a spot in the diff — the shape the
+   GitHub-style review panel renders. */
+export type ReviewFinding = {
+  id: string; concern: string; severity: string; category: string;
+  file_path: string | null; line: number | null; title: string;
+  rationale: string; suggestion: string | null; confidence: number;
+};
 export type Facet = { key: string; count: number };
 export type ItemFacets = { sources: Facet[]; types: Facet[]; statuses: Facet[] };
 export type ItemsResponse = { items: Item[]; facets: ItemFacets; noun: string };
@@ -73,10 +89,28 @@ export function statusColor(status: string | null) {
   if (!status) return "#6a6a6a";
   return DONE_WORDS.includes(status.toLowerCase()) ? "#8b8b8b" : "#3fb950";
 }
+/* One chat thread. `title` is the first thing that was asked in it — far
+   more use in a history list than "New thread" repeated eleven times. */
+export type Thread = {
+  id: number;
+  title: string;
+  message_count: number;
+  created_at: string;
+  last_message_at: string | null;
+};
+
 export type Registry = {
-  actions: { name: string; approval_required: boolean; kind: string | null; external_effect?: boolean }[];
+  /* `applies_to_url`: some moves only work on one kind of record behind an
+     otherwise identical URL — approving is valid on a pull request and
+     meaningless on an issue. The server refuses to build such an action, but
+     the card must not OFFER it: a button that can only fail is worse than an
+     absent one. */
+  actions: { name: string; approval_required: boolean; kind: string | null; external_effect?: boolean; applies_to_url?: string | null }[];
   autonomy: { escalation_action?: string; allowed_actions?: string[] };
   policy: { dry_run: boolean };
+  /* record types a reviewer targets — the Work list shows a Review button only
+     for these (PRs), never on every issue. */
+  reviewable_types?: string[];
   terms?: Terms;
 };
 
@@ -170,7 +204,7 @@ export type WorkflowStep = {
   tool: string;
   args: Record<string, any>;
   description: string;
-  requires_approval: boolean;
+  acts_live: boolean; // performs a real outward action on your tools when it runs
   select?: Record<string, any> | null;
   enabled?: boolean;
   app_info?: StepApp; // annotated server-side: which app this node touches + why
@@ -216,6 +250,140 @@ export function triggerLabel(t: WorkflowTrigger | undefined): string {
   }
   return "Manual — you run it";
 }
+
+/* Read a POST endpoint that answers with text/event-stream, calling `onEvent`
+   for each frame. POST (not EventSource) because these streams START work —
+   running a workflow, spending a model call — and a side effect does not belong
+   behind a GET. Frames are newline-delimited `data:` lines; `: ` comments are
+   keep-alives and are skipped. */
+export async function streamPost(
+  url: string,
+  body: any,
+  onEvent: (e: any) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await fetch(url, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body ?? {}),
+    signal,
+  });
+  if (res.status === 401) throw new NotSignedIn();
+  if (!res.ok) throw new Error((await res.text()) || `${res.status}`);
+  if (!res.body) throw new Error("no stream");
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    // frames are separated by a blank line; keep any partial tail in the buffer
+    const frames = buffer.split("\n\n");
+    buffer = frames.pop() ?? "";
+    for (const frame of frames) {
+      for (const line of frame.split("\n")) {
+        if (!line.startsWith("data:")) continue;
+        try { onEvent(JSON.parse(line.slice(5).trim())); } catch { /* skip a partial frame */ }
+      }
+    }
+  }
+}
+
+/* ---------------------------- schedule helpers ----------------------------
+   The ready-made cadences offered in the trigger editor, so setting a schedule
+   is a click and not a cron tutorial. Custom cron stays available underneath
+   for anyone who wants it. */
+export const CRON_PRESETS: { label: string; cron: string }[] = [
+  { label: "Every morning at 9am", cron: "0 9 * * *" },
+  { label: "Every weekday at 9am", cron: "0 9 * * 1-5" },
+  { label: "Every Monday at 9am", cron: "0 9 * * 1" },
+  { label: "Every hour", cron: "0 * * * *" },
+  { label: "Every 15 minutes", cron: "*/15 * * * *" },
+  { label: "Every night at 6pm", cron: "0 18 * * *" },
+];
+
+/* Mirrors packages/core/workflows.cron_matches. DISPLAY ONLY — the engine is
+   always the authority on when something fires; this exists so a person can see
+   what they just set instead of trusting a cron string they can't read. */
+function cronField(spec: string, low: number, high: number): Set<number> | null {
+  const out = new Set<number>();
+  for (const raw of spec.split(",")) {
+    let part = raw.trim();
+    if (!part) return null;
+    let step = 1;
+    if (part.includes("/")) {
+      const [head, tail] = part.split("/");
+      step = Number(tail);
+      if (!Number.isInteger(step) || step < 1) return null;
+      part = head;
+    }
+    let start: number, end: number;
+    if (part === "*" || part === "") { start = low; end = high; }
+    else if (part.includes("-")) {
+      const [a, b] = part.split("-");
+      start = Number(a); end = Number(b);
+    } else { start = end = Number(part); }
+    if (!Number.isInteger(start) || !Number.isInteger(end)) return null;
+    if (start < low || end > high || start > end) return null;
+    for (let v = start; v <= end; v += step) out.add(v);
+  }
+  return out;
+}
+
+export function cronFires(cron: string, when: Date): boolean {
+  const fields = (cron || "").trim().split(/\s+/);
+  if (fields.length !== 5) return false;
+  const minutes = cronField(fields[0], 0, 59);
+  const hours = cronField(fields[1], 0, 23);
+  const doms = cronField(fields[2], 1, 31);
+  const months = cronField(fields[3], 1, 12);
+  const dows = cronField(fields[4], 0, 7);
+  if (!minutes || !hours || !doms || !months || !dows) return false;
+  if (dows.has(7)) dows.add(0);
+  if (!minutes.has(when.getMinutes()) || !hours.has(when.getHours())) return false;
+  if (!months.has(when.getMonth() + 1)) return false;
+  const domAny = fields[2] === "*", dowAny = fields[4] === "*";
+  const domHit = doms.has(when.getDate()), dowHit = dows.has(when.getDay());
+  if (domAny && dowAny) return true;
+  if (domAny) return dowHit;
+  if (dowAny) return domHit;
+  return domHit || dowHit;  // cron's OR rule when both day fields are set
+}
+
+export function isValidCron(cron: string): boolean {
+  const fields = (cron || "").trim().split(/\s+/);
+  if (fields.length !== 5) return false;
+  const ranges: [number, number][] = [[0, 59], [0, 23], [1, 31], [1, 12], [0, 7]];
+  return fields.every((f, i) => cronField(f, ranges[i][0], ranges[i][1]) !== null);
+}
+
+/* When this cron next fires, scanning forward a minute at a time. Bounded to
+   ~14 days: anything rarer than that we honestly say we can't preview rather
+   than burning the main thread pretending. */
+export function nextRun(cron: string, from: Date = new Date()): Date | null {
+  if (!isValidCron(cron)) return null;
+  const t = new Date(from.getTime());
+  t.setSeconds(0, 0);
+  t.setMinutes(t.getMinutes() + 1);
+  for (let i = 0; i < 60 * 24 * 14; i++) {
+    if (cronFires(cron, t)) return t;
+    t.setMinutes(t.getMinutes() + 1);
+  }
+  return null;
+}
+
+export function nextRunLabel(cron: string): string {
+  const next = nextRun(cron);
+  if (!next) return isValidCron(cron) ? "not in the next two weeks" : "never — that schedule isn't valid";
+  const day = next.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+  const time = next.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  const isToday = next.toDateString() === new Date().toDateString();
+  return isToday ? `today at ${time}` : `${day} at ${time}`;
+}
+
 export type WorkflowStepResult = {
   tool: string;
   args: Record<string, any>;
@@ -275,11 +443,24 @@ export type Briefing = {
 
 /* ------------------------------ helpers ------------------------------ */
 
+/* Thrown on 401 so callers can tell "you are signed out" apart from "that
+   request failed". The shell listens for it and shows the sign-in screen
+   instead of rendering an app full of empty panels. */
+export class NotSignedIn extends Error {
+  constructor() {
+    super("Not signed in.");
+    this.name = "NotSignedIn";
+  }
+}
+
 export async function api(path: string, init?: RequestInit) {
   const res = await fetch(path, {
     ...init,
+    // the session cookie is HttpOnly; same-origin requests carry it for us
+    credentials: "same-origin",
     headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
   });
+  if (res.status === 401) throw new NotSignedIn();
   if (!res.ok) {
     let msg = `API ${res.status}`;
     try {
@@ -290,6 +471,28 @@ export async function api(path: string, init?: RequestInit) {
   }
   return res.json();
 }
+
+/* ------------------------------ identity ------------------------------ */
+
+export type Membership = { company_id: string; role: string; name: string };
+export type Session = {
+  user: { id: number; name: string; email: string };
+  workspace: { company_id: string; role: string };
+  workspaces: Membership[];
+};
+export type TeamMember = {
+  id: number; name: string; email: string; role: string; last_login_at: string | null;
+};
+
+export const ROLE_LABELS: Record<string, string> = {
+  owner: "Owner",
+  manager: "Manager",
+  member: "Member",
+};
+
+/* What a role actually does today. Stated plainly because a role that looks
+   like a permission but isn't is worse than no role at all. */
+export const ROLE_NOTE = "Roles record who does what. Owners and managers can invite people; everything else is open to every member.";
 
 export function timeHM(iso?: string | null) {
   if (!iso) return "";
@@ -317,6 +520,18 @@ export function relativeTime(iso?: string | null) {
 
 export function humanize(s: string) {
   return s.replace(/[_.]/g, " ");
+}
+
+/* humanize() turns `connection.saved` into readable words by eating dots and
+   underscores. Audit targets are NOT all field names though — they are also
+   emails, URLs and record ids, and eating the dot in those corrupts them:
+   an invite to `probe@localhost.invalid` was displayed as
+   `probe@localhost invalid`, which looks like a typo the user made.
+   So: only humanize things that are actually machine-name-shaped. Anything
+   carrying the marks of a real identifier is shown exactly as recorded —
+   an audit trail that rewrites what it recorded is not an audit trail. */
+export function humanizeLabel(s: string) {
+  return /[@/:]|\s/.test(s) ? s : humanize(s);
 }
 
 export function firstLine(s: string, max = 84) {
@@ -505,3 +720,107 @@ export function EvidenceRow({ e }: { e: Evidence }) {
 
 
 
+
+/* ============================ the page pattern ============================
+   Every screen answers the same three questions, in the same place, in the
+   same order — so you learn the shape once and then never have to work out
+   where you are:
+
+     1. WHERE AM I    title + one line of what this screen is for
+     2. WHAT'S TRUE   a row of real numbers, never decorative
+     3. WHAT NEXT     exactly one primary action, always top-right
+
+   Screens that render nothing when empty are the reason the app felt broken
+   rather than new, so an empty state is part of the pattern, not an extra. */
+
+export function Page({ title, purpose, action, stats, children }: {
+  title: string;
+  purpose: string;
+  action?: React.ReactNode;
+  stats?: { label: string; value: React.ReactNode; tone?: StatusTone }[];
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="mx-auto max-w-[860px] px-7 pb-20 pt-9">
+      <div className="flex items-start justify-between gap-4">
+        <div className="min-w-0">
+          <h1 className="m-0 text-[19px] font-semibold tracking-[-0.01em] text-ink">{title}</h1>
+          <p className="mt-1 max-w-[560px] text-[12.5px] leading-relaxed text-muted">{purpose}</p>
+        </div>
+        {action && <div className="flex flex-none items-center gap-2">{action}</div>}
+      </div>
+
+      {stats && stats.length > 0 && (
+        <div className="mt-5 flex flex-wrap gap-x-7 gap-y-2 border-y border-edge py-3">
+          {stats.map((s) => (
+            <div key={s.label} className="flex items-baseline gap-2">
+              <span className="text-[15px] font-semibold" style={{ color: s.tone ? TONE[s.tone].color : "#e8e8e8" }}>
+                {s.value}
+              </span>
+              <span className="text-[11.5px] text-subtle">{s.label}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="mt-6">{children}</div>
+    </div>
+  );
+}
+
+/* One status vocabulary for the whole product. The same dot means the same
+   thing on Attention, Workflows, Activity, Connections and Team — re-learning
+   the colour code on every screen is what made it feel like nine apps. */
+export type StatusTone = "ok" | "waiting" | "broken" | "idle";
+
+export const TONE: Record<StatusTone, { color: string; word: string }> = {
+  ok: { color: "#3fb950", word: "Working" },
+  waiting: { color: "#d29922", word: "Waiting on you" },
+  broken: { color: "#f85149", word: "Needs fixing" },
+  idle: { color: "#6a6a6a", word: "Not started" },
+};
+
+export function Status({ tone, label }: { tone: StatusTone; label?: string }) {
+  return (
+    <span className="inline-flex items-center gap-[6px] text-[11.5px]" style={{ color: TONE[tone].color }}>
+      <span className="h-[6px] w-[6px] rounded-full" style={{ background: TONE[tone].color }} />
+      {label ?? TONE[tone].word}
+    </span>
+  );
+}
+
+/* Nothing here YET is a different fact from nothing here, and it always has a
+   next step. A blank panel makes a new workspace look broken. */
+export function Empty({ title, next, action }: {
+  title: string; next: string; action?: React.ReactNode;
+}) {
+  return (
+    <div className="rounded-lg border border-dashed border-edge px-6 py-9 text-center">
+      <div className="text-[13.5px] text-ink">{title}</div>
+      <div className="mx-auto mt-1.5 max-w-[420px] text-[12.5px] leading-relaxed text-muted">{next}</div>
+      {action && <div className="mt-4 flex justify-center">{action}</div>}
+    </div>
+  );
+}
+
+export function PrimaryBtn({ children, ...props }: React.ButtonHTMLAttributes<HTMLButtonElement>) {
+  return (
+    <button
+      {...props}
+      className="rounded-md border-none bg-accent px-3.5 py-1.5 text-[13px] font-semibold text-[#0a0a0a] hover:opacity-90 disabled:opacity-40"
+    >
+      {children}
+    </button>
+  );
+}
+
+export function SecondaryBtn({ children, ...props }: React.ButtonHTMLAttributes<HTMLButtonElement>) {
+  return (
+    <button
+      {...props}
+      className="rounded-md border border-edge bg-transparent px-3 py-1.5 text-[12.5px] text-muted hover:text-ink disabled:opacity-40"
+    >
+      {children}
+    </button>
+  );
+}

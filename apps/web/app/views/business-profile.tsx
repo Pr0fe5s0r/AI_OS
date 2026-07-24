@@ -2,8 +2,8 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  Dot, GraphThing, Knowledge, Learning, Measurement, Situation, ThingDetail,
-  Understanding, api, firstLine, healthColor, humanize, plural, sourceColor,
+  Dot, Empty, GraphThing, Knowledge, Learning, Measurement, Page, SecondaryBtn, Situation,
+  ThingDetail, Understanding, api, firstLine, healthColor, humanize, plural, sourceColor,
   statusColor, term,
 } from "../lib";
 import { MeasurementCard } from "./learning";
@@ -370,25 +370,32 @@ export default function BusinessProfile({ knowledge, learning, understanding, si
   const workTypes = knowledge.thing_types.filter((item) => item.count > 0);
   const watchCount = (understanding?.checks.universal.length ?? 0) + (understanding?.checks.profile.length ?? 0);
 
-  return <div className="mx-auto max-w-[1120px] px-4 pb-20 pt-6 sm:px-7 sm:pt-8">
-    <header className="mb-5 flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
-      <div>
-        <div className="flex items-center gap-2 text-[10.5px] uppercase tracking-[1.2px] text-info"><span className="h-1.5 w-1.5 bg-info" />AI business memory</div>
-        <h1 className="mb-0 mt-2 text-[24px] font-semibold text-ink">{companyName}</h1>
-        <p className="mb-0 mt-1 max-w-[660px] text-[13px] leading-relaxed text-muted">Everything MarkOS has connected, learned, and is currently questioning about your business.</p>
-      </div>
-      <div className="flex items-center gap-3">
-        <span className="flex items-center gap-2 border border-edge px-3 py-2 text-[11.5px] text-muted"><Dot color={knowledge.company.status === "confirmed" ? "#3fb950" : "#d29922"} size={6} />Profile v{knowledge.company.version} {knowledge.company.status}</span>
-        <button onClick={() => onAsk("Review our complete business memory. Tell me what you know, what is uncertain, and help me correct it.")} className="border border-edgeStrong bg-transparent px-3 py-2 text-[11.5px] text-ink hover:bg-elevated">Review with Agent</button>
-      </div>
-    </header>
+  if (knowledge.graph.things.length === 0 && connected.length === 0) {
+    return (
+      <Page title="Business profile" purpose={`What MarkOS has worked out about ${companyName} from your real records.`}>
+        <Empty
+          title="Nothing learned yet"
+          next="Connect a tool and MarkOS reads its history, works out what your work looks like, and builds this picture from your own records — never from a template."
+        />
+      </Page>
+    );
+  }
 
-    <div className="mb-4 grid border border-edge bg-panel sm:grid-cols-5">
-      <LayerStat label="Sources" value={connected.length} color="#3fb950" />
-      <LayerStat label="Work memories" value={knowledge.graph.things.length} color="#58a6ff" />
-      <LayerStat label={plural(actor)} value={people.length} color="#56d4dd" />
-      <LayerStat label="Patterns learned" value={learned.length} color="#d29922" />
-      <LayerStat label="Open questions" value={clarifications.length} color="#bc8cff" />
+  return <Page
+    title="Business profile"
+    purpose={`Everything MarkOS has connected, learned, and is currently questioning about ${companyName}. Every number here opens the real records behind it.`}
+    action={<SecondaryBtn onClick={() => onAsk("Review our complete business memory. Tell me what you know, what is uncertain, and help me correct it.")}>Review with Agent</SecondaryBtn>}
+    stats={[
+      { label: "sources", value: connected.length, tone: connected.length ? "ok" : "idle" },
+      { label: "work memories", value: knowledge.graph.things.length, tone: "ok" },
+      { label: plural(actor), value: people.length, tone: "ok" },
+      { label: "patterns learned", value: learned.length, tone: learned.length ? "ok" : "idle" },
+      { label: "open questions", value: clarifications.length, tone: clarifications.length ? "waiting" : "ok" },
+    ]}
+  >
+    <div className="mb-4 flex items-center gap-2 text-[11.5px] text-muted">
+      <Dot color={knowledge.company.status === "confirmed" ? "#3fb950" : "#d29922"} size={6} />
+      Profile v{knowledge.company.version} {knowledge.company.status}
     </div>
 
     <section className="grid border border-edge bg-panel lg:grid-cols-[minmax(0,1fr)_300px]">
@@ -423,9 +430,5 @@ export default function BusinessProfile({ knowledge, learning, understanding, si
     </section>
 
     {normOpen && <NormModal measurement={activeNorm} onClose={() => setNormOpen(null)} onAsk={onAsk} />}
-  </div>;
-}
-
-function LayerStat({ label, value, color }: { label: string; value: number; color: string }) {
-  return <div className="border-b border-edge px-4 py-3 last:border-b-0 sm:border-b-0 sm:border-r sm:last:border-r-0"><div className="flex items-center gap-2 text-[10.5px] uppercase tracking-[0.7px] text-subtle"><Dot color={color} size={5} />{label}</div><div className="mt-1.5 text-[17px] font-semibold text-ink">{value}</div></div>;
+  </Page>;
 }

@@ -1,11 +1,11 @@
 "use client";
 
 import { useState } from "react";
-import { Conn, Dot, OAuthTarget, TextBtn } from "../lib";
+import { Conn, Dot, Empty, OAuthTarget, Page, TextBtn } from "../lib";
 
 /* Connections: the tools this company runs on. The list comes from the
-   company's PROFILE (via /api/connections), so an inventory company sees its
-   own sources here, not GitHub.
+   CONNECTOR REGISTRY (via /api/connections) — deriving it from the profile
+   deadlocked a new workspace, which has no profile until events arrive.
 
    A source that offers OAuth (the API says which — never hardcoded here) is
    connected by signing in: no token is ever typed, pasted or held by this
@@ -45,6 +45,9 @@ function ToolCard({ c, count, busy, onConnect, onDisconnect, onSync, onOAuth, on
   const [cfg, setCfg] = useState<any>(c.config ?? {});
   const fields = FIELDS[c.source] ?? [];
   const picks = targets[c.source] ?? [];
+  // which config field names the thing being watched (repo / channel / …), so
+  // the "what's connected" label and the picker aren't hardcoded to GitHub
+  const targetKey = fields[0]?.key ?? "repo";
 
   return (
     <div className="rounded-lg border border-edge bg-panel p-4">
@@ -58,7 +61,7 @@ function ToolCard({ c, count, busy, onConnect, onDisconnect, onSync, onOAuth, on
           <div className="flex items-center gap-[7px] text-[12.5px] text-muted">
             <Dot color="#3fb950" size={6} />
             <span>
-              {c.config?.repo ? `${c.config.repo}` : "Connected"}
+              {c.config?.[targetKey] ? `${c.config[targetKey]}` : "Connected"}
               {count > 0 ? ` · ${count.toLocaleString()} events` : ""}
             </span>
           </div>
@@ -67,7 +70,7 @@ function ToolCard({ c, count, busy, onConnect, onDisconnect, onSync, onOAuth, on
               chosen yet — pick what to watch from what the token can see */}
           {picks.length > 0 && (
             <select
-              value={c.config?.repo ?? ""}
+              value={c.config?.[targetKey] ?? ""}
               onChange={(e) => onPickTarget(c.source, e.target.value)}
               className="mt-2.5 w-full rounded-md border border-edge bg-elevated px-2 py-1.5 text-[12px] text-ink outline-none focus:border-edgeStrong"
             >
@@ -95,12 +98,13 @@ function ToolCard({ c, count, busy, onConnect, onDisconnect, onSync, onOAuth, on
           >
             Sign in with {c.source[0].toUpperCase() + c.source.slice(1)}
           </button>
+          {/* No "use a token instead" escape hatch: where sign-in exists it is
+              the only way in, and the API refuses a pasted token for exactly
+              this source. Offering a door that the server slams is worse than
+              not offering it. */}
           <div className="mt-2 text-[11px] leading-snug text-subtle">
             You approve access on {c.source}&apos;s own page — no token to copy, and MarkOS
-            never sees your password.
-          </div>
-          <div className="mt-1.5">
-            <TextBtn onClick={() => setOpen(true)}>Use a token instead</TextBtn>
+            never sees your password. Revoke it any time from {c.source}&apos;s settings.
           </div>
         </>
       ) : open ? (
@@ -161,12 +165,27 @@ function ToolCard({ c, count, busy, onConnect, onDisconnect, onSync, onOAuth, on
 export default function ConnectionsView({
   conns, eventsBySource, busy, onConnect, onDisconnect, onSync, onOAuth, onPickTarget, targets,
 }: Props) {
+  const live = conns.filter((c) => c.connected);
+  const records = Object.values(eventsBySource).reduce((a, b) => a + b, 0);
+
   return (
-    <div className="mx-auto max-w-[720px] px-7 pb-20 pt-9">
-      <div className="mb-[18px] text-[13px] text-muted">
-        Connect the tools your company runs on — MarkOS learns the rest. Sign-in is handled by
-        the tool itself; anything stored is encrypted at rest.
-      </div>
+    <Page
+      title="Connections"
+      purpose="The tools this workspace reads from. Connect one and MarkOS learns your work from it — nothing is sent back until you allow it."
+      stats={[
+        { label: live.length === 1 ? "tool connected" : "tools connected", value: live.length,
+          tone: live.length ? "ok" : "idle" },
+        { label: "records read", value: records, tone: records ? "ok" : "idle" },
+      ]}
+    >
+      {live.length === 0 && (
+        <div className="mb-4">
+          <Empty
+            title="Nothing is connected yet"
+            next="Pick a tool below and sign in. MarkOS reads its recent history, works out what your work looks like, and starts watching for what needs you."
+          />
+        </div>
+      )}
       <div className="grid grid-cols-3 gap-3">
         {conns.map((c) => (
           <ToolCard
@@ -193,6 +212,6 @@ export default function ConnectionsView({
           </div>
         </div>
       </div>
-    </div>
+    </Page>
   );
 }

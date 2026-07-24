@@ -158,11 +158,12 @@ async def test_open_action_id_finds_only_matching_status() -> None:
         assert await open_action_id(session, company, "sit-2", "page_engineer", ("pending_approval",)) is None
 
 
-def test_a_ui_button_gets_the_params_its_action_needs() -> None:
+async def test_a_ui_button_gets_the_params_its_action_needs() -> None:
     """The Flags buttons only know a situation. The profile's move spec fills
     in the rest — repo/number from the evidence URL, body from the template."""
     situation = _sit()
-    argument = default_argument(SOFTWARE_PROFILE, "comment_on_pr", situation)
+    async with Session() as session:
+        argument = await default_argument(session, SOFTWARE_PROFILE, "comment_on_pr", situation)
     params = params_for_move(SOFTWARE_PROFILE, "comment_on_pr", argument, situation)
     assert params is not None
     assert params["repo"] == "karthikeyan846/Chatbot" and params["number"] == "4"
@@ -170,3 +171,41 @@ def test_a_ui_button_gets_the_params_its_action_needs() -> None:
     comment = params["body"]["body"]
     assert "The bot replies badly." in comment
     assert "Investigate the model config." in comment
+
+
+def test_a_create_move_falls_back_to_the_home_target() -> None:
+    """Cross-app: a create move fired from a Slack incident has no GitHub URL to
+    derive a repo from. Without a home target it can't build (safe); with the
+    connected repo passed in, it opens the issue there."""
+    from apps.common.analysis import params_for_move
+    from packages.connectors.github import MOVES
+    from packages.core.profile import Profile
+
+    prof = Profile(company_id="x", moves={"registry": {"create_issue": MOVES["create_issue"]}})
+    sit = Situation(
+        id="triage:slack:1", company_id="x", rule="needs_triage", severity="high",
+        title="bug", summary="s", created_at=datetime(2026, 7, 25, tzinfo=UTC),
+        evidence=[Evidence(event_id="1", source="slack",
+                           timestamp=datetime(2026, 7, 25, tzinfo=UTC),
+                           excerpt="x", url="https://app.slack.com/client/T/C?msg=1")],
+    )
+    # a Slack URL resolves to no repo -> without a home target, no action is built
+    assert params_for_move(prof, "create_issue", "Fix login", sit) is None
+    # with the connected repo as the home target, it builds and lands there
+    built = params_for_move(prof, "create_issue", "Fix login", sit,
+                            default_target={"repo": "karthikeyan846/Chatbot"})
+    assert built is not None and built["repo"] == "karthikeyan846/Chatbot"
+
+
+def test_a_confident_autonomous_action_is_pre_approved_and_runs() -> None:
+    """An action on the autonomy allow-list that clears the confidence bar is
+    pre-approved BY that policy — it must execute, not sit in the queue. Before
+    this, a confident allowlisted public action still hit the default
+    require-approval gate and waited, the opposite of acting on its own."""
+    from packages.core.act import needs_approval
+
+    public_move = {"public": True}  # no explicit approval_required
+    # the autonomous step, not deferring to a human, marks it pre_approved
+    assert needs_approval(public_move, {"pre_approved": True, "allow_public_actions": True}) is False
+    # deferring to a human (low confidence / escalate) still queues
+    assert needs_approval(public_move, {"pre_approved": False, "force_approval": True}) is True

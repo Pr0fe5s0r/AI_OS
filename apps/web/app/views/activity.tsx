@@ -1,9 +1,20 @@
 ﻿"use client";
 
 import { useState } from "react";
-import { AuditEntry, Dot, dayTime, humanize, sourceColor } from "../lib";
+import { AuditEntry, Dot, Empty, Page, dayTime, humanize, humanizeLabel, sourceColor } from "../lib";
 
-const AUTOMATED = new Set(["ai", "scheduler", "system", "github-webhook", "api"]);
+/* Who did this — a person, or the system?
+   This used to be an allowlist of machine names, which gets the default exactly
+   backwards: any actor not on the list counted as a HUMAN, so `watcher_cron`
+   read as nine people and a workspace with one real action reported "10 by
+   people". An allowlist of automation can only ever be out of date, because
+   every new cron or callback is a name nobody remembered to add.
+   A person is the identifiable case: since sign-in exists, a human action is
+   audited under their email address. Everything else is the system. */
+function isPerson(actor: string): boolean {
+  return actor.includes("@");
+}
+
 type Filter = "all" | "auto" | "people";
 
 type ActivityRow = { key: string; entry: AuditEntry };
@@ -31,7 +42,7 @@ function readableValue(value: unknown) {
 }
 
 function ActivityDetail({ entry }: { entry: AuditEntry }) {
-  const auto = AUTOMATED.has(entry.actor);
+  const auto = !isPerson(entry.actor);
   const kind = activityKind(entry);
   const sources = rowSources(entry);
   const metadata = Object.entries(entry.metadata ?? {}).filter(([, value]) => value !== null && value !== "");
@@ -45,12 +56,18 @@ function ActivityDetail({ entry }: { entry: AuditEntry }) {
       </div>
 
       <h2 className="m-0 text-[20px] font-semibold leading-snug text-ink">{humanize(entry.action)}</h2>
-      {entry.target && <p className="mb-0 mt-2 text-[13.5px] leading-relaxed text-muted">{humanize(entry.target)}</p>}
+      {entry.target && <p className="mb-0 mt-2 text-[13.5px] leading-relaxed text-muted">{humanizeLabel(entry.target)}</p>}
 
       <div className="mt-6 grid border-y border-edge sm:grid-cols-3">
         <div className="py-3 sm:border-r sm:border-edge sm:pr-4">
           <div className="text-[10.5px] uppercase tracking-[1px] text-subtle">Done by</div>
-          <div className="mt-1 text-[12.5px] text-ink">{auto ? "MarkOS automation" : entry.actor}</div>
+          {/* Name the actual automation, not just "MarkOS". `watcher_cron` and
+              `connect` did different things for different reasons, and an audit
+              trail that flattens every machine into one word cannot answer the
+              question it exists for: which part of the system did this? */}
+          <div className="mt-1 text-[12.5px] text-ink">
+            {auto ? `MarkOS automation · ${entry.actor}` : entry.actor}
+          </div>
         </div>
         <div className="border-t border-edge py-3 sm:border-r sm:border-t-0 sm:px-4">
           <div className="text-[10.5px] uppercase tracking-[1px] text-subtle">When</div>
@@ -98,10 +115,10 @@ export default function ActivityView({ entries }: { entries: AuditEntry[] | null
   const allRows: ActivityRow[] = entries.map((entry, index) => ({ key: `${entry.created_at}:${entry.action}:${entry.target}:${index}`, entry }));
   const counts = {
     all: allRows.length,
-    auto: allRows.filter(({ entry }) => AUTOMATED.has(entry.actor)).length,
-    people: allRows.filter(({ entry }) => !AUTOMATED.has(entry.actor)).length,
+    auto: allRows.filter(({ entry }) => !isPerson(entry.actor)).length,
+    people: allRows.filter(({ entry }) => !!isPerson(entry.actor)).length,
   };
-  const rows = allRows.filter(({ entry }) => filter === "all" || (filter === "auto" ? AUTOMATED.has(entry.actor) : !AUTOMATED.has(entry.actor)));
+  const rows = allRows.filter(({ entry }) => filter === "all" || (filter === "auto" ? !isPerson(entry.actor) : !!isPerson(entry.actor)));
 
   const selected = rows.find((row) => row.key === selectedKey) ?? rows[0];
 
@@ -111,14 +128,27 @@ export default function ActivityView({ entries }: { entries: AuditEntry[] | null
     { key: "people", label: "People", hint: "Human decisions" },
   ];
 
-  return (
-    <div className="mx-auto max-w-[1080px] px-5 pb-16 pt-7 sm:px-8 sm:pt-9">
-      <header className="mb-6">
-        <div className="text-[11px] uppercase tracking-[1px] text-subtle">Audit trail</div>
-        <h1 className="mb-0 mt-1 text-[22px] font-semibold text-ink">Activity</h1>
-        <p className="mb-0 mt-1 text-[13px] leading-relaxed text-muted">Every change is kept here. Select an event to see who made it, where it came from, and the exact data recorded.</p>
-      </header>
+  if (allRows.length === 0) {
+    return (
+      <Page title="Activity" purpose="Every change MarkOS or a person made, kept permanently.">
+        <Empty
+          title="Nothing has happened yet"
+          next="Once a tool is connected, every sync, every judgment and every action lands here — with who did it and the exact data recorded."
+        />
+      </Page>
+    );
+  }
 
+  return (
+    <Page
+      title="Activity"
+      purpose="Every change is kept here. Select an entry to see who made it, where it came from, and the exact data recorded."
+      stats={[
+        { label: "entries", value: counts.all, tone: "ok" },
+        { label: "by AI + system", value: counts.auto, tone: "ok" },
+        { label: "by people", value: counts.people, tone: "ok" },
+      ]}
+    >
       <div className="mb-4 grid grid-cols-3 border border-edge">
         {filters.map((item, index) => (
           <button key={item.key} onClick={() => setFilter(item.key)} className={`min-h-[68px] border-0 bg-transparent px-3 py-2.5 text-left transition-colors sm:px-4 ${index > 0 ? "border-l border-edge" : ""} ${filter === item.key ? "bg-elevated" : "hover:bg-panel"}`}>
@@ -132,7 +162,7 @@ export default function ActivityView({ entries }: { entries: AuditEntry[] | null
       <div className="grid overflow-hidden border border-edge lg:grid-cols-[330px_minmax(0,1fr)]">
         <div className="max-h-[310px] overflow-y-auto border-b border-edge bg-panel lg:max-h-[590px] lg:border-b-0 lg:border-r">
           {rows.map(({ key, entry }) => {
-            const auto = AUTOMATED.has(entry.actor);
+            const auto = !isPerson(entry.actor);
             const kind = activityKind(entry);
             const sources = rowSources(entry);
             return (
@@ -141,7 +171,7 @@ export default function ActivityView({ entries }: { entries: AuditEntry[] | null
                   <span className="mt-1"><Dot color={kind.color} /></span>
                   <span className="min-w-0 flex-1">
                     <span className="block truncate text-[13px] font-semibold text-ink">{humanize(entry.action)}</span>
-                    <span className="mt-1 block truncate text-[11.5px] text-subtle">{entry.target ? humanize(entry.target) : kind.label}</span>
+                    <span className="mt-1 block truncate text-[11.5px] text-subtle">{entry.target ? humanizeLabel(entry.target) : kind.label}</span>
                     <span className="mt-1.5 flex items-center justify-between gap-3 text-[10.5px] text-subtle">
                       <span>{auto ? "MarkOS" : entry.actor}</span>
                       <span className="flex items-center gap-1.5">{sources.map((source) => <Dot key={source} color={sourceColor(source)} size={5} />)}{dayTime(entry.created_at)}</span>
@@ -157,7 +187,6 @@ export default function ActivityView({ entries }: { entries: AuditEntry[] | null
           {selected ? <ActivityDetail entry={selected.entry} /> : <div className="p-8 text-[13px] text-subtle">Select an event to inspect it.</div>}
         </div>
       </div>
-    </div>
+    </Page>
   );
 }
-

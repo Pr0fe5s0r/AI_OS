@@ -112,6 +112,29 @@ async def _connector_spec(
     )
 
 
+def _merge_new_source(base: Profile, induced: Profile, source: str) -> Profile:
+    """Fold a newly-discovered source's mapping into the existing profile. Keep
+    everything the workspace already learned (other sources, things, links,
+    moves, vocabulary, reviewers); replace only this source's own entry and add
+    any rhythms/watchers it proposed that aren't already there. `moves` and
+    `reviewers` come back on load through the connector overlays once the source
+    is present, so they need no merging here."""
+    new_src = next((s for s in induced.sources if s.get("source") == source), None)
+    sources = [s for s in base.sources if s.get("source") != source]
+    if new_src is not None:
+        sources.append(new_src)
+
+    def _add(existing: list, extra: list) -> list:
+        seen = {x.get("name") for x in existing if isinstance(x, dict)}
+        return existing + [x for x in extra if isinstance(x, dict) and x.get("name") not in seen]
+
+    return base.model_copy(update={
+        "sources": sources,
+        "rhythms": _add(base.rhythms, induced.rhythms),
+        "watchers": _add(base.watchers, induced.watchers),
+    })
+
+
 async def propose_from_connector(
     session: AsyncSession,
     company_id: str,
@@ -137,6 +160,16 @@ async def propose_from_connector(
     profile, report = induce_profile(
         company_id, source, spec["type"], raws, INDUCE_PROMPT
     )
+    # Adding a source must ADD to the profile, not replace it. induce_profile
+    # only sees the new source's payloads, so on its own it proposes a profile
+    # with just that source — confirming which would wipe every OTHER source the
+    # workspace already learned (this silently deleted a GitHub setup the first
+    # time a second tool was connected). Fold the new source into the existing
+    # confirmed profile instead, keeping its things, moves, reviewers and other
+    # sources intact.
+    existing = await load_profile(session, company_id)
+    if existing is not None:
+        profile = _merge_new_source(existing, profile, source)
     await ensure_company(session, company_id, company_id)
     version = await save_profile(session, profile, status="proposed")
     profile.version = version

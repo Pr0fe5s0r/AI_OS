@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import {
-  Dot, StepApp, WorkflowStep, WorkflowTrigger, appColor, humanize, triggerLabel,
+  Dot, StepApp, WorkflowStep, WorkflowTrigger, appColor, humanize, nextRunLabel, triggerLabel,
 } from "../lib";
 
 /* The n8n-style workflow canvas: a trigger node at the top, then action nodes
@@ -70,6 +70,7 @@ function targetChip(step: WorkflowStep): string | null {
 type Controls = {
   onToggle?: (index: number) => void;
   onMove?: (index: number, dir: -1 | 1) => void;
+  onEditTrigger?: () => void;
 };
 
 function StepNode({ step, index, total, controls }: {
@@ -100,8 +101,8 @@ function StepNode({ step, index, total, controls }: {
             {target && (
               <span className="rounded border border-edge px-1.5 py-[1px] text-[10px] text-info">{target}</span>
             )}
-            {step.requires_approval && (
-              <span className="rounded border border-edge px-1.5 py-[1px] text-[10px] text-warn">waits for approval</span>
+            {step.acts_live && (
+              <span className="rounded border border-edge px-1.5 py-[1px] text-[10px] text-warn">acts on your tools for real</span>
             )}
             {off && <span className="text-[10px] text-subtle">disabled</span>}
           </div>
@@ -149,7 +150,9 @@ export function WorkflowGraph({ trigger, steps, controls }: {
 }) {
   return (
     <div className="flex flex-col">
-      {/* trigger node */}
+      {/* trigger node — the one node you can edit directly, because "when does
+          this run" is the question people ask first and shouldn't have to
+          phrase as a chat message */}
       <div className="rounded-lg border px-3.5 py-2.5" style={{ borderColor: "#2a3a2c", background: "rgba(63,185,80,0.06)" }}>
         <div className="flex items-center gap-2">
           <span className="flex h-[18px] w-[18px] flex-none items-center justify-center rounded-full text-accent" style={{ background: "rgba(63,185,80,0.14)" }}>
@@ -157,7 +160,20 @@ export function WorkflowGraph({ trigger, steps, controls }: {
           </span>
           <span className="text-[10px] font-semibold uppercase tracking-[1px] text-accent">Trigger</span>
           <span className="truncate text-[12.5px] text-ink">{triggerLabel(trigger)}</span>
+          {controls?.onEditTrigger && (
+            <button
+              onClick={controls.onEditTrigger}
+              className="ml-auto flex-none rounded border border-edge bg-transparent px-2 py-[2px] text-[11px] text-muted hover:text-ink"
+            >
+              Change schedule
+            </button>
+          )}
         </div>
+        {trigger?.type === "schedule" && trigger.config?.cron && (
+          <div className="mt-1 pl-[26px] text-[11px] text-subtle">
+            {trigger.config.cron} · next run {nextRunLabel(String(trigger.config.cron))}
+          </div>
+        )}
       </div>
 
       {steps.map((step, i) => (

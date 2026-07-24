@@ -139,6 +139,17 @@ class Situation(BaseModel):
     resolved_choice: str | None = None  # the Choice.id the user picked
     resolved_by: str | None = None
     snoozed_until: datetime | None = None  # a "remind me later" choice sets this
+    # Line-anchored review findings (all None on an ordinary thing-level
+    # situation). When a reviewer concern pins a defect to a spot in a diff,
+    # these carry it, so act() can post an INLINE review comment rather than a
+    # top-level one, and the feed can show the exact location. `confidence` is
+    # the reviewer's own certainty, which the autonomy gate reads; `category`
+    # is the concern's free-text label ("injection", "missing-test").
+    file_path: str | None = None
+    line_start: int | None = None
+    line_end: int | None = None
+    confidence: float | None = None
+    category: str | None = None
 
 
 class ActionLink(BaseModel):
@@ -160,6 +171,10 @@ class Brief(BaseModel):
     assigned_to: str | None = None
     action_links: list[ActionLink] = Field(default_factory=list)
     note: str = ""  # extra context rendered above the buttons
+    # A stable "company:situation" tag stamped into the subject so a REPLY to
+    # this email can be correlated back (the reply echoes the subject). This is
+    # what lets a lead answer "give it to Bob instead" and have the system act.
+    reply_ref: str = ""
 
 
 class AssigneeDecision(BaseModel):
@@ -176,6 +191,70 @@ class DeliveryReceipt(BaseModel):
     recipient: str
     status: str
     delivered_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# Review layer — grounded specialist fan-out over a Thing's content.
+# A reviewer reads one Thing (a PR diff, a receiving report) through several
+# concerns at once and returns structured Findings. All DATA-driven: what the
+# concerns are, and their prompts, come from the profile/connector — core names
+# no concern. Findings become line-anchored Situations (see Situation above).
+# ---------------------------------------------------------------------------
+
+
+class ReviewerConcern(BaseModel):
+    """One specialist pass — the blog's "security / quality / tests / docs",
+    but named by DATA, never by core. ``prompt`` is the instruction handed to
+    the model alongside the grounded context; ``severity_ceiling`` caps how
+    loud this concern is allowed to be (a docs nit can't claim `critical`)."""
+
+    key: str
+    prompt: str = ""
+    severity_ceiling: str = "critical"  # critical | high | medium | low | info
+
+
+class Reviewer(BaseModel):
+    """A grounded reviewer, expressed as profile/connector data.
+
+    ``select`` picks the Things to review (same selector grammar watchers use:
+    ``thing_type`` + ``where``). ``ground`` says how to build context —
+    ``attach`` names connector fields to fold in (changed_paths, commits,
+    thread) and ``retrieve`` tunes the hybrid search neighbours. ``concerns``
+    is the fan-out. ``post`` names the move to act through and the autonomy
+    gate — which, until we've proven review quality, stays closed so nothing
+    reaches a real repo without a human.
+    """
+
+    key: str
+    select: dict[str, Any] = Field(default_factory=dict)
+    ground: dict[str, Any] = Field(default_factory=dict)
+    concerns: list[ReviewerConcern] = Field(default_factory=list)
+    post: dict[str, Any] = Field(default_factory=dict)
+
+
+class Finding(BaseModel):
+    """The fixed output contract of every concern — deciding this shape up
+    front is what lets dedup, gating and posting stay deterministic.
+
+    A finding WITH file/line anchors becomes an inline review comment; without
+    them it is a thing-level situation. ``confidence`` drives the autonomy
+    gate; ``rationale`` is the cited evidence the model must supply so a
+    finding can be traced, not just asserted.
+    """
+
+    reviewer_key: str
+    concern: str
+    thing_id: str
+    source: str = ""
+    severity: str = "low"  # critical | high | medium | low | info
+    category: str = ""
+    title: str = ""
+    file_path: str | None = None
+    line_start: int | None = None
+    line_end: int | None = None
+    confidence: float = 0.0
+    rationale: str = ""
+    suggestion: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -276,8 +355,11 @@ class TeamMember(BaseModel):
 class WorkflowStep(BaseModel):
     """One step of a compiled plan. ``tool``/``args`` map onto a tool the agent
     already has, so a plan can never propose something the engine can't do.
-    ``requires_approval`` is decided at plan time from the tool + the profile;
-    it is advisory — the real brake is still act()'s gate at run time.
+    ``acts_live`` marks a step that performs a REAL outward action on a
+    connected tool (a comment, a label, a merge) when the workflow runs — as
+    opposed to a read step. A saved workflow runs autonomously and for real
+    (see apps.common.workflows_flow), so this is what the review UI uses to
+    show, before anyone enables it, which steps will actually touch GitHub.
 
     ``select`` makes a run_action step DYNAMIC: instead of a fixed
     ``args.situation_id`` captured when the plan was written, the step targets
@@ -290,7 +372,7 @@ class WorkflowStep(BaseModel):
     tool: str
     args: dict[str, Any] = Field(default_factory=dict)
     description: str = ""  # plain-language "what this step does", for the review UI
-    requires_approval: bool = False
+    acts_live: bool = False  # performs a real outward action when the workflow runs
     select: dict[str, Any] | None = None  # run-action fan-out target, resolved at run time
     enabled: bool = True  # a disabled node is kept in the graph but skipped at run time
 

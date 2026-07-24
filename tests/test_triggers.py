@@ -10,7 +10,7 @@ from apps.common.triggers import fire_event_workflows, run_scheduled_workflows
 from packages.core import workflows as wf
 from packages.core.db import Session
 from packages.core.profile import Profile
-from packages.core.workflows import claim_fire, cron_matches, minute_bucket
+from packages.core.workflows import claim_fire, cron_matches, minute_bucket, valid_cron
 from packages.shared.schema import WorkflowStep, WorkflowTrigger
 
 # The triggers runtime (build 3): what fires a saved workflow without a person.
@@ -33,9 +33,9 @@ def _profile() -> Profile:
         moves={
             "registry": {
                 "safe_log": {"kind": "log", "approval_required": False, "template": "noted (safe)"},
-                "gated_log": {"kind": "log", "approval_required": False, "template": "noted (gated)"},
+                "gated_log": {"kind": "log", "approval_required": True, "template": "noted (gated)"},
             },
-            "autonomy": {"allowed_actions": ["safe_log"]},
+            "autonomy": {"allowed_actions": []},
             "approval_defaults": {"dry_run": True},
         },
     )
@@ -137,6 +137,16 @@ def test_malformed_cron_never_fires() -> None:
         assert cron_matches(bad, when) is False, bad
 
 
+def test_valid_cron_agrees_with_matching() -> None:
+    """What the API accepts must be exactly what the runtime can fire. A schedule
+    that validates but never matches would be the worst kind of silent failure."""
+    for good in ("0 9 * * *", "*/15 * * * *", "0 9 * * 1-5", "0,30 8-18 * * *", "* * * * *"):
+        assert valid_cron(good) is True, good
+    for bad in ("", "0 9 * *", "every morning", "99 9 * * *", "0 9 * * abc", "0 9 * * */0"):
+        assert valid_cron(bad) is False, bad
+        assert cron_matches(bad, datetime(2026, 7, 21, 9, 0, tzinfo=UTC)) is False
+
+
 def test_minute_bucket_is_stable_within_a_minute() -> None:
     a = datetime(2026, 7, 21, 9, 5, 1, tzinfo=UTC)
     b = datetime(2026, 7, 21, 9, 5, 59, tzinfo=UTC)
@@ -223,15 +233,16 @@ async def test_disabled_workflow_never_fires_on_schedule() -> None:
     assert result["fired"] == 0
 
 
-async def test_unattended_run_still_obeys_the_allowlist_gate() -> None:
-    """The safety-critical one. Nobody is watching a scheduled run, so an
-    off-allowlist action must queue for approval — exactly as it would if a
-    person had pressed Run. Unattended buys no extra privilege."""
+async def test_a_scheduled_run_acts_autonomously_without_a_human() -> None:
+    """Nobody is watching a scheduled run — which is the whole point. A saved,
+    scheduled workflow was authorized when it was built and enabled, so it runs
+    every step on its own, even ones off the allowlist or marked
+    approval_required. Unattended is the intended state, not a reason to stop."""
     when = datetime(2026, 7, 21, 9, 0, tzinfo=UTC)
     async with Session() as session:
         await _reset(session)
         await wf.save_workflow(
-            session, _CO, "gated schedule", "do both on a schedule",
+            session, _CO, "auto schedule", "do both on a schedule",
             [
                 WorkflowStep(tool="run_action", args={"action": "safe_log", "situation_id": "s1"}),
                 WorkflowStep(tool="run_action", args={"action": "gated_log", "situation_id": "s2"}),
@@ -244,9 +255,8 @@ async def test_unattended_run_still_obeys_the_allowlist_gate() -> None:
         result = await run_scheduled_workflows({}, now=when)
 
     statuses = [r["status"] for r in result["runs"][0]["step_results"]]
-    assert statuses[0] == "recorded"
-    assert statuses[1] == "pending_approval"
-    assert result["runs"][0]["status"] == "needs_approval"
+    assert statuses == ["recorded", "recorded"]
+    assert result["runs"][0]["status"] == "done"
 
 
 # -------------------------------- event runs --------------------------------

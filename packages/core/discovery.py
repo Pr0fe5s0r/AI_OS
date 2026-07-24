@@ -4,7 +4,8 @@ import json
 from datetime import datetime
 from typing import Any
 
-from packages.core.ingest import ingest
+from packages.connectors.base import record_kind_field_for
+from packages.core.ingest import apply_declared_mapping, ingest
 from packages.core.llm import chat
 from packages.core.profile import Profile
 
@@ -199,7 +200,15 @@ _SLOTS_SCHEMA: dict[str, Any] = {
                 "thing_type": {"type": "string", "description": "PascalCase name for the main record, e.g. Incident"},
                 "event_type": {"type": "string", "description": "snake_case name for the event, e.g. issue"},
                 "id_template": {"type": "string", "description": "unique id template using {field} placeholders"},
-                "timestamp_field": {"type": "string"},
+                "timestamp_field": {"type": "string", "description": "when the record was CREATED"},
+                "activity_field": {
+                    "type": "string",
+                    "description": (
+                        "field holding when the record was LAST CHANGED (e.g. updated_at, "
+                        "modified, last_edited). Distinct from timestamp_field. Empty string "
+                        "if the payload has no such field."
+                    ),
+                },
                 "title_field": {"type": "string"},
                 "body_field": {"type": "string"},
                 "status_field": {"type": "string"},
@@ -301,9 +310,21 @@ def _mapping_from(proposal: dict[str, Any], source: str) -> dict[str, Any]:
 
     # actor is already a concrete path to a string (e.g. "user.login") — the
     # inventory resolves nested actor objects down to the name field itself
+    # One source can return several KINDS of record — GitHub's /issues endpoint
+    # hands back pull requests too. A constant `type` flattened them into one
+    # indistinguishable pile: no way to filter PRs, and no way for a move that
+    # only works on a PR to know it didn't apply. Where the connector declares
+    # a discriminator field, read `type` from it; the induced name stays as the
+    # default so a payload missing the field still normalizes.
+    fallback_type = proposal.get("event_type") or "record"
+    kind_field = record_kind_field_for(source)
+    type_op: dict[str, Any] = (
+        {"path": kind_field, "default": fallback_type} if kind_field else {"const": fallback_type}
+    )
+
     mapping: dict[str, Any] = {
         "id": {"template": proposal.get("id_template") or f"{source}-{{id}}"},
-        "type": {"const": proposal.get("event_type") or "record"},
+        "type": type_op,
         "actor_id": {"path": actor or "actor", "default": "unknown"},
         "actor_name": {"path": actor or "actor", "default": "unknown"},
         "timestamp": {"path": proposal.get("timestamp_field") or ""},
@@ -316,7 +337,14 @@ def _mapping_from(proposal: dict[str, Any], source: str) -> dict[str, Any]:
         mapping["metadata"]["url"] = {"path": proposal["url_field"]}
     if proposal.get("end_field"):
         mapping["metadata"][proposal["end_field"].split(".")[-1]] = {"path": proposal["end_field"]}
-    return mapping
+    if proposal.get("activity_field"):
+        mapping["metadata"][proposal["activity_field"].split(".")[-1]] = {
+            "path": proposal["activity_field"]
+        }
+    # whatever the connector STATES rather than something induced from samples
+    # — same fold that load_profile applies, so a freshly discovered mapping and
+    # a refreshed old one are identical
+    return apply_declared_mapping(source, mapping)
 
 
 def build_profile(company_id: str, source: str, connector: str, proposal: dict[str, Any]) -> Profile:
@@ -325,6 +353,7 @@ def build_profile(company_id: str, source: str, connector: str, proposal: dict[s
     event_type = proposal.get("event_type") or "record"
     status_leaf = (proposal.get("status_field") or "").split(".")[-1]
     end_leaf = (proposal.get("end_field") or "").split(".")[-1]
+    activity_leaf = (proposal.get("activity_field") or "").split(".")[-1]
     vocab = proposal.get("vocabulary") or {}
 
     rhythms = []
@@ -354,6 +383,8 @@ def build_profile(company_id: str, source: str, connector: str, proposal: dict[s
             "types": [{"name": thing_type, "source": source, "event_type": event_type}],
             "default_type": "Event",
             "status_field": status_leaf or "status",
+            # what "still moving" is measured from — see resolve._last_activity
+            "activity_field": activity_leaf,
             "actor_thing": {"type": "Person"},
             "entity_rules": {
                 "id_patterns": [r"#(\d+)", r"\b[A-Z]{3,}-\d+\b"],

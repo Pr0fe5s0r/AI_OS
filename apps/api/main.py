@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
@@ -11,7 +12,9 @@ from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from apps.api.auth_routes import router as auth_router
 from apps.common.analysis import (
     ASSIGN_PURPOSE,
     accept_assignment,
@@ -19,9 +22,13 @@ from apps.common.analysis import (
     free_members,
     propose_assignment,
     request_action,
+    request_pr_review,
+    review_findings,
+    review_one_record,
+    reviewable_types,
     run_analysis,
 )
-from apps.common.assistant_tools import answer
+from apps.common.assistant_tools import answer, answer_streaming, history_for_model
 from apps.common.clarifications import resolve_clarification
 from apps.common.context import (
     DRY_RUN_KEY,
@@ -29,7 +36,6 @@ from apps.common.context import (
     approval_policy,
     get_profile,
     save_team_roster,
-    seed_all_profiles,
     team_roster,
 )
 from apps.common.discovery_flow import (
@@ -38,10 +44,13 @@ from apps.common.discovery_flow import (
     propose_from_connector,
 )
 from apps.common.feed_stream import CHANNEL as FEED_CHANNEL
+from apps.common.inbound import handle_inbound_reply
 from apps.common.ingestion import push_events, trigger_backfill, trigger_ingest
+from apps.common.scheduling import ingest_timeout
 from apps.common.understanding import describe
 from apps.common.webhooks import handle_github_webhook
 from apps.common.workflows_flow import (
+    _acts_live,
     apps_used,
     edit_workflow,
     plan_workflow,
@@ -61,7 +70,10 @@ from packages.core.act import decide, list_actions
 from packages.core.briefing import build_briefing
 from packages.core.conversations import (
     add_message,
+    conversation_exists,
+    create_conversation,
     get_or_create_default_conversation,
+    list_conversations,
     list_messages,
 )
 from packages.core.credentials import (
@@ -80,7 +92,14 @@ from packages.core.items import item_facets, list_items
 from packages.core.norms import get_norms, norm_evidence, reset_norms
 from packages.core.oauth import OAuthError, authorize_url, exchange_code
 from packages.core.pipeline import redis_settings
-from packages.core.profile import Profile, load_profile, save_profile, set_source_enabled
+from packages.core.profile import (
+    Profile,
+    load_profile,
+    save_profile,
+    set_autonomy,
+    set_source_enabled,
+)
+from packages.core.review import record_dismissal, suppression_report
 from packages.core.search import search
 from packages.core.settings import set_setting
 from packages.core.situations import (
@@ -101,12 +120,9 @@ from packages.shared.schema import TeamMember, WorkflowStep, WorkflowTrigger
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Graph constraints/indexes/vector index are created idempotently on every
-    # boot; profile seeds land once (idempotent by content).
+    # boot. Nothing else is planted: a company's profile is DISCOVERED from its
+    # own data once a source is connected, never seeded from a file.
     await graph.bootstrap()
-    async with Session() as session:
-        seeded = await seed_all_profiles(session)
-        await session.commit()
-    print(f"profiles ready: {', '.join(seeded) or 'none'}")
     yield
     await graph.close_driver()
 
@@ -116,6 +132,10 @@ app = FastAPI(title="MarkOS", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
+
+# Identity. Registered first so /api/auth/* is reachable without a session;
+# every other route below depends on company_scope and 401s without one.
+app.include_router(auth_router)
 
 
 async def profile_scope(company_id: str = Depends(company_scope)) -> Profile:
@@ -366,13 +386,25 @@ async def remove_member(member_id: str, company_id: str = Depends(company_scope)
 
 
 @app.get("/api/connections")
-async def get_connections(
-    company_id: str = Depends(company_scope),
-    profile: Profile = Depends(profile_scope),
-) -> dict:
-    supported = [s["source"] for s in profile.sources if s.get("kind") == "connector"]
+async def get_connections(company_id: str = Depends(company_scope)) -> dict:
+    """What this workspace CAN connect, and what it already has.
+
+    The list comes from the connector registry, never from the profile. Deriving
+    it from the profile was a deadlock: a new workspace has no profile, a
+    profile is discovered from events, and events only arrive once a source is
+    connected — so the one screen you need on day one showed nothing to click.
+    Capability belongs to the connectors, the same rule the action registry
+    already follows.
+    """
+    supported = list(SUPPORTED_SOURCES)
     async with Session() as session:
         conns = await list_connections(session, company_id)
+        profile = await load_profile(session, company_id)
+    # a profile may name a source the registry doesn't ship (a push-only feed)
+    for source in (profile.sources if profile else []):
+        name = str(source.get("source") or "")
+        if source.get("kind") == "connector" and name and name not in supported:
+            supported.append(name)
     connected = {c.source: c for c in conns}
     def _oauth_state(source: str) -> dict:
         """Whether this source offers "sign in with…" — asked of the connector
@@ -526,21 +558,42 @@ async def connect(
 ) -> dict:
     """Save a connection.
 
-    A company that already has a profile may only connect a source that
-    profile declares — the profile is the contract. But a company being
-    ONBOARDED has no profile yet (that's what discovery is for), so before
-    one exists we validate against the connector registry instead. Requiring
-    a profile here would make it impossible to ever connect the first tool.
+    What may be connected is whatever the CONNECTOR REGISTRY ships, plus
+    anything extra the profile names. The profile can only widen that set,
+    never narrow it: a new workspace has an empty profile, and letting an
+    empty profile veto the registry made every first connection fail with
+    "unsupported source" — the same deadlock the GET route had.
     """
     async with Session() as session:
         existing = await load_profile(session, company_id)
+    supported = set(SUPPORTED_SOURCES)
     if existing is not None:
-        supported = [s["source"] for s in existing.sources if s.get("kind") == "connector"]
-        if source not in supported:
-            raise HTTPException(400, f"unsupported source: {source}")
-    elif source not in SUPPORTED_SOURCES:
+        supported |= {
+            str(s.get("source")) for s in existing.sources if s.get("kind") == "connector"
+        }
+    if source not in supported:
         raise HTTPException(400, f"unsupported source: {source}")
     token = payload.pop("token", "") or ""
+
+    # Where a real sign-in exists, it is the ONLY way in. A pasted token is a
+    # long-lived secret this system then has to hold, with whatever breadth the
+    # person happened to grant it and no way to tell whose it is; the OAuth
+    # grant is scoped, attributable and revocable from the provider's own
+    # settings page. Enforced HERE rather than by hiding the field, because a
+    # control that is merely invisible is still an endpoint — and this one
+    # writes a credential.
+    #
+    # Sources with no OAuth app configured are unaffected: for them a token is
+    # the only way to connect at all, and refusing it would just mean nobody
+    # can connect anything.
+    provider = oauth_provider_for(source)
+    if token and provider is not None and provider.configured:
+        raise HTTPException(
+            400,
+            f"{source} connects by signing in, not with a pasted token — "
+            f"use Sign in with {source.capitalize()} so access stays scoped and revocable.",
+        )
+
     async with Session() as session:
         # An empty token means "I'm only changing config" (e.g. picking which
         # repo to watch after an OAuth grant) — NOT "throw my token away".
@@ -553,7 +606,48 @@ async def connect(
         await audit.record(session, company_id, "api", "connection.saved", target=source,
                            metadata={"config": payload})
         await session.commit()
-    return {"source": source, "connected": True, "config": payload}
+
+    # Connecting a tool has to be enough. Until now the profile was seeded from
+    # a file, so a connection was the only missing piece; with discovery it is
+    # the FIRST piece, and leaving induction to a button nobody knew to press
+    # meant a connected workspace stayed permanently empty. Discovery validates
+    # itself — a proposal that cannot normalize its own sample payloads is
+    # rejected — so a proposal that survives that is safe to activate.
+    discovered = None
+    if existing is None or not any(s.get("source") == source for s in existing.sources):
+        try:
+            async with Session() as session:
+                proposal = await propose_from_connector(session, company_id, source, limit=30)
+                await session.commit()
+            async with Session() as session:
+                await confirm_proposed(session, company_id, proposal["version"])
+                await session.commit()
+            discovered = {"version": proposal["version"], "things": proposal.get("things", [])}
+        except Exception as exc:
+            # the connection itself is saved and valid; discovery can be retried
+            discovered = {"error": str(exc)}
+
+    # Learning the SHAPE of the data is not the same as having any. Discovery
+    # alone left a freshly connected workspace empty until the next scan tick,
+    # and left the agent blind to everything opened or closed before we arrived.
+    # Queued rather than awaited: a history walk paces itself across pages and
+    # has no business holding an HTTP request open.
+    syncing = False
+    try:
+        pool = await create_pool(redis_settings())
+        try:
+            await pool.enqueue_job("first_sync", company_id, source)
+            syncing = True
+        finally:
+            await pool.aclose()
+    except Exception:
+        # the connection is still real; the scan cron will pick it up
+        syncing = False
+
+    return {
+        "source": source, "connected": True, "config": payload,
+        "discovered": discovered, "syncing": syncing,
+    }
 
 
 @app.delete("/api/connections/{source}")
@@ -755,10 +849,42 @@ async def analyze(
     company_id: str = Depends(company_scope),
     profile: Profile = Depends(profile_scope),
 ) -> dict:
-    """Learn norms -> detect situations -> assemble briefs -> deliver."""
+    """Learn norms -> detect situations -> assemble briefs -> deliver.
+
+    Re-reasons over what has already been ingested; it does NOT poll. Use
+    /api/scan for the "check my tools again" button.
+    """
     async with Session() as session:
         summary = await run_analysis(session, profile)
         await audit.record(session, company_id, "api", "analyze.run", metadata=summary)
+        await session.commit()
+    return summary
+
+
+@app.post("/api/scan")
+async def scan_now(
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+) -> dict:
+    """Poll every connected source, then reason over what came back.
+
+    What "Scan now" always claimed to do and didn't: it called /api/analyze,
+    which only re-reasons over events already stored. Sitting next to "N events
+    watched", a button reading "Scan now" that cannot discover a single new
+    record is a promise the product does not keep — a pull request opened
+    minutes earlier stayed invisible until the 15-minute cron happened to run.
+
+    Deliberately the same two steps, in the same order, as the unattended scan
+    (apps.common.scheduling.scheduled_scan): fetch and WAIT for the queue to
+    drain, then analyse. Waiting is what makes the button honest — detection
+    reads events from the store, so returning before they land would report on
+    the state that existed before the click.
+    """
+    async with Session() as session:
+        ingested = await trigger_ingest(session, profile, wait=ingest_timeout())
+        summary = await run_analysis(session, profile)
+        summary["ingested"] = ingested
+        await audit.record(session, company_id, "ui", "scan.run", metadata=summary)
         await session.commit()
     return summary
 
@@ -791,12 +917,82 @@ async def dismiss_situation_route(
     situation_id: str, company_id: str = Depends(company_scope)
 ) -> dict:
     async with Session() as session:
+        # Record the dismissal BEFORE resolving it: record_dismissal reads the
+        # situation's rule/category, and a review finding teaches the reviewer
+        # not to raise this (or its whole category) again — the feedback loop.
+        # A no-op for any non-review situation.
+        await record_dismissal(session, company_id, situation_id)
         ok = await dismiss_situation(session, company_id, situation_id)
         if not ok:
             raise HTTPException(404, "no open situation with that id")
         await audit.record(session, company_id, "ui", "situation.dismiss", target=situation_id)
         await session.commit()
     return {"status": "dismissed", "situation_id": situation_id}
+
+
+@app.get("/api/reviews/suppressions")
+async def review_suppressions_route(
+    company_id: str = Depends(company_scope),
+) -> dict:
+    """What the reviewer has learned to stop raising, and the dismissals that
+    taught it — evidence, never a silent filter."""
+    async with Session() as session:
+        muted = await suppression_report(session, company_id)
+    return {"count": len(muted), "muted": muted}
+
+
+@app.post("/api/inbound/email")
+async def inbound_email_route(
+    payload: dict = Body(...),
+    secret: str = Query("", description="shared secret the email forwarder includes"),
+) -> dict:
+    """Receive one inbound email reply from an email-forwarding service and, if a
+    lead asked to reassign, act on it. This is the loop's other half: the system
+    doesn't just email people, it reads what they email back.
+
+    NOT behind the workspace login — an email forwarder is not a signed-in user.
+    The workspace is resolved from the [ref:…] tag in the subject, and the
+    endpoint is gated by INBOUND_EMAIL_SECRET so only your configured forwarder
+    can reach it. Disabled (503) until that secret is set."""
+    expected = os.getenv("INBOUND_EMAIL_SECRET", "")
+    if not expected:
+        raise HTTPException(503, "inbound email not enabled — set INBOUND_EMAIL_SECRET")
+    if secret != expected:
+        raise HTTPException(403, "bad or missing inbound secret")
+    async with Session() as session:
+        result = await handle_inbound_reply(session, payload)
+        await session.commit()
+    return result
+
+
+@app.get("/api/reviews/{thing_id}")
+async def get_review_route(
+    thing_id: str, company_id: str = Depends(company_scope),
+) -> dict:
+    """A record's current review findings — what the reviewer saw, each at its
+    exact file:line. Empty until the record is reviewed."""
+    async with Session() as session:
+        findings = await review_findings(session, company_id, thing_id)
+    return {"thing_id": thing_id, "count": len(findings), "findings": findings}
+
+
+@app.post("/api/reviews/{thing_id}/run")
+async def run_review_route(
+    thing_id: str,
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+) -> dict:
+    """Review this record now — what a Review button calls. Reads the code,
+    fans the concerns out, raises findings. Nothing is posted; findings surface
+    for a person to read (and to Request changes on, gated)."""
+    async with Session() as session:
+        result = await review_one_record(session, profile, thing_id, force=True)
+        if result is None:
+            raise HTTPException(404, "no reviewer targets this record's type")
+        await audit.record(session, company_id, "ui", "review.run", target=thing_id, metadata=result)
+        await session.commit()
+        findings = await review_findings(session, company_id, thing_id)
+    return {"thing_id": thing_id, "review": result, "count": len(findings), "findings": findings}
 
 
 # ------------------------------ Feed (CP2 part C/D) ------------------------------
@@ -1045,7 +1241,7 @@ async def feed_stream(company_id: str = Depends(company_scope)) -> StreamingResp
             await pubsub.unsubscribe(channel)
             await pool.aclose()
 
-    return StreamingResponse(events(), media_type="text/event-stream")
+    return StreamingResponse(events(), media_type="text/event-stream", headers=SSE_HEADERS)
 
 
 @app.get("/api/connector-health")
@@ -1075,6 +1271,47 @@ async def resolve_situation_choice(
             raise HTTPException(400, "invalid clarification choice")
         await session.commit()
     return result
+
+
+@app.get("/api/conversations")
+async def conversations(company_id: str = Depends(company_scope)) -> dict:
+    """Every thread in this workspace, most recent first."""
+    async with Session() as session:
+        return {"conversations": await list_conversations(session, company_id)}
+
+
+@app.post("/api/conversations")
+async def new_conversation(
+    payload: dict = Body(default={}),
+    company_id: str = Depends(company_scope),
+) -> dict:
+    """Start a fresh thread.
+
+    Every turn replays the last 20 messages, so without this a workspace had
+    one endless conversation and no way out of it: an answer written when it
+    was empty kept being fed back to the model days later.
+    """
+    async with Session() as session:
+        conversation_id = await create_conversation(
+            session, company_id, str(payload.get("title") or "New thread")
+        )
+        await session.commit()
+    return {"conversation_id": conversation_id, "messages": []}
+
+
+async def _resolve_conversation(
+    session: AsyncSession, company_id: str, conversation_id: int | None
+) -> int:
+    """The thread to read or write, scoped to this workspace.
+
+    A thread id belonging to somebody else must not resolve — the id is the
+    only thing the client sends, so this is the whole check.
+    """
+    if conversation_id is None:
+        return await get_or_create_default_conversation(session, company_id)
+    if not await conversation_exists(session, company_id, int(conversation_id)):
+        raise HTTPException(404, "no such conversation")
+    return int(conversation_id)
 
 
 @app.get("/api/conversations/default/messages")
@@ -1109,6 +1346,22 @@ async def post_default_message(
         message = await add_message(session, conversation_id, role, content, artifacts)
         await session.commit()
     return message.model_dump(mode="json")
+
+
+# Declared AFTER the literal "default" routes: FastAPI matches in declaration
+# order, and an int-typed path param would reject "default" with a 422 rather
+# than letting it fall through to the route that handles it.
+@app.get("/api/conversations/{conversation_id}/messages")
+async def conversation_messages(
+    conversation_id: int, company_id: str = Depends(company_scope)
+) -> dict:
+    async with Session() as session:
+        resolved = await _resolve_conversation(session, company_id, conversation_id)
+        messages = await list_messages(session, company_id, resolved)
+    return {
+        "conversation_id": resolved,
+        "messages": [m.model_dump(mode="json") for m in messages],
+    }
 
 
 # --------------------------- Profile discovery (CP5) ---------------------------
@@ -1200,13 +1453,11 @@ async def agent_chat(
     if not message:
         raise HTTPException(400, "message is required")
     async with Session() as session:
-        conversation_id = await get_or_create_default_conversation(session, company_id)
+        conversation_id = await _resolve_conversation(
+            session, company_id, payload.get("conversation_id")
+        )
         prior = await list_messages(session, company_id, conversation_id, limit=20)
-        history = [
-            {"role": "assistant" if m.role == "agent" else "user", "content": m.content}
-            for m in prior
-            if m.content and m.role in ("user", "agent")
-        ]
+        history = history_for_model(prior)
         user_msg = await add_message(session, conversation_id, "user", message, [])
         result = await answer(session, profile, message, history=history)
         agent_msg = await add_message(
@@ -1236,9 +1487,13 @@ def _with_apps(profile: Profile, workflow: wf.Workflow) -> dict:
     for what' the n8n graph shows on each node."""
     data = workflow.model_dump(mode="json")
     data["apps_used"] = apps_used(profile, workflow.steps)
+    # `acts_live` is DERIVED from the current registry on every read, not trusted
+    # from what was stored — a workflow saved before this flag existed, or one
+    # whose action's capability changed, still shows the truth about what it does
+    # to your tools now.
     data["steps"] = [
-        {**s.model_dump(mode="json"), **{"app_info": app}}
-        for s, app in zip(workflow.steps, [step_app(profile, s) for s in workflow.steps], strict=True)
+        {**s.model_dump(mode="json"), "app_info": step_app(profile, s), "acts_live": _acts_live(profile, s)}
+        for s in workflow.steps
     ]
     return data
 
@@ -1319,15 +1574,162 @@ async def update_workflow_route(
             raise HTTPException(400, f"invalid steps: {exc}") from exc
     if "trigger" in payload:
         try:
-            changes["trigger"] = WorkflowTrigger(**payload["trigger"])
+            trigger = WorkflowTrigger(**payload["trigger"])
         except (TypeError, ValueError) as exc:
             raise HTTPException(400, f"invalid trigger: {exc}") from exc
+        if trigger.type == "schedule" and not wf.valid_cron(str(trigger.config.get("cron", ""))):
+            # refuse rather than accept-and-never-fire: a schedule nobody can
+            # see failing is worse than an error at the moment it's set
+            raise HTTPException(400, "That schedule isn't a valid cron expression.")
+        changes["trigger"] = trigger
     async with Session() as session:
         updated = await wf.update_workflow(session, company_id, workflow_id, **changes)
         if updated is None:
             raise HTTPException(404, "workflow not found")
+        # every write to a workflow is attributable. A workflow that quietly
+        # changed its own schedule is exactly the kind of thing you can only
+        # investigate if the edit left a trace.
+        await audit.record(
+            session, company_id, str(payload.get("by") or "ui"), "workflow.updated",
+            target=updated.name,
+            metadata={
+                "workflow_id": workflow_id,
+                "fields": sorted(changes.keys()),
+                "trigger": updated.trigger.model_dump() if "trigger" in changes else None,
+            },
+        )
         await session.commit()
     return _with_apps(profile, updated)
+
+
+# Headers every SSE response needs. `Content-Encoding: identity` is the load
+# bearing one: a proxy in front of us (the Next dev server does this) will
+# otherwise gzip the stream, and gzip buffers the whole body — the client then
+# receives NOTHING until the response ends, which is the exact opposite of
+# streaming. Declaring an encoding makes compressing middleware leave it alone.
+SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "X-Accel-Buffering": "no",       # nginx
+    "Content-Encoding": "identity",  # any gzip-ing proxy
+}
+
+
+def _sse(event: dict) -> str:
+    """One Server-Sent Event frame. Kept as a helper because the streaming
+    endpoints below all speak the same wire format the frontend parses once."""
+    return f"data: {json.dumps(event, default=str)}\n\n"
+
+
+@app.post("/api/agent/chat/stream")
+async def agent_chat_stream(
+    payload: dict = Body(...),
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+) -> StreamingResponse:
+    """The streaming twin of POST /api/agent/chat. Same turn, same persistence,
+    same artifacts — the difference is you watch it happen: which tool is
+    running, then the answer arriving word by word.
+
+    The turn is persisted from the FINAL event, so what a refresh shows is
+    identical to the non-streaming route. A client that drops mid-stream still
+    gets a saved turn, because the write happens server-side, not on delivery.
+    """
+    message = str(payload.get("message") or "").strip()
+    if not message:
+        raise HTTPException(400, "message is required")
+
+    async def events():
+        async with Session() as session:
+            conversation_id = await _resolve_conversation(
+                session, company_id, payload.get("conversation_id")
+            )
+            prior = await list_messages(session, company_id, conversation_id, limit=20)
+            history = history_for_model(prior)
+            user_msg = await add_message(session, conversation_id, "user", message, [])
+            await session.commit()
+            yield _sse({"type": "user_message", "message": user_msg.model_dump(mode="json")})
+
+            result: dict | None = None
+            try:
+                async for event in answer_streaming(session, profile, message, history=history):
+                    if event["type"] == "final":
+                        result = event
+                    else:
+                        yield _sse(event)
+            except Exception as exc:  # never leave the client hanging on an open stream
+                yield _sse({"type": "error", "error": str(exc)})
+                return
+
+            if result is None:
+                yield _sse({"type": "error", "error": "the turn produced no answer"})
+                return
+
+            agent_msg = await add_message(
+                session, conversation_id, "agent", result["reply"], result["artifacts"]
+            )
+            await audit.record(
+                session, company_id, "agent", "agent.chat", target=message[:120],
+                metadata={"tools": [s["tool"] for s in result["steps"]], "streamed": True},
+            )
+            await session.commit()
+            yield _sse({
+                "type": "final",
+                "reply": result["reply"],
+                "artifacts": result["artifacts"],
+                "message": agent_msg.model_dump(mode="json"),
+                "tools_used": result["tools_used"],
+                "changed": result["changed"],
+            })
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
+    )
+
+
+@app.post("/api/workflows/{workflow_id}/run/stream")
+async def run_workflow_stream(
+    workflow_id: int,
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+) -> StreamingResponse:
+    """Run a workflow and watch each node as it goes. A run can queue approvals
+    or call a real API per step, so seeing WHICH step is live — and what each one
+    decided — matters more here than in chat."""
+
+    async def events():
+        async with Session() as session:
+            queue: asyncio.Queue = asyncio.Queue()
+
+            async def on_event(kind, index, step, result):
+                await queue.put({
+                    "type": kind,
+                    "index": index,
+                    "tool": step.tool,
+                    "action": step.args.get("action"),
+                    "description": step.description,
+                    "result": result.model_dump() if result is not None else None,
+                })
+
+            task = asyncio.create_task(
+                run_workflow(session, profile, workflow_id, trigger="manual", on_event=on_event)
+            )
+            while not task.done() or not queue.empty():
+                try:
+                    yield _sse(await asyncio.wait_for(queue.get(), timeout=1.0))
+                except TimeoutError:
+                    yield ": keep-alive\n\n"
+            try:
+                yield _sse({"type": "final", **(await task)})
+            except Exception as exc:
+                yield _sse({"type": "error", "error": str(exc)})
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
+    )
 
 
 @app.post("/api/workflows/{workflow_id}/edit")
@@ -1375,6 +1777,9 @@ async def delete_workflow_route(
         ok = await wf.delete_workflow(session, company_id, workflow_id)
         if not ok:
             raise HTTPException(404, "workflow not found")
+        await audit.record(
+            session, company_id, "ui", "workflow.deleted", metadata={"workflow_id": workflow_id}
+        )
         await session.commit()
     return {"deleted": workflow_id}
 
@@ -1488,11 +1893,18 @@ async def action_registry(
                 # able to say so on the button rather than implying an effect
                 "kind": v.get("kind"),
                 "external_effect": v.get("kind") == "http",
+                # so a card can filter out moves that cannot apply to the
+                # record it is about, instead of offering a button whose only
+                # possible outcome is a refusal
+                "applies_to_url": v.get("applies_to_url"),
             }
             for k, v in registry.items()
         ],
         "policy": policy,
         "autonomy": profile.moves.get("autonomy", {}),
+        # record types a reviewer targets — so the Work list shows a Review
+        # button only where a reviewer actually exists (PRs), not on every issue
+        "reviewable_types": reviewable_types(profile),
         # the words THIS business uses, so the UI stops saying "situation"
         # to a warehouse that calls it a supply risk
         "terms": profile.vocabulary.get("terms", {}) or {},
@@ -1529,6 +1941,119 @@ async def set_dry_run(
     return {"dry_run": enabled}
 
 
+# ------------------------------ Autonomy config ------------------------------
+
+
+@app.get("/api/autonomy")
+async def get_autonomy(
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+) -> dict:
+    """Everything the Autonomy screen needs: what the AI is allowed to do on its
+    own, who it can assign to, and every move it COULD be allowed (so the UI
+    shows real checkboxes, never invented ones)."""
+    autonomy = profile.moves.get("autonomy", {}) or {}
+    registry = profile.moves.get("registry", {}) or {}
+    async with Session() as session:
+        policy = await approval_policy(session, profile)
+        roster = await team_roster(session, company_id)
+    return {
+        "live": not policy["dry_run"],
+        "autonomy": {
+            "enabled": autonomy.get("enabled", True),
+            "allowed_actions": autonomy.get("allowed_actions", []),
+            "min_confidence": autonomy.get("min_confidence", 0.7),
+            "escalate_severities": autonomy.get("escalate_severities", []),
+            "allow_public_actions": autonomy.get("allow_public_actions", False),
+        },
+        # every registered move, flagged so the UI can warn which ones post in
+        # public — the same `public` fact the gate reads
+        "available_actions": [
+            {"name": k, "public": bool(v.get("public")), "kind": v.get("kind")}
+            for k, v in registry.items()
+        ],
+        "roster": roster,
+    }
+
+
+@app.post("/api/autonomy")
+async def update_autonomy(
+    payload: dict = Body(...),
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+) -> dict:
+    """Update the autonomy policy — a new confirmed profile version (audited),
+    the same way every other policy change is kept."""
+    keys = ("enabled", "allowed_actions", "min_confidence", "escalate_severities", "allow_public_actions")
+    async with Session() as session:
+        updated = await set_autonomy(session, company_id, **{k: payload.get(k) for k in keys})
+        await audit.record(session, company_id, "ui", "autonomy.updated", metadata=payload)
+        await session.commit()
+    if updated is None:
+        raise HTTPException(400, "no valid autonomy fields to update")
+    return {"autonomy": updated.moves.get("autonomy", {})}
+
+
+async def _ensure_team_config(session: object, company_id: str) -> None:
+    """Give a workspace a working assignment setup the first time it saves a
+    roster, so auto-assign has a move to run and roles to notify — auto-detected
+    from the connector's registry, never hardcoded to a tool."""
+    profile = await load_profile(session, company_id)  # type: ignore[arg-type]
+    if profile is None or (profile.moves.get("team", {}) or {}).get("assign_move"):
+        return
+    registry = profile.moves.get("registry", {}) or {}
+    assign_move = next((n for n in registry if "assign" in n.lower()), None)
+    if not assign_move:
+        return
+    team = {
+        "assign_move": assign_move,
+        "notify_roles": ["owner", "lead"],
+        "roles": ["owner", "lead", "dev", "designer", "qa"],
+        "workload": {},
+    }
+    await save_profile(session, profile.model_copy(update={"moves": {**profile.moves, "team": team}}))  # type: ignore[arg-type]
+
+
+@app.get("/api/roster")
+async def get_roster(company_id: str = Depends(company_scope)) -> dict:
+    """The assignment roster — the people the AI may hand work to, with the
+    skills the matcher reasons over. Distinct from workspace sign-in members."""
+    async with Session() as session:
+        roster = await team_roster(session, company_id)
+    return {"roster": roster}
+
+
+@app.post("/api/roster")
+async def save_roster(
+    payload: dict = Body(...),
+    company_id: str = Depends(company_scope),
+) -> dict:
+    """Replace the roster with the posted list. Light validation only — this is
+    a small operator-curated table, not user input at scale."""
+    roster = payload.get("roster")
+    if not isinstance(roster, list):
+        raise HTTPException(400, "body must be {\"roster\": [...]}")
+    cleaned = []
+    for m in roster:
+        if not isinstance(m, dict) or not str(m.get("id", "")).strip():
+            raise HTTPException(400, "each member needs an id (the login used to assign)")
+        cleaned.append({
+            "id": str(m["id"]).strip(),
+            "name": str(m.get("name") or m["id"]).strip(),
+            "email": str(m.get("email") or "").strip(),
+            "roles": [str(r) for r in (m.get("roles") or []) if str(r).strip()],
+            "skills": [str(s) for s in (m.get("skills") or []) if str(s).strip()],
+            "max_open_issues": int(m.get("max_open_issues") or 3),
+            "assignable": bool(m.get("assignable", True)),
+        })
+    async with Session() as session:
+        await save_team_roster(session, company_id, cleaned)
+        await _ensure_team_config(session, company_id)
+        await audit.record(session, company_id, "ui", "roster.saved", metadata={"count": len(cleaned)})
+        await session.commit()
+    return {"roster": cleaned}
+
+
 @app.post("/api/actions")
 async def create_action(
     payload: dict = Body(...),
@@ -1547,6 +2072,28 @@ async def create_action(
             situation_id=payload.get("situation_id"),
             requested_by=payload.get("requested_by", "ui"),
         )
+    return result.model_dump()
+
+
+@app.post("/api/reviews/{thing_id}/request-changes")
+async def request_pr_review_route(
+    thing_id: str,
+    company_id: str = Depends(company_scope),
+    profile: Profile = Depends(profile_scope),
+) -> dict:
+    """Assemble this PR's review findings into one inline REQUEST_CHANGES review
+    and queue it for approval. Nothing is posted here — the move is public, so
+    it lands in the approval queue and reaches GitHub only when a person
+    approves it (and only for real once Practice mode is off)."""
+    async with Session() as session:
+        result = await request_pr_review(session, profile, thing_id, requested_by="ui")
+        if result is None:
+            raise HTTPException(404, "no open review findings for this record")
+        await audit.record(
+            session, company_id, "ui", "review.request_changes",
+            target=thing_id, metadata={"action_id": result.id, "status": result.status},
+        )
+        await session.commit()
     return result.model_dump()
 
 

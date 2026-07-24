@@ -33,7 +33,10 @@ def _route(severity: str, routing_config: dict) -> tuple[str, list[str]]:
 
 
 def _render(brief: Brief) -> tuple[str, str]:
-    subject = f"[{brief.severity.upper()}] {brief.title}"
+    # The [ref:…] tag rides in the subject so a reply (which quotes the subject)
+    # can be matched back to this situation — see apps.common.inbound.
+    tag = f" [ref:{brief.reply_ref}]" if brief.reply_ref else ""
+    subject = f"[{brief.severity.upper()}] {brief.title}{tag}"
     lines = [
         f"Severity : {brief.severity.upper()}",
         f"Situation: {brief.title}",

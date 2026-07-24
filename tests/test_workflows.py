@@ -14,26 +14,30 @@ from packages.shared.schema import WorkflowStep, WorkflowTrigger
 # Phase 2: saved agentic workflows. Three layers, tested separately:
 #   1. the generic executor (core.workflows.execute_plan) — pure mechanics
 #   2. the planner (goal -> steps, with a scripted fake model)
-#   3. the allowlist gate — the safety-critical bit: a run_action step whose
-#      action is NOT on the autonomy allowlist must queue, never fire unattended.
+#   3. autonomy — a saved workflow runs every step on its own and for real:
+#      no approval queue, no allowlist requirement, and not rehearsed even in
+#      Practice mode. Building and enabling the workflow is the authorization.
 
 _CO = "test-workflows"
 
 
 def _profile() -> Profile:
-    """Minimal profile with two log actions — one on the autonomy allowlist,
-    one not — so the gate's effect is isolated from approval_required."""
+    """Minimal profile with two log actions and NEITHER on the autonomy
+    allowlist — a saved workflow runs both anyway. Practice mode (dry_run) is
+    on, to prove a workflow ignores it. `approval_required` is set on one to
+    prove a workflow ignores that too."""
     return Profile(
         company_id=_CO,
         sources=[], things={}, links={}, rhythms=[], watchers=[], vocabulary={},
         moves={
             "registry": {
-                # placeholder-free templates: these tests exercise the allowlist
-                # gate, not param templating (which needs a real situation row)
+                # placeholder-free templates: these tests exercise the autonomy
+                # of a saved workflow, not param templating (which needs a real
+                # situation row)
                 "safe_log": {"kind": "log", "approval_required": False, "template": "noted (safe)"},
-                "gated_log": {"kind": "log", "approval_required": False, "template": "noted (gated)"},
+                "gated_log": {"kind": "log", "approval_required": True, "template": "noted (gated)"},
             },
-            "autonomy": {"allowed_actions": ["safe_log"]},
+            "autonomy": {"allowed_actions": []},
             "approval_defaults": {"dry_run": True},
         },
     )
@@ -258,25 +262,62 @@ async def test_trigger_persists_through_save_and_get() -> None:
     assert got.trigger.config["rule"] == "unassigned_bug"
 
 
-async def test_allowlist_gate_queues_off_allowlist_action() -> None:
-    """The safety-critical path. A workflow run auto-executes an allowlisted
-    action but FORCES an off-allowlist one into the approval queue — it never
-    fires unattended, even though nothing marked it approval_required."""
+async def test_a_saved_workflow_runs_every_step_autonomously() -> None:
+    """A saved workflow is a standing authorization: it runs on its own, for
+    real. Neither action is on the autonomy allowlist and one is marked
+    approval_required — a chat request would queue both — yet the workflow
+    executes both without a human, because building and enabling the workflow
+    IS the human decision."""
     async with Session() as session:
         await _reset(session)
         steps = [
             WorkflowStep(tool="run_action", args={"action": "safe_log", "situation_id": "sit-1"}),
             WorkflowStep(tool="run_action", args={"action": "gated_log", "situation_id": "sit-2"}),
         ]
-        workflow = await wf.save_workflow(session, _CO, "gate test", "do both", steps)
+        workflow = await wf.save_workflow(session, _CO, "auto test", "do both", steps)
         await session.commit()
 
         result = await run_workflow(session, _profile(), workflow.id, trigger="manual")
 
     statuses = [r["status"] for r in result["step_results"]]
-    assert statuses[0] == "recorded"          # on the allowlist -> ran (a log contacts nobody)
-    assert statuses[1] == "pending_approval"  # off the allowlist -> forced to queue
-    assert result["status"] == "needs_approval"
+    # both ran; a log move "records" rather than hitting an external system
+    assert statuses == ["recorded", "recorded"]
+    assert all((r.get("result") or {}).get("autonomous") for r in result["step_results"])
+    assert result["status"] == "done"
+    # nothing was left waiting for a person
+    assert not any(r["status"] == "pending_approval" for r in result["step_results"])
+
+
+async def test_a_workflow_action_ignores_practice_mode(monkeypatch) -> None:
+    """The deliberate hole. Practice mode (dry_run) is ON, yet a workflow's
+    run_action must reach act() with dry_run FALSE — a saved workflow executes
+    for real. Proven by capturing the policy act() receives, so no real HTTP
+    call is made."""
+    import apps.common.analysis as analysis
+
+    captured: dict = {}
+
+    async def spy_act(state, request, registry, policy):
+        captured.update(policy)
+        from packages.shared.schema import ActionResult
+        return ActionResult(action=request.action, status="executed", detail="")
+
+    monkeypatch.setattr(analysis, "act", spy_act)
+
+    profile = _profile()
+    profile.moves["registry"]["real_call"] = {
+        "kind": "http", "method": "POST", "url": "https://example.test/x",
+        "approval_required": False,
+    }
+    async with Session() as session:
+        await _reset(session)
+        steps = [WorkflowStep(tool="run_action", args={"action": "real_call", "situation_id": "s1"})]
+        workflow = await wf.save_workflow(session, _CO, "live test", "do it", steps)
+        await session.commit()
+        await run_workflow(session, profile, workflow.id, trigger="manual")
+
+    assert captured["dry_run"] is False       # Practice mode was overridden
+    assert captured["pre_approved"] is True   # and no human is asked
 
 
 async def _seed_situation(session, sid: str, rule: str, severity: str = "high") -> None:

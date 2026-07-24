@@ -1,12 +1,15 @@
 ﻿"use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Action, Artifact, AuditEntry, Briefing, CheckIcon, Conn, Dot, Item, ItemFacets, Knowledge,
-  Learning, OAuthTarget, Registry, Situation, Understanding, Workflow, api, COMPANY, healthColor,
-  humanize, relativeTime,
+  Learning, OAuthTarget, Registry, ReviewFinding, Situation, Thread, Understanding, Workflow, WorkflowPlanArtifact,
+  api, healthColor, humanize, relativeTime, streamPost, NotSignedIn, Session,
 } from "./lib";
 import ActivityView from "./views/activity";
+import AuthView from "./views/auth";
+import TeamView from "./views/team";
+import AutonomyView from "./views/autonomy";
 import AgentView, { Msg } from "./views/agent";
 import ConnectionsView from "./views/connections";
 import FeedView from "./views/feed";
@@ -21,7 +24,7 @@ import WorkflowsView from "./views/workflows";
    status page would say, you ask the agent, which can also CHANGE the
    answer. The two always-on indicators are the ones you must never have to
    ask about: is data arriving, and can this thing touch my real systems. */
-type Screen = "home" | "agent" | "workflows" | "attention" | "work" | "knowledge" | "activity" | "connections";
+type Screen = "home" | "agent" | "workflows" | "attention" | "work" | "knowledge" | "activity" | "connections" | "team" | "autonomy";
 
 /* ------------------------------ sidebar icons ------------------------------ */
 
@@ -76,6 +79,20 @@ const ICONS: Record<Screen, React.ReactNode> = {
       <path d="M8 10.5V14" />
     </svg>
   ),
+  team: (
+    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="6" cy="6" r="2.3" />
+      <path d="M2.5 13c0-2 1.6-3.4 3.5-3.4S9.5 11 9.5 13" />
+      <circle cx="11.5" cy="6.5" r="1.8" />
+      <path d="M11 9.7c1.6 0 2.5 1.2 2.5 2.8" />
+    </svg>
+  ),
+  autonomy: (
+    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="8" cy="8" r="2" />
+      <path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M12.6 3.4l-1.4 1.4M4.8 11.2l-1.4 1.4" />
+    </svg>
+  ),
 };
 
 export default function Home() {
@@ -87,6 +104,12 @@ export default function Home() {
   const [audit, setAudit] = useState<AuditEntry[] | null>(null);
   const [conns, setConns] = useState<Conn[]>([]);
   const [messages, setMessages] = useState<Msg[]>([]);
+  /* Which chat thread is on screen. Every turn replays the last 20 messages,
+     so a single endless conversation kept feeding the model answers written
+     when the workspace was empty — a new thread is how you leave that behind. */
+  const [threads, setThreads] = useState<Thread[]>([]);
+  const [threadId, setThreadId] = useState<number | null>(null);
+  const switchedRef = useRef(false);
   const [items, setItems] = useState<Item[]>([]);
   const [itemFacets, setItemFacets] = useState<ItemFacets | null>(null);
   const [itemNoun, setItemNoun] = useState("item");
@@ -105,6 +128,9 @@ export default function Home() {
   const [busy, setBusy] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [tourStep, setTourStep] = useState(0);
+  /* null = not checked yet, false = signed out. The API rejects unauthenticated
+     requests, so the shell must not render until we know which. */
+  const [session, setSession] = useState<Session | null | false>(null);
 
   const flash = (m: string) => {
     setToast(m);
@@ -115,19 +141,25 @@ export default function Home() {
 
   const loadAll = useCallback(async () => {
     const grab = async <T,>(p: Promise<T>, fallback: T): Promise<T> => {
-      try { return await p; } catch { return fallback; }
+      try { return await p; } catch (e) {
+        // a session that expired mid-use should return you to sign-in, not
+        // leave a shell of empty panels behind
+        if (e instanceof NotSignedIn) setSession(false);
+        return fallback;
+      }
     };
-    const [b, f, r, au, c, m, u, lrn, kn, wfs] = await Promise.all([
-      grab(api(`/api/briefing?company_id=${COMPANY}`), null),
-      grab(api(`/api/feed?company_id=${COMPANY}`), { situations: [], actions: [] }),
-      grab(api(`/api/actions/registry?company_id=${COMPANY}`), null),
-      grab(api(`/api/audit?company_id=${COMPANY}&limit=80`), { entries: [] }),
-      grab(api(`/api/connections?company_id=${COMPANY}`), { connections: [] }),
-      grab(api(`/api/conversations/default/messages?company_id=${COMPANY}`), { messages: [] }),
-      grab(api(`/api/understanding?company_id=${COMPANY}`), null),
-      grab(api(`/api/learning?company_id=${COMPANY}`), null),
-      grab(api(`/api/knowledge?company_id=${COMPANY}`), null),
-      grab(api(`/api/workflows?company_id=${COMPANY}`), { workflows: [] }),
+    const [b, f, r, au, c, m, u, lrn, kn, wfs, th] = await Promise.all([
+      grab(api(`/api/briefing`), null),
+      grab(api(`/api/feed`), { situations: [], actions: [] }),
+      grab(api(`/api/actions/registry`), null),
+      grab(api(`/api/audit?limit=80`), { entries: [] }),
+      grab(api(`/api/connections`), { connections: [] }),
+      grab(api(threadId ? `/api/conversations/${threadId}/messages` : `/api/conversations/default/messages`), { messages: [], conversation_id: null }),
+      grab(api(`/api/understanding`), null),
+      grab(api(`/api/learning`), null),
+      grab(api(`/api/knowledge`), null),
+      grab(api(`/api/workflows`), { workflows: [] }),
+      grab(api(`/api/conversations`), { conversations: [] }),
     ]);
     setBriefing(b);
     setSituations(f.situations);
@@ -139,26 +171,61 @@ export default function Home() {
     setLearning(lrn);
     setKnowledge(kn);
     setWorkflows(wfs.workflows ?? []);
+    setThreads(th.conversations ?? []);
+    if (m.conversation_id) setThreadId(m.conversation_id);
     const serverMsgs: Msg[] = (m.messages ?? []).map((x: any) => ({
       id: `server:${x.id}`, kind: x.role === "user" ? "user" : "agent", text: x.content, artifacts: x.artifacts ?? [],
     }));
     setMessages((prev) => {
+      // Merging is right for a poll of the SAME thread (keeps a streaming
+      // draft on screen). Switching threads must replace outright, or the
+      // thread you left bleeds into the one you opened.
+      if (switchedRef.current) { switchedRef.current = false; return serverMsgs; }
       const seen = new Set(prev.map((x) => x.id).filter(Boolean));
       return [...prev, ...serverMsgs.filter((x) => !x.id || !seen.has(x.id))];
     });
+  }, [threadId]);
+
+  /* Open an existing thread, or start a new one. Both clear what is on screen
+     first: leaving the previous thread visible while its replacement loads
+     reads as the message having been sent to the wrong place. */
+  function openThread(id: number | null) {
+    switchedRef.current = true;
+    setMessages([]);
+    setThreadId(id);
+  }
+
+  async function newThread() {
+    try {
+      const created = await api(`/api/conversations`, { method: "POST", body: JSON.stringify({}) });
+      openThread(created.conversation_id);
+    } catch (e: any) { flash(e.message); }
+  }
+
+  /* Establish identity BEFORE any data call: every other endpoint 401s without
+     a session, so loading first would just be a burst of failures. */
+  const checkSession = useCallback(async () => {
+    try {
+      setSession(await api(`/api/auth/me`));
+    } catch (e) {
+      setSession(e instanceof NotSignedIn ? false : false);
+    }
   }, []);
 
+  useEffect(() => { void checkSession(); }, [checkSession]);
+
   useEffect(() => {
+    if (!session) return;
     void loadAll();
     const t = setInterval(() => void loadAll(), 30000);
     return () => clearInterval(t);
-  }, [loadAll]);
+  }, [loadAll, session]);
 
   /* The work list is fetched separately from the feed because it re-queries
      whenever a facet chip is clicked — the server does the counting, so the
      numbers are always the truth rather than something the UI tallied. */
   const loadItems = useCallback(async () => {
-    const q = new URLSearchParams({ company_id: COMPANY });
+    const q = new URLSearchParams();
     if (itemFilters.source) q.set("source", itemFilters.source);
     if (itemFilters.type) q.set("type", itemFilters.type);
     if (itemFilters.status) q.set("status", itemFilters.status);
@@ -172,14 +239,22 @@ export default function Home() {
     }
   }, [itemFilters]);
 
-  useEffect(() => { void loadItems(); }, [loadItems]);
+  /* Gated on session, exactly like loadAll — this used to run ungated on mount,
+     so on a fresh load it fired /api/items BEFORE sign-in, 401'd, emptied Work,
+     and never re-ran (its deps only change on a filter click). A freshly
+     signed-in user saw an empty Work until they touched a facet or reloaded.
+     Re-running when the session appears is what fills it. */
+  useEffect(() => {
+    if (!session) return;
+    void loadItems();
+  }, [loadItems, session]);
 
   /* Live arrival: the watcher engine (every 5 min, or right after a webhook
      or a manual scan) publishes one "the feed changed" nudge per pass over
      Redis pub/sub; this SSE connection forwards it, and we just refetch —
      the 30s poll above stays as a fallback if the stream ever drops. */
   useEffect(() => {
-    const es = new EventSource(`/api/feed/stream?company_id=${COMPANY}`);
+    const es = new EventSource(`/api/feed/stream`);
     es.onmessage = () => void loadAll();
     return () => es.close();
   }, [loadAll]);
@@ -208,7 +283,7 @@ export default function Home() {
   async function runMove(move: string, situationId: string) {
     setBusy(`move:${move}`);
     try {
-      const r = await api(`/api/actions?company_id=${COMPANY}`, {
+      const r = await api(`/api/actions`, {
         method: "POST",
         body: JSON.stringify({ action: move, situation_id: situationId, params: {}, requested_by: "ui" }),
       });
@@ -222,10 +297,48 @@ export default function Home() {
     } catch (e: any) { flash(e.message); } finally { setBusy(null); }
   }
 
+  async function requestReview(thingId: string) {
+    setBusy(`review:${thingId}`);
+    try {
+      const r = await api(`/api/reviews/${encodeURIComponent(thingId)}/request-changes`, { method: "POST" });
+      flash(r.status === "pending_approval"
+        ? "Review prepared — approve it on the Feed to post it to the PR"
+        : `Review: ${humanize(r.status)}`);
+      await loadAll();
+    } catch (e: any) { flash(e.message); } finally { setBusy(null); }
+  }
+
+  // What the reviewer found, per record — the GitHub-style panel reads this.
+  const [reviews, setReviews] = useState<Record<string, ReviewFinding[]>>({});
+
+  async function loadReview(thingId: string) {
+    try {
+      const r = await api(`/api/reviews/${encodeURIComponent(thingId)}`);
+      setReviews((m) => ({ ...m, [thingId]: r.findings }));
+    } catch (e: any) { flash(e.message); }
+  }
+
+  async function runReview(thingId: string) {
+    setBusy(`runreview:${thingId}`);
+    try {
+      const r = await api(`/api/reviews/${encodeURIComponent(thingId)}/run`, { method: "POST" });
+      setReviews((m) => ({ ...m, [thingId]: r.findings }));
+      const n = r.count as number;
+      flash(n ? `Reviewed — ${n} finding${n === 1 ? "" : "s"}` : "Reviewed — nothing to flag");
+    } catch (e: any) { flash(e.message); } finally { setBusy(null); }
+  }
+
+  async function dismissFinding(thingId: string, findingId: string) {
+    try {
+      await api(`/api/situations/${encodeURIComponent(findingId)}/dismiss`, { method: "POST" });
+      await loadReview(thingId);
+    } catch (e: any) { flash(e.message); }
+  }
+
   async function decide(actionId: number, verdict: "approve" | "reject") {
     setBusy(`decide:${actionId}`);
     try {
-      const r = await api(`/api/actions/${actionId}/${verdict}?company_id=${COMPANY}`, { method: "POST" });
+      const r = await api(`/api/actions/${actionId}/${verdict}`, { method: "POST" });
       flash(verdict === "approve" ? `Approved — ${humanize(r.status)}` : "Discarded");
       await loadAll();
     } catch (e: any) { flash(e.message); } finally { setBusy(null); }
@@ -234,7 +347,7 @@ export default function Home() {
   async function resolveClarification(situationId: string, choiceId: string) {
     setBusy(`clarification:${situationId}`);
     try {
-      const r = await api(`/api/situations/${encodeURIComponent(situationId)}/resolve?company_id=${COMPANY}`, {
+      const r = await api(`/api/situations/${encodeURIComponent(situationId)}/resolve`, {
         method: "POST",
         body: JSON.stringify({ choice: choiceId, by: "ui" }),
       });
@@ -247,7 +360,7 @@ export default function Home() {
   async function dismiss(situationId: string) {
     setDismissed((d) => new Set(d).add(situationId)); // instant UI feedback
     try {
-      await api(`/api/situations/${encodeURIComponent(situationId)}/dismiss?company_id=${COMPANY}`, {
+      await api(`/api/situations/${encodeURIComponent(situationId)}/dismiss`, {
         method: "POST",
       });
     } catch (e: any) {
@@ -259,7 +372,7 @@ export default function Home() {
      either side, exists in the database. No local-only chat state. */
   async function say(role: "user" | "agent", text: string, artifacts?: Artifact[]) {
     try {
-      const saved = await api(`/api/conversations/default/messages?company_id=${COMPANY}`, {
+      const saved = await api(`/api/conversations/default/messages`, {
         method: "POST",
         body: JSON.stringify({ role, content: text, artifacts: artifacts ?? [] }),
       });
@@ -285,20 +398,56 @@ export default function Home() {
      real server id on success, so the 30s poll never double-renders it. */
   async function askAgent(text: string) {
     const localId = `local:${Date.now()}`;
-    setMessages((m) => [...m, { id: localId, kind: "user", text }]);
+    const draftId = `draft:${Date.now()}`;
+    setMessages((m) => [
+      ...m,
+      { id: localId, kind: "user", text },
+      // a live bubble the stream writes into; replaced by the persisted turn
+      { id: draftId, kind: "agent", text: "", artifacts: [], streaming: true },
+    ]);
+
+    function patchDraft(fn: (d: Msg) => Msg) {
+      setMessages((m) => m.map((x) => (x.id === draftId ? fn(x) : x)));
+    }
+
+    /* A stream can simply STOP — a suspended tab, a dropped socket, a proxy
+       timeout — and that arrives as neither an error event nor a final one.
+       Without this flag the draft bubble sat on "Thinking…" forever, which
+       reads as a hung agent even though the server finished the turn and saved
+       it (the route persists from its own final event, not from delivery). */
+    let finished = false;
     try {
-      const r = await api(`/api/agent/chat?company_id=${COMPANY}`, {
-        method: "POST",
-        body: JSON.stringify({ message: text }),
+      await streamPost(`/api/agent/chat/stream`, { message: text, conversation_id: threadId }, (e) => {
+        if (e.type === "user_message") {
+          setMessages((m) => m.map((x) => (x.id === localId ? { ...x, id: `server:${e.message.id}` } : x)));
+        } else if (e.type === "tool_start") {
+          patchDraft((d) => ({ ...d, working: e.label }));
+        } else if (e.type === "tool_done") {
+          patchDraft((d) => ({ ...d, working: undefined }));
+        } else if (e.type === "text") {
+          patchDraft((d) => ({ ...d, text: (d.text || "") + e.delta, working: undefined }));
+        } else if (e.type === "text_reset") {
+          // that prose was a preamble to a tool call, not the answer
+          patchDraft((d) => ({ ...d, text: "" }));
+        } else if (e.type === "error") {
+          throw new Error(e.error);
+        } else if (e.type === "final") {
+          finished = true;
+          patchDraft(() => ({
+            id: `server:${e.message.id}`, kind: "agent", text: e.reply,
+            artifacts: e.artifacts ?? [], streaming: false,
+          }));
+        }
       });
-      setMessages((m) =>
-        m
-          .map((x) => (x.id === localId ? { ...x, id: `server:${r.user_message.id}` } : x))
-          .concat([{ id: `server:${r.message.id}`, kind: "agent", text: r.reply, artifacts: r.artifacts ?? [] }]),
-      );
+      if (!finished) {
+        // drop the stranded draft first so loadAll's merge brings in the real
+        // saved turn instead of leaving both on screen
+        setMessages((m) => m.filter((x) => x.id !== draftId));
+        flash("Connection dropped mid-answer — reloading it.");
+      }
       await loadAll(); // the agent may have queued an action — reflect it
     } catch (e: any) {
-      setMessages((m) => m.filter((x) => x.id !== localId)); // roll back the bubble
+      setMessages((m) => m.filter((x) => x.id !== localId && x.id !== draftId));
       flash(`Agent error: ${e.message}`);
       throw e;
     }
@@ -311,42 +460,71 @@ export default function Home() {
   async function createWorkflowInChat(goal: string) {
     setMessages((m) => [...m, { kind: "user", text: goal }]);
     try {
-      const plan = await api(`/api/workflows/plan?company_id=${COMPANY}`, {
+      const plan = await api(`/api/workflows/plan`, {
         method: "POST", body: JSON.stringify({ goal }),
       });
       const lead = plan.clarifications?.length
         ? "I need one thing before I can build this:"
         : "Here's the workflow I'd build:";
-      setMessages((m) => [...m, { kind: "agent", text: lead, artifacts: [{ type: "workflow_plan", plan }] }]);
+      const planKey = `plan-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      setMessages((m) => [...m, { kind: "agent", text: lead, artifacts: [{ type: "workflow_plan", plan, planKey }] }]);
     } catch (e: any) {
       flash(`Couldn't build that: ${e.message}`);
       throw e;
     }
   }
 
-  async function saveWorkflowPlan(plan: any) {
-    await api(`/api/workflows?company_id=${COMPANY}`, {
+  /* Record what a draft became, in the thread itself. The Save button reads its
+     state from here rather than from component-local state, so a re-render (or
+     a dev hot-reload) can't re-arm it and create the same workflow twice. */
+  function markPlanSaved(planKey: string, workflowId: number) {
+    setMessages((m) =>
+      m.map((msg) =>
+        msg.artifacts
+          ? {
+              ...msg,
+              artifacts: msg.artifacts.map((a: any) =>
+                a.type === "workflow_plan" && a.planKey === planKey
+                  ? { ...a, saved: true, workflowId }
+                  : a
+              ),
+            }
+          : msg
+      )
+    );
+  }
+
+  /* Save once, at most. "Save" then "Save & run" must act on ONE workflow, not
+     two — previously each button POSTed its own copy. */
+  async function ensureWorkflowSaved(a: WorkflowPlanArtifact): Promise<number> {
+    if (a.workflowId) return a.workflowId;
+    const saved = await api(`/api/workflows`, {
       method: "POST",
-      body: JSON.stringify({ name: plan.name, goal: plan.goal, trigger: plan.trigger, steps: plan.steps }),
+      body: JSON.stringify({
+        name: a.plan.name, goal: a.plan.goal, trigger: a.plan.trigger, steps: a.plan.steps,
+      }),
     });
-    flash(`Saved "${plan.name}" to Workflows`);
+    markPlanSaved(a.planKey, saved.id);
+    return saved.id;
+  }
+
+  async function saveWorkflowPlan(a: WorkflowPlanArtifact) {
+    await ensureWorkflowSaved(a);
+    flash(`Saved "${a.plan.name}" to Workflows`);
     await loadAll();
   }
 
-  async function runWorkflowPlan(plan: any) {
-    const saved = await api(`/api/workflows?company_id=${COMPANY}`, {
-      method: "POST",
-      body: JSON.stringify({ name: plan.name, goal: plan.goal, trigger: plan.trigger, steps: plan.steps }),
-    });
-    const r = await api(`/api/workflows/${saved.id}/run?company_id=${COMPANY}`, { method: "POST" });
-    flash(`${plan.name}: ${r.summary}`);
+  async function runWorkflowPlan(a: WorkflowPlanArtifact) {
+    const id = await ensureWorkflowSaved(a);
+    const r = await api(`/api/workflows/${id}/run`, { method: "POST" });
+    flash(`${a.plan.name}: ${r.summary}`);
     await loadAll();
   }
 
   async function connect(source: string, token: string, config: any) {
     setBusy(`connect:${source}`);
     try {
-      await api(`/api/connections/${source}?company_id=${COMPANY}`, {
+      await api(`/api/connections/${source}`, {
         method: "POST", body: JSON.stringify({ token, ...config }),
       });
       flash(`${source} connected — reading your history`);
@@ -356,7 +534,7 @@ export default function Home() {
 
   async function disconnect(source: string) {
     try {
-      await api(`/api/connections/${source}?company_id=${COMPANY}`, { method: "DELETE" });
+      await api(`/api/connections/${source}`, { method: "DELETE" });
       flash(`${source} disconnected`);
       await loadAll();
     } catch (e: any) { flash(e.message); }
@@ -367,12 +545,12 @@ export default function Home() {
      fetch) because the human has to see and approve on the provider's own
      page — that's the entire point of the flow. */
   function startOAuth(source: string) {
-    window.location.href = `/api/oauth/${source}/start?company_id=${COMPANY}`;
+    window.location.href = `/api/oauth/${source}/start`;
   }
 
   const loadTargets = useCallback(async (source: string) => {
     try {
-      const r = await api(`/api/oauth/${source}/targets?company_id=${COMPANY}`);
+      const r = await api(`/api/oauth/${source}/targets`);
       setTargets((t) => ({ ...t, [source]: r.targets ?? [] }));
     } catch {
       /* not connected via OAuth, or the token can't list — leave the picker off */
@@ -384,10 +562,12 @@ export default function Home() {
     setBusy(`connect:${source}`);
     try {
       // reuse the normal connect path: token stays as-is server-side, we only
-      // set which repo/channel to watch
-      await api(`/api/connections/${source}?company_id=${COMPANY}`, {
+      // set which repo/channel to watch. The config field is per-source
+      // (repo for GitHub, channel for Slack) so this isn't hardcoded to one tool.
+      const field = ({ github: "repo", slack: "channel" } as Record<string, string>)[source] ?? "repo";
+      await api(`/api/connections/${source}`, {
         method: "POST",
-        body: JSON.stringify({ repo: key }),
+        body: JSON.stringify({ [field]: key }),
       });
       flash(`Watching ${key}`);
       await loadAll();
@@ -416,7 +596,7 @@ export default function Home() {
   async function sync(source: string) {
     setBusy(`sync:${source}`);
     try {
-      const d = await api(`/api/connections/${source}/sync?company_id=${COMPANY}`, { method: "POST" });
+      const d = await api(`/api/connections/${source}/sync`, { method: "POST" });
       const n = Object.values(d.enqueued as Record<string, number>).reduce((x, y) => x + y, 0);
       flash(`Pulled ${n} events — linking them now`);
       setTimeout(() => void loadAll(), 4000);
@@ -447,11 +627,11 @@ export default function Home() {
     setArmLive(false);
     setBusy("practice");
     try {
-      await api(`/api/settings/dry_run?company_id=${COMPANY}`, {
+      await api(`/api/settings/dry_run`, {
         method: "POST",
         body: JSON.stringify({ enabled: on }),
       });
-      flash(on ? "Practice mode on — nothing will be sent" : "Live mode — actions now affect your real tools");
+      flash(on ? "Practice mode — the AI won't act on its own; your clicks still run for real" : "Live — the AI now acts on its own while you're away");
       await loadAll();
     } catch (e: any) { flash(e.message); } finally { setBusy(null); }
   }
@@ -459,8 +639,16 @@ export default function Home() {
   async function scan() {
     setBusy("scan");
     try {
-      const d = await api(`/api/analyze?company_id=${COMPANY}`, { method: "POST" });
-      flash(`Scan done — ${d.situations} situation${d.situations === 1 ? "" : "s"} live`);
+      // /api/scan polls the connected tools first; /api/analyze only re-reasons
+      // over what was already stored, which made this button unable to find
+      // anything new despite being called "Scan now"
+      const d = await api(`/api/scan`, { method: "POST" });
+      const pulled = Object.values((d.ingested ?? {}) as Record<string, number>)
+        .reduce((n: number, c: number) => n + c, 0);
+      flash(
+        `Scan done — ${pulled} record${pulled === 1 ? "" : "s"} read, ` +
+        `${d.situations} situation${d.situations === 1 ? "" : "s"} live`,
+      );
       await loadAll();
       setScreen("attention");
     } catch (e: any) { flash(e.message); } finally { setBusy(null); }
@@ -481,6 +669,14 @@ export default function Home() {
   const NavBtn = ({ k, label, badge }: { k: Screen; label: string; badge?: number }) => (
     <button
       onClick={() => setScreen(k)}
+      /* Below `sm` the label is hidden and this collapses to an icon rail, so
+         without these the whole nav is nine unlabelled glyphs — unreadable on a
+         narrow window and silent to a screen reader at every width. `title`
+         gives the hover tooltip a mouse user needs when the text is gone;
+         `aria-label` names it regardless. */
+      title={label}
+      aria-label={label}
+      aria-current={screen === k ? "page" : undefined}
       className="relative flex w-full items-center justify-center gap-[9px] rounded-md border-none px-2.5 py-2 text-left text-[13px] font-medium hover:text-ink sm:justify-start"
       style={{
         background: screen === k ? "#161616" : "transparent",
@@ -497,6 +693,26 @@ export default function Home() {
     </button>
   );
 
+  async function signOut() {
+    try { await api(`/api/auth/logout`, { method: "POST" }); } catch { /* leaving anyway */ }
+    setSession(false);
+    setMessages([]);          // never leave one account's thread on screen for the next
+    setScreen("home");
+  }
+
+  if (session === null) {
+    return <div className="flex h-screen items-center justify-center bg-canvas text-[13px] text-subtle">Loading…</div>;
+  }
+  if (session === false) {
+    return <AuthView onSignedIn={(s) => { setSession(s); void loadAll(); }} />;
+  }
+
+  const NavGroup = ({ label }: { label: string }) => (
+    <div className="mt-3 hidden px-2.5 pb-1 pt-1 text-[10px] font-semibold uppercase tracking-[1.2px] text-subtle first:mt-0 sm:block">
+      {label}
+    </div>
+  );
+
   return (
     <div className="flex h-screen overflow-hidden bg-canvas text-ink">
       {/* ============ SIDEBAR ============ */}
@@ -507,6 +723,7 @@ export default function Home() {
         </div>
 
         <nav className="flex flex-col gap-0.5">
+          <NavGroup label="Work" />
           <NavBtn k="home" label="Home" />
           <div className="relative">
             <NavBtn k="agent" label="Agent" />
@@ -530,15 +747,41 @@ export default function Home() {
               </div>
             )}
           </div>
-          <NavBtn k="workflows" label="Workflows" />
           <NavBtn k="attention" label="Attention" badge={liveCount || undefined} />
           <NavBtn k="work" label="Work" />
+
+          <NavGroup label="Automate" />
+          <NavBtn k="workflows" label="Workflows" />
+          <NavBtn k="autonomy" label="Autonomy" />
+
+          <NavGroup label="System" />
           <NavBtn k="knowledge" label="Business profile" />
           <NavBtn k="activity" label="Activity" />
           <NavBtn k="connections" label="Connections" />
+          <NavBtn k="team" label="Team" />
         </nav>
 
         <div className="mt-auto hidden flex-col gap-2 px-2.5 sm:flex">
+          {/* Who you are signed in as, and which workspace this data belongs
+              to — the two things you must never have to guess when several
+              workspaces look alike. */}
+          <button
+            onClick={() => setScreen("team")}
+            className="flex flex-col items-start border-none bg-transparent p-0 text-left hover:opacity-80"
+          >
+            <span className="truncate text-[11.5px] text-muted">{session.user.name}</span>
+            <span className="truncate text-[11px] text-subtle">
+              {session.workspaces.find((w) => w.company_id === session.workspace.company_id)?.name
+                ?? session.workspace.company_id}
+            </span>
+          </button>
+          <button
+            onClick={signOut}
+            className="self-start border-none bg-transparent p-0 text-[11px] text-subtle hover:text-ink"
+          >
+            Sign out
+          </button>
+
           {/* Is each connection actually alive? Without this, a dead
               connection just looks like a quiet week. */}
           {(understanding?.watching ?? []).filter((w) => w.connected).map((w) => (
@@ -585,8 +828,8 @@ export default function Home() {
               <Dot color={understanding.practice_mode ? "#d29922" : "#3fb950"} size={6} />
               <span style={{ color: understanding.practice_mode ? "#d29922" : "#8b8b8b" }}>
                 {understanding.practice_mode
-                  ? "Practice mode — nothing is sent to your real tools"
-                  : "Live — approved actions really change your tools"}
+                  ? "Practice mode — the AI won't act on its own. Your approvals and buttons run for real."
+                  : "Live — the AI acts on its own while you're away: triage, assign, notify."}
               </span>
             </span>
             <button
@@ -600,7 +843,7 @@ export default function Home() {
                 : !understanding.practice_mode
                   ? "back to practice"
                   : armLive
-                    ? "click again to confirm — this writes to your real tools"
+                    ? "click again to confirm — the AI will start acting on its own"
                     : "go live"}
             </button>
             {armLive && (
@@ -633,6 +876,10 @@ export default function Home() {
         )}
         {screen === "agent" && (
           <AgentView
+            threads={threads}
+            threadId={threadId}
+            onOpenThread={openThread}
+            onNewThread={newThread}
             messages={messages}
             onAsk={askAgent}
             onResolveClarification={resolveClarification}
@@ -671,6 +918,12 @@ export default function Home() {
               itemFilters={itemFilters}
               onFilterItems={setItemFilters}
               onRunMove={runMove}
+              onRequestReview={requestReview}
+              reviews={reviews}
+              onRunReview={runReview}
+              onLoadReview={loadReview}
+              onDismissFinding={dismissFinding}
+              busy={busy}
               onDecide={decide}
               onResolveClarification={resolveClarification}
               onDismiss={dismiss}
@@ -711,6 +964,25 @@ export default function Home() {
               onOAuth={startOAuth}
               onPickTarget={pickTarget}
               targets={targets}
+            />
+          </div>
+        )}
+
+        {screen === "autonomy" && (
+          <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
+            <AutonomyView flash={flash} />
+          </div>
+        )}
+        {screen === "team" && (
+          <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
+            <TeamView
+              session={session}
+              flash={flash}
+              onSwitched={async () => {
+                await checkSession();
+                await loadAll();
+                flash("Switched workspace");
+              }}
             />
           </div>
         )}

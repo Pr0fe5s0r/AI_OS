@@ -1,15 +1,12 @@
 from __future__ import annotations
 
 import os
-import pathlib
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.credentials import get_credential
-from packages.core.profile import Profile, load_profile, seed_profile
+from packages.core.profile import Profile, load_profile
 from packages.core.settings import get_setting
-
-PROFILE_DIR = pathlib.Path(__file__).resolve().parents[2] / "profiles"
 
 DRY_RUN_KEY = "dry_run"
 TEAM_KEY = "team_roster"
@@ -23,18 +20,10 @@ async def get_profile(session: AsyncSession, company_id: str) -> Profile:
     profile = await load_profile(session, company_id)
     if profile is None:
         raise ProfileNotFound(
-            f"no confirmed profile for company {company_id!r} — run the seed (make seed)"
+            f"no confirmed profile for company {company_id!r} — connect a source and "
+            "let discovery propose one"
         )
     return profile
-
-
-async def seed_all_profiles(session: AsyncSession) -> list[str]:
-    """Load every profiles/*.yaml into the profiles table (idempotent)."""
-    seeded = []
-    for path in sorted(PROFILE_DIR.glob("*.yaml")):
-        profile = await seed_profile(session, path)
-        seeded.append(f"{profile.company_id} v{profile.version}")
-    return seeded
 
 
 # ------------------------- source configs from a profile -------------------------
@@ -133,7 +122,17 @@ async def approval_policy(session: AsyncSession, profile: Profile) -> dict:
     dry_run = await get_setting(
         session, profile.company_id, DRY_RUN_KEY, defaults.get("dry_run", True)
     )
-    return {**defaults, "dry_run": bool(dry_run)}
+    # "may an action that posts where other people read it run unattended?" is
+    # the same KIND of decision as the other autonomy knobs (how sure it must
+    # be, which severities always escalate), so it is read from there rather
+    # than becoming a second place to look. The gate that consumes it is
+    # core.act.needs_approval; absent means no, which is the safe direction.
+    autonomy = profile.moves.get("autonomy", {}) or {}
+    return {
+        **defaults,
+        "dry_run": bool(dry_run),
+        "allow_public_actions": bool(autonomy.get("allow_public_actions", False)),
+    }
 
 
 async def team_roster(session: AsyncSession, company_id: str) -> list[dict]:

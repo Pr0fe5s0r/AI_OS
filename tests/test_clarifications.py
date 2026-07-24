@@ -46,7 +46,7 @@ async def _seed_duration_event(session, eid: str, days_ago: float, duration_hour
             INSERT INTO events (id, company_id, source, type, actor_id, actor_name,
                                  timestamp, content, metadata, content_tsv)
             VALUES (:id, :c, 'github', 'issue', 'u', 'u', :ts, 'x', CAST(:md AS jsonb), to_tsvector('x'))
-            ON CONFLICT (id, timestamp) DO NOTHING
+            ON CONFLICT (company_id, id, timestamp) DO NOTHING
             """
         ),
         {"id": eid, "c": _CO, "ts": start, "md": json.dumps({"closed_at": end.isoformat()})},

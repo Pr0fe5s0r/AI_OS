@@ -21,6 +21,12 @@ x-app-env: &app-env
   GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
   GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
   GITHUB_OAUTH_SCOPE: ${GITHUB_OAUTH_SCOPE:-public_repo}
+  # "Sign in with Slack" (OAuth). Unset -> the UI falls back to a bot-token field.
+  SLACK_CLIENT_ID: ${SLACK_CLIENT_ID:-}
+  SLACK_CLIENT_SECRET: ${SLACK_CLIENT_SECRET:-}
+  SLACK_OAUTH_SCOPE: ${SLACK_OAUTH_SCOPE:-channels:history,channels:read,users:read}
+  # inbound email reply handling (POST /api/inbound/email) is off until set
+  INBOUND_EMAIL_SECRET: ${INBOUND_EMAIL_SECRET:-}
   WEB_BASE_URL: ${WEB_BASE_URL:-http://localhost:3000}
   FERNET_KEY: ${FERNET_KEY:-}
   SMTP_HOST: ${SMTP_HOST:-}
