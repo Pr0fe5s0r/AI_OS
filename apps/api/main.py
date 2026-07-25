@@ -19,6 +19,7 @@ from apps.common.analysis import (
     ASSIGN_PURPOSE,
     accept_assignment,
     complete_ticket,
+    finish_create_chain,
     free_members,
     propose_assignment,
     request_action,
@@ -2112,8 +2113,14 @@ async def decide_action_route(
             session, action_id, verdict == "approve", "ui",
             profile.moves.get("registry", {}), policy,
         )
+        # If that approval ran a CREATE, finish the cross-app chain — adopt the
+        # new item's address and assign it — so approving a Slack incident's
+        # "create issue" leaves it owned, exactly like the autonomous path.
+        chained_assignee = None
+        if verdict == "approve" and result.status == "executed":
+            chained_assignee = await finish_create_chain(session, profile, action_id, result)
         await session.commit()
-    return result.model_dump()
+    return {**result.model_dump(), "chained_assignee": chained_assignee}
 
 
 # --------------------------- Data deletion (CP6 part C) ---------------------------

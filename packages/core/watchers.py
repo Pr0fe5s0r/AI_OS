@@ -33,6 +33,17 @@ BROKEN_RHYTHM_K = 2.0
 _TERMINAL_STATUSES = ("closed", "done", "resolved", "solved", "merged", "cancelled", "canceled")
 
 
+def _subject(text: str | None, fallback: str, limit: int = 60) -> str:
+    """The record's own name, trimmed to sit inside a card title. Every built-in
+    watcher raises a GENERIC headline ("Opened, then never touched again"), so a
+    workspace with six aging issues would show six identical cards — the operator
+    can't tell which issue each one is. Folding the subject into the title makes
+    every card name the thing it is about, without touching the summary."""
+    subject = (text or "").strip().splitlines()[0] if text else ""
+    subject = subject or fallback
+    return subject if len(subject) <= limit else subject[: limit - 1].rstrip() + "…"
+
+
 def catalog() -> list[dict[str, Any]]:
     """What the built-ins look for, as DATA — so a screen can tell a person
     what the system is watching for without the frontend hardcoding a list
@@ -90,7 +101,7 @@ async def stalled_things(session: AsyncSession, company_id: str) -> list[Situati
             company_id=company_id,
             rule="stalled_thing",
             severity="medium",
-            title="Stalled: no activity in a while",
+            title=f"Stalled: {_subject(r['title'], r['id'])}",
             summary=f"\"{r['title'] or r['id']}\" has had no activity for over {STALL_DAYS} days, after being actively worked on.",
             recommended_action="Check in, or close it out if it's no longer relevant.",
             evidence=[Evidence(event_id=r["id"], source="graph", timestamp=now, excerpt=r["title"] or r["id"], url=urls.get(r["id"]))],
@@ -112,7 +123,7 @@ async def aging_commitments(session: AsyncSession, company_id: str) -> list[Situ
             company_id=company_id,
             rule="aging_commitment",
             severity="medium",
-            title="Opened, then never touched again",
+            title=f"No follow-up: {_subject(r['title'], r['id'])}",
             summary=(
                 f"\"{r['title'] or r['id']}\" was created over {COMMITMENT_MIN_AGE_DAYS} "
                 "days ago and has had no follow-up since."
@@ -140,7 +151,7 @@ async def orphaned_hotspots(session: AsyncSession, company_id: str) -> list[Situ
                 company_id=company_id,
                 rule="orphaned_hotspot",
                 severity="high",
-                title="Talked about a lot, resolved by nothing",
+                title=f"Unowned, much-referenced: {_subject(r['title'], r['id'])}",
                 summary=(
                     f"\"{r['title'] or r['id']}\" is referenced by {count} other "
                     f"item{'s' if count != 1 else ''}, but nothing has acted on it."
@@ -189,7 +200,7 @@ async def broken_rhythms(session: AsyncSession, company_id: str, rhythms: list[d
                     company_id=company_id,
                     rule="broken_rhythm",
                     severity="high",
-                    title=f"Past its normal {defn['name'].replace('_', ' ')}",
+                    title=f"Overdue: {_subject(r.content, r.id)}",
                     summary=(
                         f"Open for {round(age_hours, 1)}h, vs. a typical {baseline.median}h "
                         f"({baseline.maturity} baseline, n={baseline.n})."

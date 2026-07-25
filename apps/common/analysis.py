@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -26,6 +27,7 @@ from packages.core.profile import Profile
 from packages.core.review import review_thing, run_reviewers
 from packages.core.situations import (
     get_situation,
+    list_situations,
     record_delivery,
     resolve_stale,
     save_situation,
@@ -296,6 +298,29 @@ async def _current_assignee(
     return event.metadata.get(field) or None
 
 
+async def _already_actioned_move(
+    session: AsyncSession, company_id: str, situation_id: str, action: str
+) -> bool:
+    """Has THIS move already been run (or queued) for THIS situation? A move
+    against an external tool leaves no trace on our stored copy of the source
+    record, so the actions ledger is the only durable memory that we already did
+    it — the guard that stops a re-run every analyze pass."""
+    row = (
+        await session.execute(
+            text(
+                """
+                SELECT 1 FROM actions
+                WHERE company_id = :c AND situation_id = :s AND action = :a
+                  AND status IN ('executed', 'pending_approval', 'dry_run')
+                LIMIT 1
+                """
+            ),
+            {"c": company_id, "s": situation_id, "a": action},
+        )
+    ).first()
+    return row is not None
+
+
 async def propose_assignment(
     session: AsyncSession, profile: Profile, situation: Situation, roster: list[dict]
 ) -> dict:
@@ -378,6 +403,13 @@ async def auto_assign(
     if not team.get("assign_move"):
         return {"status": "no_assign_move", "assignee": None}
     if await _current_assignee(session, profile, situation):
+        return {"status": "already_owned", "assignee": None}
+    # Idempotent: an assignment we already made won't show up in the SOURCE
+    # event's metadata (assigning on GitHub never updates our stored Slack/graph
+    # copy), so without this guard every analyze pass re-assigns the same person
+    # — the duplicate-action storm the operator saw. Our own actions ledger is
+    # the durable record of what we already did for this situation.
+    if await _already_actioned_move(session, profile.company_id, situation.id, team["assign_move"]):
         return {"status": "already_owned", "assignee": None}
     url = situation.evidence[0].url if situation.evidence else None
     target = extract_target(profile, url)
@@ -551,6 +583,85 @@ async def _situation_already_actioned(
     return row is not None
 
 
+def _captured_url(body: Any, field: str) -> str | None:
+    """Read a created record's link out of an action's stored response body.
+    Tries JSON first; falls back to a plain text scan because the body is
+    length-capped and may be truncated mid-JSON — the fallback still finds the
+    field as long as it landed inside the cap. Returns None if absent."""
+    if not field or body is None:
+        return None
+    try:
+        parsed = json.loads(body) if isinstance(body, str) else body
+        if isinstance(parsed, dict) and parsed.get(field):
+            return str(parsed[field])
+    except (ValueError, TypeError):
+        pass
+    if isinstance(body, str):
+        m = re.search(rf'"{re.escape(field)}"\s*:\s*"([^"]+)"', body)
+        return m.group(1) if m else None
+    return None
+
+
+async def _capture_and_chain(
+    session: AsyncSession, profile: Profile, situation: Situation,
+    action_name: str, result: ActionResult, roster: list[dict],
+) -> str | None:
+    """Close the cross-app chain. A CREATE move fired from an address-less
+    incident (a Slack message opens a GitHub issue) returns the record it made;
+    the move's ``captures`` declares which response field is that record's link.
+    We attach it to the situation — in memory AND durably — so the incident now
+    HAS an address, then assign the right person ON the new issue in the same
+    pass. Without this, the issue got created but nothing ever pointed the
+    assignment at it, so the incident sat forever unowned.
+
+    Returns the assignee if the follow-up assignment landed, else None."""
+    spec = (profile.moves.get("registry") or {}).get(action_name, {})
+    captures = spec.get("captures") or {}
+    if result.status != "executed" or not captures or not situation.evidence:
+        return None
+    new_url = _captured_url((result.result or {}).get("body"), captures.get("url", ""))
+    if not new_url:
+        return None
+
+    situation.evidence[0].url = new_url
+    await session.execute(
+        text("UPDATE situations SET evidence = CAST(:e AS jsonb) WHERE company_id = :c AND id = :s"),
+        {
+            "e": json.dumps([ev.model_dump(mode="json") for ev in situation.evidence]),
+            "c": profile.company_id,
+            "s": situation.id,
+        },
+    )
+    outcome = await auto_assign(session, profile, situation, roster)
+    return outcome.get("assignee") if outcome.get("status") == "assigned" else None
+
+
+async def finish_create_chain(
+    session: AsyncSession, profile: Profile, action_id: int, result: ActionResult
+) -> str | None:
+    """Complete the cross-app chain after a HUMAN approves a queued CREATE.
+    The autonomous path chains create -> assign on its own, but an escalated
+    incident (a critical routed to a person) is created via the approval queue
+    instead — and without this, approving it opened the issue but left it
+    unowned. Runs the identical capture-and-assign so an approved 'create issue'
+    on a Slack incident ends up assigned, not just created. Safe to call after
+    any approval: it no-ops unless the move actually declared a capture."""
+    row = (
+        await session.execute(
+            text("SELECT situation_id FROM actions WHERE company_id = :c AND id = :i"),
+            {"c": profile.company_id, "i": action_id},
+        )
+    ).first()
+    situation_id = row.situation_id if row else None
+    if not situation_id:
+        return None
+    situation = await get_situation(session, profile.company_id, situation_id)
+    if situation is None:
+        return None
+    roster = await team_roster(session, profile.company_id)
+    return await _capture_and_chain(session, profile, situation, result.action, result, roster)
+
+
 async def _autonomous_step(
     session: AsyncSession, profile: Profile, situation: Situation, policy: dict
 ) -> dict:
@@ -569,6 +680,29 @@ async def _autonomous_step(
     prompts = profile.vocabulary.get("prompts", {})
     assign_move = team.get("assign_move")
     allowed = [a for a in autonomy.get("allowed_actions", []) if a != assign_move]
+
+    # Only offer moves that can actually RUN against this situation. A URL-less
+    # incident (a Slack message) can open an issue but can't comment on or label
+    # one — there is no issue number yet. It is not enough that the params BUILD:
+    # apply_label builds fine from just the home repo, but its endpoint is
+    # .../issues/{number}/labels, so it fails at the API. Prove the move's own
+    # URL template is fully fillable too, or the agent will keep picking a move
+    # that can only fail — leaving the incident untouched instead of opening the
+    # tracked issue it needs. If nothing is viable, keep the full list so the
+    # model can still choose to escalate.
+    registry = profile.moves.get("registry", {}) or {}
+    viable = []
+    for a in allowed:
+        home = await _home_target(session, profile, a)
+        built = params_for_move(profile, a, "x", situation, default_target=home)
+        if built is None:
+            continue
+        try:
+            str(registry.get(a, {}).get("url", "")).format(**built)
+        except (KeyError, IndexError):
+            continue
+        viable.append(a)
+    allowed = viable or allowed
 
     decision = decide_action(
         situation, allowed, prompts.get("choose_action", "{title} {actions}"),
@@ -637,6 +771,14 @@ async def _autonomous_step(
         {**policy, "force_approval": human, "pre_approved": not human,
          "dry_run": False, "allow_public_actions": True},
     )
+    # If that was a CREATE, adopt the new record's address and assign someone ON
+    # it — the triage -> create issue -> assign chain, completed in one pass.
+    chained_assignee = None
+    if not human:
+        roster = await team_roster(session, profile.company_id)
+        chained_assignee = await _capture_and_chain(
+            session, profile, situation, action_name, result, roster
+        )
     return {
         "situation_id": situation.id,
         "chose": decision.action,
@@ -645,6 +787,7 @@ async def _autonomous_step(
         "confidence": round(decision.confidence, 2),
         "status": result.status,
         "autonomous": result.status != "pending_approval",
+        "chained_assignee": chained_assignee,
     }
 
 
@@ -696,6 +839,16 @@ async def evaluate_watchers(
             }
         else:
             proposal = await propose_assignment(session, profile, situation, roster)
+        # Whoever already owns this in OUR records is the truth the card shows.
+        # A cross-app incident's assignee lives on the GitHub issue we opened for
+        # it (recorded as a ticket), never back on the Slack event the situation
+        # is rebuilt from — so re-deriving ownership from evidence would wrongly
+        # read "unassigned" on every pass after the first.
+        if not proposal.get("assignee"):
+            owned = await ticket_for_situation(session, company_id, situation.id)
+            if owned and owned.assignee:
+                proposal["assignee"] = owned.assignee
+                proposal.setdefault("note", f"Owned by {owned.assignee}.")
         assignments.append(
             {"situation_id": situation.id, **{k: v for k, v in proposal.items() if k != "links"}}
         )
@@ -725,8 +878,33 @@ async def evaluate_watchers(
     live = not policy.get("dry_run", True)
     decisions: list[dict] = []
     if live and autonomy.get("enabled", True) and autonomy.get("allowed_actions"):
-        for situation in situations[: int(autonomy.get("max_actions_per_run", 5))]:
-            decisions.append(await _autonomous_step(session, profile, situation, policy))
+        # Consider EVERY open incident, most-severe first — not just the ones
+        # raised this pass. Two traps this avoids: (1) triage raises a situation
+        # ONCE (the ledger stops re-judging), so a critical incident handled on
+        # no earlier pass would never be revisited; (2) situations arrive
+        # watchers-first, triage-last, so a fixed cap over this-pass order let
+        # week-old medium aging-issues starve a brand-new CRITICAL out of the
+        # step entirely. Loading open situations here means the next cron
+        # reliably picks up anything still unhandled; _autonomous_step's own
+        # already-actioned guard keeps it idempotent and cheap.
+        open_situations = [
+            s for s in await list_situations(session, company_id, limit=100)
+            if s.status != "resolved" and s.kind in ("business", "triage")
+        ]
+        ranked = sorted(open_situations, key=lambda s: _SEV_RANK.get(s.severity, 9))
+        # The cap limits real WORK per run, not situations looked at. An already
+        # -actioned situation is skipped cheaply (its guard costs one indexed
+        # query, no LLM) and must NOT spend the budget — otherwise a handful of
+        # already-handled criticals starve a still-untouched medium out of the
+        # run forever. Spend the budget only on steps that actually did something.
+        budget = int(autonomy.get("max_actions_per_run", 5))
+        for situation in ranked:
+            if budget <= 0:
+                break
+            decision = await _autonomous_step(session, profile, situation, policy)
+            decisions.append(decision)
+            if not decision.get("skipped"):
+                budget -= 1
         await session.commit()
 
     by_severity: dict[str, int] = {}

@@ -36,6 +36,11 @@ _UPSERT = text(
          :file_path, :line_start, :line_end, :confidence, :category)
     ON CONFLICT (id) DO UPDATE SET
         severity = EXCLUDED.severity,
+        -- refresh the headline too: a watcher's title now carries the record's
+        -- own subject, and without this an already-raised situation would keep
+        -- the old generic title ("Opened, then never touched again") forever,
+        -- so six distinct issues stayed six identical cards.
+        title = EXCLUDED.title,
         summary = EXCLUDED.summary,
         recommended_action = EXCLUDED.recommended_action,
         evidence = EXCLUDED.evidence,

@@ -168,7 +168,12 @@ async def _execute(
         return (
             "executed" if resp.is_success else "failed",
             f"HTTP {resp.status_code}",
-            {"sent": preview, "status_code": resp.status_code, "body": resp.text[:500]},
+            # Keep enough of the response that a CREATE's caller can read back the
+            # record it just made (a GitHub issue JSON puts the html_url a few
+            # hundred chars in, past the old 500-char cut) — the cross-app chain
+            # adopts that link to assign the new item. Still bounded, so a huge
+            # payload can't bloat the actions row.
+            {"sent": preview, "status_code": resp.status_code, "body": resp.text[:4000]},
         )
 
     return "failed", f"unknown action kind: {kind!r}", {}

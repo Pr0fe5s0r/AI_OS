@@ -584,6 +584,15 @@ MOVES: dict[str, dict] = {
         # no `target` — creating needs a repo but no existing item number
         "params": {"body": {"title": "{argument}"}, "target": "github_repo"},
         "public": True,
+        # A create returns the record it just made. `captures.url` names the
+        # response field holding that record's canonical link, so the engine can
+        # attach it back to the situation and let a follow-up move (assign,
+        # comment) act ON the new issue. This is what closes the cross-app chain:
+        # a Slack incident with no address of its own opens a GitHub issue, and
+        # THAT issue's url becomes the situation's address for everything after.
+        # Declared as DATA so nothing outside this connector knows GitHub calls
+        # the field `html_url`.
+        "captures": {"url": "html_url"},
     },
     # --- pull requests only -------------------------------------------------
     # `applies_to_url` is the reason these can exist at all. Every move above
