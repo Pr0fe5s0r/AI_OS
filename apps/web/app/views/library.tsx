@@ -1,19 +1,19 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import {
-  Facets,
-  Item,
-  api,
-  confidenceTone,
-  cx,
-  preview,
-  sourceTone,
-  when,
-} from "../lib";
-import { Button, Chip, Empty, Spinner } from "../ui/kit";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Facets, Item, api, confidenceTone, cx, sourceTone, when } from "../lib";
+import { Empty } from "../ui/kit";
 
-/** The library: everything the knowledge base holds, filterable. */
+/** The index, as a table.
+ *
+ *  This is a store of records, so it is shown the way a store of records is
+ *  read: dense rows, sortable columns, counts you can trust. A feed of cards
+ *  would imply the newest thing matters most, which is true of an activity
+ *  log and false of a knowledge base — here the question is almost always
+ *  "what do we hold about X", not "what happened last". */
+
+type Pending = { name: string; state: "reading" | "failed"; detail?: string };
+
 export function Library({
   facets,
   onOpen,
@@ -28,15 +28,19 @@ export function Library({
   setFilter: (f: { class_id?: string; source?: string }) => void;
 }) {
   const [items, setItems] = useState<Item[] | null>(null);
-  const [busy, setBusy] = useState<string | null>(null);
-  const drop = useRef<HTMLLabelElement>(null);
+  const [pending, setPending] = useState<Pending[]>([]);
+  const [q, setQ] = useState("");
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [dragging, setDragging] = useState(false);
 
-  async function load() {
+  async function load(): Promise<Item[]> {
     const params = new URLSearchParams();
     if (filter.class_id) params.set("class_id", filter.class_id);
     if (filter.source) params.set("source", filter.source);
+    params.set("limit", "200");
     const res = await api<{ items: Item[] }>(`/api/items?${params}`);
     setItems(res.items);
+    return res.items;
   }
 
   useEffect(() => {
@@ -45,191 +49,284 @@ export function Library({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filter.class_id, filter.source]);
 
+  /** Ingestion is asynchronous, so the row does not exist the moment the
+   *  upload returns. Waiting a fixed second and reloading made a successful
+   *  upload look like nothing happened — so the file is shown as a row from
+   *  the start, and we poll until it really lands. */
   async function upload(files: FileList | null) {
     if (!files?.length) return;
-    for (const file of Array.from(files)) {
-      setBusy(file.name);
-      const form = new FormData();
-      form.append("file", file);
-      form.append("source", "upload");
-      try {
-        await api("/api/items/file", { method: "POST", body: form });
-      } catch (e) {
-        alert(`${file.name}: ${(e as Error).message}`);
+    const chosen = Array.from(files);
+    setPending((p) => [...p, ...chosen.map((f) => ({ name: f.name, state: "reading" as const }))]);
+
+    const before = new Set((items || []).map((i) => i.id));
+
+    await Promise.all(
+      chosen.map(async (file) => {
+        const form = new FormData();
+        form.append("file", file);
+        form.append("source", "upload");
+        try {
+          await api("/api/items/file", { method: "POST", body: form });
+        } catch (e) {
+          setPending((p) =>
+            p.map((x) =>
+              x.name === file.name
+                ? { ...x, state: "failed", detail: (e as Error).message }
+                : x
+            )
+          );
+        }
+      })
+    );
+
+    // Poll for the rows rather than guessing at a delay — and keep polling
+    // past the moment they appear. Writing the item and filing it are separate
+    // jobs, so stopping at "the row exists" showed every new document as
+    // uncategorised and never corrected itself.
+    for (let attempt = 0; attempt < 16; attempt++) {
+      await new Promise((r) => setTimeout(r, 1200));
+      const fresh = await load();
+      const arrived = fresh.filter((i) => !before.has(i.id));
+      if (arrived.length >= chosen.length) {
+        setPending((p) => p.filter((x) => x.state === "failed"));
+        if (arrived.every((i) => (i.classes || []).length > 0)) break;
       }
     }
-    setBusy(null);
-    // Ingestion is asynchronous by design, so the row appears a moment later.
-    setTimeout(() => {
-      load();
-      onIngested();
-    }, 1200);
+    setPending((p) => p.filter((x) => x.state === "failed"));
+    onIngested();
+    if (fileRef.current) fileRef.current.value = ""; // same file can be re-picked
   }
 
+  const rows = useMemo(() => {
+    if (!items) return null;
+    const needle = q.trim().toLowerCase();
+    if (!needle) return items;
+    return items.filter(
+      (i) =>
+        i.title.toLowerCase().includes(needle) ||
+        i.source.locator.toLowerCase().includes(needle)
+    );
+  }, [items, q]);
+
   return (
-    <div className="flex min-h-0 flex-1">
-      {/* filter rail */}
-      <div className="w-56 shrink-0 overflow-y-auto border-r border-edge px-4 py-5">
-        <Rail
-          title="Filed under"
-          rows={(facets?.classes || []).map((c) => ({
-            key: c.class_id,
-            label: c.name,
-            count: c.count,
-          }))}
-          active={filter.class_id}
-          onPick={(k) => setFilter({ ...filter, class_id: k })}
-        />
-        <div className="h-5" />
-        <Rail
-          title="Source"
-          rows={(facets?.sources || []).map((s) => ({
-            key: s.source,
-            label: s.source,
-            count: s.count,
-          }))}
-          active={filter.source}
-          onPick={(k) => setFilter({ ...filter, source: k })}
+    <div
+      className="flex min-h-0 flex-1 flex-col"
+      onDragOver={(e) => {
+        e.preventDefault();
+        setDragging(true);
+      }}
+      onDragLeave={(e) => {
+        if (e.currentTarget === e.target) setDragging(false);
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        setDragging(false);
+        upload(e.dataTransfer.files);
+      }}
+    >
+      {/* counts across the top: the shape of the store, at a glance */}
+      <div className="flex shrink-0 items-stretch gap-px border-b border-edge bg-edge">
+        <Metric label="Documents" value={facets?.total ?? "—"} />
+        <Metric label="Categories in use" value={facets?.classes.length ?? "—"} />
+        <Metric label="Sources" value={facets?.sources.length ?? "—"} />
+        <Metric
+          label="Assignments"
+          value={facets ? facets.classes.reduce((a, c) => a + c.count, 0) : "—"}
         />
       </div>
 
-      {/* items */}
-      <div className="min-w-0 flex-1 overflow-y-auto px-6 py-5">
-        <label
-          ref={drop}
-          onDragOver={(e) => {
-            e.preventDefault();
-            drop.current?.classList.add("border-accent/60");
-          }}
-          onDragLeave={() => drop.current?.classList.remove("border-accent/60")}
-          onDrop={(e) => {
-            e.preventDefault();
-            drop.current?.classList.remove("border-accent/60");
-            upload(e.dataTransfer.files);
-          }}
-          className="mb-5 flex cursor-pointer items-center justify-center gap-2 rounded-xl border border-dashed border-edge py-4 text-xs text-subtle transition hover:border-edgeStrong hover:text-muted"
+      {/* toolbar */}
+      <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-edge px-4 py-2.5">
+        <input
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          placeholder="Filter by title or path…"
+          className="w-64 rounded-lg border border-edge bg-canvas px-3 py-1.5 text-xs text-ink outline-none transition placeholder:text-subtle focus:border-accent/60"
+        />
+        <Select
+          value={filter.class_id || ""}
+          onChange={(v) => setFilter({ ...filter, class_id: v || undefined })}
+          placeholder="All categories"
+          options={(facets?.classes || []).map((c) => ({
+            value: c.class_id,
+            label: `${c.name} (${c.count})`,
+          }))}
+        />
+        <Select
+          value={filter.source || ""}
+          onChange={(v) => setFilter({ ...filter, source: v || undefined })}
+          placeholder="All sources"
+          options={(facets?.sources || []).map((s) => ({
+            value: s.source,
+            label: `${s.source} (${s.count})`,
+          }))}
+        />
+        <span className="ml-auto text-2xs tabular-nums text-subtle">
+          {rows ? `${rows.length} shown` : ""}
+        </span>
+        <input
+          ref={fileRef}
+          type="file"
+          multiple
+          // sr-only, not display:none — a hidden input can be skipped by the
+          // label click that is supposed to open the picker, which is exactly
+          // why uploading appeared to do nothing.
+          className="sr-only"
+          onChange={(e) => upload(e.target.files)}
+        />
+        <button
+          onClick={() => fileRef.current?.click()}
+          className="rounded-lg border border-accent bg-accent px-3 py-1.5 text-xs font-medium text-white transition hover:bg-accentSoft"
         >
-          <input
-            type="file"
-            multiple
-            className="hidden"
-            onChange={(e) => upload(e.target.files)}
-          />
-          {busy ? (
-            <>
-              <span className="h-3 w-3 animate-spin rounded-full border-2 border-edgeStrong border-t-accent" />
-              Reading {busy}…
-            </>
-          ) : (
-            <>Drop a document here, or click to choose — PDF, Markdown or text</>
-          )}
-        </label>
+          Add documents
+        </button>
+      </div>
 
-        {(filter.class_id || filter.source) && (
-          <div className="mb-4 flex items-center gap-2">
-            <span className="text-2xs text-subtle">Filtered by</span>
-            {filter.class_id && (
-              <Chip
-                tone="text-accentSoft border-accent/40 bg-accent/10"
-                onClick={() => setFilter({ ...filter, class_id: undefined })}
-              >
-                {facets?.classes.find((c) => c.class_id === filter.class_id)?.name ||
-                  filter.class_id}{" "}
-                ✕
-              </Chip>
-            )}
-            {filter.source && (
-              <Chip
-                tone={sourceTone(filter.source)}
-                onClick={() => setFilter({ ...filter, source: undefined })}
-              >
-                {filter.source} ✕
-              </Chip>
-            )}
+      {/* table */}
+      <div className="min-h-0 flex-1 overflow-auto">
+        {dragging && (
+          <div className="pointer-events-none sticky top-0 z-10 border-b border-accent/50 bg-accent/10 px-4 py-2 text-center text-xs text-accentSoft">
+            Drop to add to the knowledge base
           </div>
         )}
 
-        {items === null ? (
-          <Spinner label="Opening the library…" />
-        ) : items.length === 0 ? (
-          <Empty
-            title="Nothing here yet"
-            hint="Add a document above and it will be read, filed and made searchable. Nothing is generated for you — what you see is only ever what you put in."
-          />
+        {rows === null ? (
+          <div className="px-4 py-8 text-xs text-subtle">Loading the index…</div>
+        ) : rows.length === 0 && pending.length === 0 ? (
+          <div className="px-4 py-10">
+            <Empty
+              title={q || filter.class_id || filter.source ? "No matches" : "The index is empty"}
+              hint={
+                q || filter.class_id || filter.source
+                  ? "Nothing here matches those filters."
+                  : "Add a document and it will be read, filed and indexed. Nothing is generated for you — the index holds only what you put in it."
+              }
+            />
+          </div>
         ) : (
-          <ul className="space-y-2">
-            {items.map((item) => (
-              <li key={item.id}>
-                <button
-                  onClick={() => onOpen(item.id)}
-                  className="w-full animate-rise rounded-xl border border-edge bg-panel px-4 py-3.5 text-left transition hover:border-edgeStrong hover:bg-elevated"
-                >
-                  <div className="flex items-start gap-3">
-                    <div className="min-w-0 flex-1">
-                      <h3 className="truncate text-sm font-medium text-ink">{item.title}</h3>
-                      <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-subtle">
-                        {preview(item.body)}
-                      </p>
+          <table className="w-full border-collapse text-left">
+            <thead className="sticky top-0 z-[1] bg-canvas">
+              <tr className="border-b border-edge text-2xs uppercase tracking-wide text-subtle">
+                <Th className="pl-4">Document</Th>
+                <Th>Source</Th>
+                <Th>Categories</Th>
+                <Th className="text-right">Ver</Th>
+                <Th className="pr-4 text-right">Added</Th>
+              </tr>
+            </thead>
+            <tbody>
+              {pending.map((p) => (
+                <tr key={p.name} className="border-b border-edge/60">
+                  <td className="py-2.5 pl-4">
+                    <div className="flex items-center gap-2">
+                      {p.state === "reading" ? (
+                        <span className="h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-edgeStrong border-t-accent" />
+                      ) : (
+                        <span className="text-danger">✕</span>
+                      )}
+                      <span className="text-xs text-muted">{p.name}</span>
                     </div>
-                    <span className="shrink-0 text-2xs text-subtle">
-                      {when(item.created_at)}
+                  </td>
+                  <td colSpan={4} className="py-2.5 pr-4 text-2xs text-subtle">
+                    {p.state === "reading" ? "reading and indexing…" : p.detail}
+                  </td>
+                </tr>
+              ))}
+
+              {rows.map((item) => (
+                <tr
+                  key={item.id}
+                  onClick={() => onOpen(item.id)}
+                  className="cursor-pointer border-b border-edge/60 transition hover:bg-elevated"
+                >
+                  <td className="max-w-0 py-2.5 pl-4 pr-3">
+                    <div className="truncate text-xs font-medium text-ink">{item.title}</div>
+                    <div className="truncate font-mono text-2xs text-subtle">
+                      {item.source.locator}
+                    </div>
+                  </td>
+                  <td className="py-2.5 pr-3">
+                    <span
+                      className={cx(
+                        "rounded border px-1.5 py-0.5 text-2xs",
+                        sourceTone(item.source.source)
+                      )}
+                    >
+                      {item.source.source}
                     </span>
-                  </div>
-                  <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
-                    <Chip tone={sourceTone(item.source.source)}>{item.source.source}</Chip>
-                    {(item.classes || []).map((c) => (
-                      <Chip key={c.class_id} tone={confidenceTone(c.confidence, c.pinned)}>
-                        {c.pinned && <span aria-hidden>📌</span>}
-                        {c.name}
-                      </Chip>
-                    ))}
-                    {item.version > 1 && (
-                      <span className="text-2xs text-subtle">v{item.version}</span>
-                    )}
-                  </div>
-                </button>
-              </li>
-            ))}
-          </ul>
+                  </td>
+                  <td className="py-2.5 pr-3">
+                    <div className="flex flex-wrap gap-1">
+                      {(item.classes || []).length === 0 && (
+                        <span className="text-2xs text-subtle">—</span>
+                      )}
+                      {(item.classes || []).map((c) => (
+                        <span
+                          key={c.class_id}
+                          title={c.pinned ? `Set by ${c.actor}` : c.basis || ""}
+                          className={cx(
+                            "rounded border px-1.5 py-0.5 text-2xs",
+                            confidenceTone(c.confidence, c.pinned)
+                          )}
+                        >
+                          {c.pinned && "📌 "}
+                          {c.name}
+                        </span>
+                      ))}
+                    </div>
+                  </td>
+                  <td className="py-2.5 pr-3 text-right font-mono text-2xs text-subtle">
+                    {item.version}
+                  </td>
+                  <td className="whitespace-nowrap py-2.5 pr-4 text-right text-2xs text-subtle">
+                    {when(item.created_at)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         )}
       </div>
     </div>
   );
 }
 
-function Rail({
-  title,
-  rows,
-  active,
-  onPick,
+function Metric({ label, value }: { label: string; value: number | string }) {
+  return (
+    <div className="flex-1 bg-canvas px-4 py-3">
+      <div className="text-lg font-semibold tabular-nums text-ink">{value}</div>
+      <div className="text-2xs uppercase tracking-wide text-subtle">{label}</div>
+    </div>
+  );
+}
+
+function Th({ children, className }: { children: React.ReactNode; className?: string }) {
+  return <th className={cx("py-2 pr-3 font-medium", className)}>{children}</th>;
+}
+
+function Select({
+  value,
+  onChange,
+  options,
+  placeholder,
 }: {
-  title: string;
-  rows: { key: string; label: string; count: number }[];
-  active?: string;
-  onPick: (key: string | undefined) => void;
+  value: string;
+  onChange: (v: string) => void;
+  options: { value: string; label: string }[];
+  placeholder: string;
 }) {
   return (
-    <div>
-      <h3 className="mb-2 text-2xs uppercase tracking-wide text-subtle">{title}</h3>
-      {rows.length === 0 && <p className="text-2xs text-subtle">—</p>}
-      <ul className="space-y-0.5">
-        {rows.map((r) => (
-          <li key={r.key}>
-            <button
-              onClick={() => onPick(active === r.key ? undefined : r.key)}
-              className={cx(
-                "flex w-full items-center justify-between rounded-lg px-2 py-1.5 text-left text-xs transition",
-                active === r.key
-                  ? "bg-accent/15 text-accentSoft"
-                  : "text-muted hover:bg-elevated hover:text-ink"
-              )}
-            >
-              <span className="truncate capitalize">{r.label}</span>
-              <span className="ml-2 shrink-0 tabular-nums text-subtle">{r.count}</span>
-            </button>
-          </li>
-        ))}
-      </ul>
-    </div>
+    <select
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      className="rounded-lg border border-edge bg-canvas px-2.5 py-1.5 text-xs text-ink outline-none focus:border-accent/60"
+    >
+      <option value="">{placeholder}</option>
+      {options.map((o) => (
+        <option key={o.value} value={o.value}>
+          {o.label}
+        </option>
+      ))}
+    </select>
   );
 }

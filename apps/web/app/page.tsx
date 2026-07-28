@@ -56,8 +56,8 @@ export default function Page() {
   if (me === null) return <Gate onIn={check} />;
 
   const nav: { id: View; label: string; badge?: number }[] = [
-    { id: "library", label: "Library" },
-    { id: "search", label: "Search" },
+    { id: "library", label: "Index" },
+    { id: "search", label: "Query" },
     { id: "review", label: "Review", badge: reviewCount },
     { id: "taxonomy", label: "Categories" },
   ];
