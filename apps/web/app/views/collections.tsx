@@ -1,184 +1,289 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Collection, ago, cx, num } from "../data";
-import { Button, Card, Chip, Empty, Label, Mono } from "../ui/kit";
+import * as api from "../api";
+import { Collection, CollectionDetail, Document, ago, bytes, cx, num } from "../data";
+import { Button, Card, Chip, Empty, Label, Mono, Stat } from "../ui/kit";
 
+/** Collections, and what is inside one.
+ *
+ *  The numbers here come from the store rather than from a summary table, so
+ *  "items" means active items — superseded versions are counted separately
+ *  because a collection that looks twice its size is a collection nobody
+ *  trusts. */
 export function Collections({
   collections,
   selected,
   onSelect,
   onQuery,
+  onChanged,
+  toast,
 }: {
   collections: Collection[];
   selected: string | null;
   onSelect: (id: string | null) => void;
   onQuery: () => void;
+  onChanged: () => Promise<void> | void;
+  toast: (m: string) => void;
 }) {
-  const active = collections.find((c) => c.id === selected) || null;
+  const [detail, setDetail] = useState<CollectionDetail | null>(null);
+  const [docs, setDocs] = useState<Document[] | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [name, setName] = useState("");
 
   useEffect(() => {
-    if (!active && collections.length) onSelect(collections[0].id);
-  }, [active, collections, onSelect]);
+    let live = true;
+    if (!selected) {
+      setDetail(null);
+      setDocs(null);
+      return;
+    }
+    setDetail(null);
+    setDocs(null);
+    (async () => {
+      const [d, items] = await Promise.all([
+        api.collection(selected),
+        api.documents(selected, 100),
+      ]);
+      if (!live) return;
+      setDetail(d);
+      setDocs(items);
+    })();
+    return () => {
+      live = false;
+    };
+  }, [selected]);
 
-  if (!collections.length)
+  async function create() {
+    if (!name.trim()) return;
+    try {
+      const made = await api.createCollection(name.trim());
+      setName("");
+      setCreating(false);
+      await onChanged();
+      onSelect(made.collection_id);
+      toast("Collection created");
+    } catch (e) {
+      toast((e as Error).message);
+    }
+  }
+
+  async function drop(c: Collection) {
+    if (
+      !confirm(
+        `Delete "${c.name}"?\n\nIts ${num(c.items)} document(s) go with it. This cannot be undone.`
+      )
+    )
+      return;
+    const { items_removed } = await api.deleteCollection(c.id);
+    onSelect(null);
+    await onChanged();
+    toast(`Deleted — ${items_removed} document(s) removed`);
+  }
+
+  // ------------------------------ one collection ------------------------------
+
+  if (selected) {
     return (
-      <div className="mx-auto max-w-6xl px-6 py-7">
-        <Empty
-          title="No collections in this cluster yet"
-          hint="A collection holds vectors of a fixed dimensionality and a distance metric. Create one, then upsert your embeddings."
-          action={<Button variant="primary">+ Create collection</Button>}
-        />
+      <div className="px-6 py-6">
+        <button
+          onClick={() => onSelect(null)}
+          className="mb-4 font-mono text-2xs text-subtle transition hover:text-ink"
+        >
+          ← all collections
+        </button>
+
+        {!detail ? (
+          <div className="font-mono text-xs text-subtle">Loading collection…</div>
+        ) : (
+          <>
+            <div className="mb-5 flex flex-wrap items-start justify-between gap-4">
+              <div>
+                <h1 className="font-mono text-base font-semibold text-ink">{detail.name}</h1>
+                <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                  <Chip>{detail.id}</Chip>
+                  <Chip tone="text-heat-2 border-heat-2/30 bg-heat-2/10">cosine</Chip>
+                  <Chip>{detail.dimensions} dims</Chip>
+                  <span className="font-mono text-2xs text-subtle">
+                    {detail.embeddingModel || "no model set"}
+                  </span>
+                </div>
+              </div>
+              <div className="flex gap-2">
+                <Button onClick={onQuery}>Query it</Button>
+                <Button variant="danger" onClick={() => drop(detail)}>
+                  Delete
+                </Button>
+              </div>
+            </div>
+
+            <Card className="mb-5 flex flex-wrap gap-x-10 gap-y-4 p-4">
+              <Stat value={num(detail.stats.items)} label="documents" />
+              <Stat value={num(detail.stats.sources)} label="sources" />
+              <Stat value={bytes(detail.stats.characters)} label="stored text" />
+              <Stat
+                value={num(detail.stats.superseded)}
+                label="superseded"
+                tone={detail.stats.superseded ? "text-muted" : undefined}
+              />
+              <Stat
+                value={num(detail.stats.failed)}
+                label="failed"
+                tone={detail.stats.failed ? "text-danger" : undefined}
+              />
+            </Card>
+
+            <Label className="mb-2 block">documents</Label>
+            {docs === null ? (
+              <div className="font-mono text-xs text-subtle">Loading…</div>
+            ) : docs.length === 0 ? (
+              <Empty
+                title="This collection is empty"
+                hint="Upload a file or write to it with the SDK. Nothing is generated for you."
+              />
+            ) : (
+              <Card className="overflow-hidden">
+                <table className="w-full text-left">
+                  <thead>
+                    <tr className="border-b border-edge">
+                      <Th className="pl-4">Document</Th>
+                      <Th>Source</Th>
+                      <Th>Categories</Th>
+                      <Th className="text-right">Ver</Th>
+                      <Th className="pr-4 text-right">Added</Th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {docs.map((d) => (
+                      <tr key={d.id} className="border-b border-edge/60 last:border-0">
+                        <td className="max-w-0 py-2.5 pl-4 pr-3">
+                          <div className="truncate text-xs text-ink">{d.title}</div>
+                          <div className="truncate font-mono text-2xs text-subtle">
+                            {d.locator}
+                          </div>
+                        </td>
+                        <td className="py-2.5 pr-3">
+                          <Chip>{d.source}</Chip>
+                        </td>
+                        <td className="py-2.5 pr-3">
+                          <div className="flex flex-wrap gap-1">
+                            {d.categories.length === 0 && (
+                              <span className="font-mono text-2xs text-subtle">—</span>
+                            )}
+                            {d.categories.map((c) => (
+                              <Chip
+                                key={c.class_id}
+                                title={c.pinned ? "set by a person" : c.basis || ""}
+                                tone={
+                                  c.pinned
+                                    ? "text-accentSoft border-accent/40 bg-accent/10"
+                                    : "text-muted border-edgeStrong bg-elevated"
+                                }
+                              >
+                                {c.pinned && "📌 "}
+                                {c.name}
+                              </Chip>
+                            ))}
+                          </div>
+                        </td>
+                        <td className="py-2.5 pr-3 text-right font-mono text-2xs text-subtle">
+                          {d.version}
+                        </td>
+                        <td className="whitespace-nowrap py-2.5 pr-4 text-right font-mono text-2xs text-subtle">
+                          {ago(d.createdAt)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </Card>
+            )}
+          </>
+        )}
       </div>
     );
+  }
+
+  // ------------------------------- the listing -------------------------------
 
   return (
-    <div className="mx-auto flex max-w-6xl gap-5 px-6 py-7">
-      {/* List */}
-      <div className="w-64 shrink-0 space-y-1.5">
-        <div className="mb-2 flex items-center justify-between">
-          <h2 className="text-sm font-semibold text-ink">Collections</h2>
-          <Button size="sm">+ New</Button>
+    <div className="px-6 py-6">
+      <div className="mb-5 flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-base font-semibold text-ink">Collections</h1>
+          <p className="mt-1 max-w-xl text-xs leading-relaxed text-subtle">
+            A collection holds documents and their vectors. Its embedding model and
+            dimensions are fixed when it is made — changing either would invalidate
+            everything inside it.
+          </p>
         </div>
-        {collections.map((c) => (
-          <button
-            key={c.id}
-            onClick={() => onSelect(c.id)}
-            className={cx(
-              "w-full rounded-lg border px-3 py-2.5 text-left transition",
-              c.id === selected
-                ? "border-accent/50 bg-accent/10"
-                : "border-edge bg-panel hover:border-edgeStrong"
-            )}
-          >
-            <Mono className="block truncate text-xs font-medium text-ink">{c.name}</Mono>
-            <div className="mt-1 flex items-center gap-2 text-2xs text-subtle">
-              <span>{num(c.points)} pts</span>
-              <span>·</span>
-              <span>{c.dims}d</span>
-            </div>
-          </button>
-        ))}
+        <Button variant="primary" onClick={() => setCreating(true)}>
+          + New collection
+        </Button>
       </div>
 
-      {/* Detail */}
-      {active && <CollectionDetail c={active} onQuery={onQuery} />}
+      {creating && (
+        <Card className="card-in mb-5 flex flex-wrap items-end gap-3 p-4">
+          <label className="min-w-[16rem] flex-1">
+            <Label className="mb-1.5 block">Name</Label>
+            <input
+              autoFocus
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && create()}
+              placeholder="Client research"
+              className="w-full rounded-lg border border-edge bg-canvas px-3 py-2 text-sm text-ink outline-none focus:border-accent/60"
+            />
+          </label>
+          <Button variant="primary" onClick={create} disabled={!name.trim()}>
+            Create
+          </Button>
+          <Button onClick={() => setCreating(false)}>Cancel</Button>
+        </Card>
+      )}
+
+      {collections.length === 0 ? (
+        <Empty
+          title="No collections in this cluster"
+          hint="Create one, then upload a document or write to it with the SDK."
+          action={
+            <Button variant="primary" onClick={() => setCreating(true)}>
+              Create a collection
+            </Button>
+          }
+        />
+      ) : (
+        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+          {collections.map((c) => (
+            <Card key={c.id} hover onClick={() => onSelect(c.id)} className="p-4">
+              <div className="flex items-start justify-between gap-2">
+                <Mono className="truncate text-sm font-medium text-ink">{c.name}</Mono>
+                <Chip>{c.dimensions}d</Chip>
+              </div>
+              <div className="mt-1 truncate font-mono text-2xs text-subtle">{c.id}</div>
+              <div className="mt-4 flex items-baseline gap-1.5">
+                <span className="font-mono text-lg font-semibold tabular-nums text-ink">
+                  {num(c.items)}
+                </span>
+                <Label>documents</Label>
+              </div>
+            </Card>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
 
-function CollectionDetail({ c, onQuery }: { c: Collection; onQuery: () => void }) {
-  const [tab, setTab] = useState<"schema" | "config">("schema");
+function Th({ children, className }: { children?: React.ReactNode; className?: string }) {
   return (
-    <div className="min-w-0 flex-1 space-y-4">
-      <Card className="p-5">
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <div>
-            <Mono className="text-lg font-semibold text-ink">{c.name}</Mono>
-            <div className="mt-1.5 flex items-center gap-2">
-              <Chip>{c.metric}</Chip>
-              <Chip>{c.dims} dims</Chip>
-              <span className="text-2xs text-subtle">updated {ago(c.updatedAt)}</span>
-            </div>
-          </div>
-          <div className="flex gap-2">
-            <Button size="sm" onClick={onQuery}>
-              Query
-            </Button>
-            <Button size="sm" variant="danger">
-              Delete
-            </Button>
-          </div>
-        </div>
-
-        <div className="mt-5 grid grid-cols-2 gap-3 sm:grid-cols-4">
-          {[
-            ["points", num(c.points)],
-            ["indexed", `${c.indexedPct}%`],
-            ["dims", `${c.dims}`],
-            ["size", `${(c.sizeMb / 1024).toFixed(2)}GB`],
-          ].map(([l, v]) => (
-            <div key={l} className="rounded-lg border border-edge bg-canvas px-3 py-2.5">
-              <Mono className="text-base font-semibold tabular-nums text-ink">{v}</Mono>
-              <Label className="mt-0.5 block">{l}</Label>
-            </div>
-          ))}
-        </div>
-
-        {c.indexedPct < 100 && (
-          <div className="mt-4 flex items-center gap-2 rounded-lg border border-warn/30 bg-warn/10 px-3 py-2">
-            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-warn" />
-            <span className="text-2xs text-warn">
-              Reindexing — {c.indexedPct}% of {num(c.points)} vectors built. Queries run on the
-              indexed portion meanwhile.
-            </span>
-          </div>
-        )}
-      </Card>
-
-      <Card className="overflow-hidden">
-        <div className="flex gap-1 border-b border-edge px-3 pt-2">
-          {(["schema", "config"] as const).map((t) => (
-            <button
-              key={t}
-              onClick={() => setTab(t)}
-              className={cx(
-                "rounded-t-lg px-3 py-2 font-mono text-2xs uppercase tracking-wide transition",
-                tab === t ? "bg-elevated text-ink" : "text-subtle hover:text-muted"
-              )}
-            >
-              {t}
-            </button>
-          ))}
-        </div>
-
-        {tab === "schema" ? (
-          <div className="p-4">
-            <Label>payload fields</Label>
-            <div className="mt-2 overflow-hidden rounded-lg border border-edge">
-              <table className="w-full text-left">
-                <thead className="bg-elevated/60">
-                  <tr>
-                    <th className="px-3 py-2 font-mono text-2xs uppercase tracking-wide text-subtle">field</th>
-                    <th className="px-3 py-2 font-mono text-2xs uppercase tracking-wide text-subtle">type</th>
-                    <th className="px-3 py-2 font-mono text-2xs uppercase tracking-wide text-subtle">filterable</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {[{ field: "vector", type: `float[${c.dims}]` }, ...c.schema].map((f, i) => (
-                    <tr key={i} className="border-t border-edge">
-                      <td className="px-3 py-2 font-mono text-xs text-ink">{f.field}</td>
-                      <td className="px-3 py-2 font-mono text-xs text-heat-2">{f.type}</td>
-                      <td className="px-3 py-2 font-mono text-2xs text-subtle">
-                        {f.field === "vector" ? "—" : "yes"}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        ) : (
-          <div className="grid gap-3 p-4 sm:grid-cols-2">
-            {[
-              ["distance metric", c.metric],
-              ["index type", "HNSW"],
-              ["m / ef_construct", "16 / 128"],
-              ["on-disk payload", "true"],
-              ["replication factor", "2"],
-              ["quantization", c.dims > 1000 ? "scalar (int8)" : "none"],
-            ].map(([l, v]) => (
-              <div
-                key={l}
-                className="flex items-center justify-between rounded-lg border border-edge bg-canvas px-3 py-2.5"
-              >
-                <Label>{l}</Label>
-                <Mono className="text-xs text-ink">{v}</Mono>
-              </div>
-            ))}
-          </div>
-        )}
-      </Card>
-    </div>
+    <th
+      className={cx(
+        "py-2 pr-3 font-mono text-2xs font-medium uppercase tracking-[0.14em] text-subtle",
+        className
+      )}
+    >
+      {children}
+    </th>
   );
 }

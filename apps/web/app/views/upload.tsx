@@ -1,198 +1,234 @@
 "use client";
 
-import { useRef, useState } from "react";
-import { Collection, cx, num } from "../data";
-import { Button, Card, Chip, Code, Label, Mono } from "../ui/kit";
+import { useEffect, useRef, useState } from "react";
+import * as api from "../api";
+import { Collection, cx } from "../data";
+import { Button, Card, Chip, Label, Mono } from "../ui/kit";
 
-type Stage = "idle" | "embedding" | "upserting" | "done";
+type Row = {
+  name: string;
+  state: "sending" | "indexing" | "done" | "failed";
+  detail?: string;
+};
 
+/** Putting data in.
+ *
+ *  Writing and indexing are separate jobs, so a file is not searchable the
+ *  instant the upload returns. The row stays visible and keeps polling until
+ *  the document genuinely exists — guessing at a delay is what made uploading
+ *  look broken before. */
 export function Upload({
   collections,
   toast,
+  onIngested,
 }: {
   collections: Collection[];
   toast: (m: string) => void;
+  onIngested: () => Promise<void> | void;
 }) {
-  const [target, setTarget] = useState(collections[0]?.id || "");
-  const [file, setFile] = useState<{ name: string; rows: number } | null>(null);
-  const [drag, setDrag] = useState(false);
-  const [stage, setStage] = useState<Stage>("idle");
-  const [pct, setPct] = useState(0);
-  const inputRef = useRef<HTMLInputElement>(null);
-  const col = collections.find((c) => c.id === target);
+  const [collectionId, setCollectionId] = useState<string | undefined>(collections[0]?.id);
+  const [rows, setRows] = useState<Row[]>([]);
+  const [dragging, setDragging] = useState(false);
+  const [formats, setFormats] = useState<string[]>([]);
+  const [text, setText] = useState("");
+  const [title, setTitle] = useState("");
+  const fileRef = useRef<HTMLInputElement>(null);
 
-  function accept(name: string) {
-    const rows = 200 + Math.floor(Math.random() * 9800);
-    setFile({ name, rows });
-    setStage("idle");
-    setPct(0);
+  useEffect(() => {
+    api
+      .formats()
+      .then((f) => setFormats(f.supported))
+      .catch(() => {});
+  }, []);
+
+  function mark(name: string, state: Row["state"], detail?: string) {
+    setRows((r) => r.map((x) => (x.name === name ? { ...x, state, detail } : x)));
   }
 
-  function run() {
-    if (!file || !col) return;
-    setStage("embedding");
-    setPct(0);
-    const step = () =>
-      setPct((p) => {
-        const next = p + 4 + Math.random() * 8;
-        if (next >= 55 && stageRef.current === "embedding") setStageSafe("upserting");
-        if (next >= 100) {
-          setStageSafe("done");
-          toast(`Upserted ${num(file.rows)} vectors into ${col.name}`);
-          return 100;
+  /** Wait for a locator to actually appear in the collection. */
+  async function settle(locator: string, name: string) {
+    for (let attempt = 0; attempt < 16; attempt++) {
+      await new Promise((r) => setTimeout(r, 1200));
+      const docs = await api.documents(collectionId, 200).catch(() => []);
+      const found = docs.find((d) => d.locator === locator);
+      if (found) {
+        // Filing runs after the write, so wait a beat longer for categories
+        // rather than showing every new document as uncategorised forever.
+        if (found.categories.length || attempt > 6) {
+          mark(name, "done", `v${found.version} · ${found.categories.length} categories`);
+          return true;
         }
-        timer.current = setTimeout(step, 120);
-        return next;
-      });
-    timer.current = setTimeout(step, 200);
+      }
+    }
+    mark(name, "failed", "accepted, but not searchable yet — check the collection");
+    return false;
   }
 
-  // Keep the async stage transitions honest without stale closures.
-  const stageRef = useRef<Stage>("idle");
-  stageRef.current = stage;
-  const timer = useRef<ReturnType<typeof setTimeout>>();
-  const setStageSafe = (s: Stage) => {
-    stageRef.current = s;
-    setStage(s);
-  };
+  async function send(files: FileList | null) {
+    if (!files?.length) return;
+    if (!collectionId) {
+      toast("Choose a collection first");
+      return;
+    }
+    const chosen = Array.from(files);
+    setRows((r) => [...chosen.map((f) => ({ name: f.name, state: "sending" as const })), ...r]);
 
-  const busy = stage === "embedding" || stage === "upserting";
+    for (const file of chosen) {
+      try {
+        await api.addFile(collectionId, file);
+        mark(file.name, "indexing");
+        await settle(file.name, file.name);
+      } catch (e) {
+        mark(file.name, "failed", (e as Error).message);
+      }
+    }
+    await onIngested();
+    if (fileRef.current) fileRef.current.value = "";
+  }
 
-  const snippet = `from markvector import Client
-
-client = Client(api_key="mvk_live_…")
-
-# each record: an id, a ${col?.dims ?? 1536}-dim vector, and a payload you can filter on
-client.upsert(
-    collection="${col?.name ?? "support_docs"}",
-    points=[
-        {
-            "id": "doc_8823",
-            "vector": embed(text),          # your embedding model
-            "payload": {"title": title, "url": url},
-        },
-        # …${file ? num(file.rows) : "N"} more
-    ],
-)`;
+  async function sendText() {
+    if (!text.trim() || !collectionId) return;
+    const locator = `note/${Date.now()}`;
+    const name = title.trim() || locator;
+    setRows((r) => [{ name, state: "sending" }, ...r]);
+    try {
+      await api.addText(collectionId, {
+        source: "console",
+        locator,
+        body: text,
+        title: title.trim() || undefined,
+      });
+      setText("");
+      setTitle("");
+      mark(name, "indexing");
+      await settle(locator, name);
+      await onIngested();
+    } catch (e) {
+      mark(name, "failed", (e as Error).message);
+    }
+  }
 
   return (
-    <div className="mx-auto max-w-4xl px-6 py-7">
-      <h1 className="text-sm font-semibold text-ink">Upload data</h1>
-      <p className="mt-1 max-w-xl text-xs leading-relaxed text-muted">
-        Drop a JSONL or CSV of records and MarkVector embeds and upserts them into the
-        collection. Already have vectors? Upload them directly — the embedding step is skipped.
-      </p>
-
-      <div className="mt-5 grid gap-2">
-        <Label>Destination collection</Label>
-        <div className="flex flex-wrap gap-2">
-          {collections.map((c) => (
-            <Chip
-              key={c.id}
-              active={c.id === target}
-              onClick={() => setTarget(c.id)}
-              tone={
-                c.id === target
-                  ? "text-ink border-accent/50 bg-accent/10"
-                  : "text-muted border-edgeStrong bg-elevated"
-              }
-            >
-              {c.name} · {c.dims}d
-            </Chip>
-          ))}
+    <div
+      className="px-6 py-6"
+      onDragOver={(e) => {
+        e.preventDefault();
+        setDragging(true);
+      }}
+      onDragLeave={(e) => {
+        if (e.currentTarget === e.target) setDragging(false);
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        setDragging(false);
+        send(e.dataTransfer.files);
+      }}
+    >
+      <div className="mb-5 flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <h1 className="text-base font-semibold text-ink">Upload data</h1>
+          <p className="mt-1 max-w-xl text-xs leading-relaxed text-subtle">
+            Files are read, converted to Markdown and indexed. The original is never
+            stored — the store keeps text and a link back, not a copy of your file.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <Label>into</Label>
+          <select
+            value={collectionId || ""}
+            onChange={(e) => setCollectionId(e.target.value || undefined)}
+            className="rounded-lg border border-edge bg-canvas px-2.5 py-1.5 font-mono text-2xs text-ink outline-none focus:border-accent/60"
+          >
+            {collections.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.id}
+              </option>
+            ))}
+          </select>
         </div>
       </div>
 
-      {/* Drop zone */}
-      <div
-        onDragOver={(e) => {
-          e.preventDefault();
-          setDrag(true);
-        }}
-        onDragLeave={() => setDrag(false)}
-        onDrop={(e) => {
-          e.preventDefault();
-          setDrag(false);
-          const f = e.dataTransfer.files?.[0];
-          accept(f?.name || "records.jsonl");
-        }}
-        onClick={() => inputRef.current?.click()}
+      <input
+        ref={fileRef}
+        type="file"
+        multiple
+        className="sr-only"
+        onChange={(e) => send(e.target.files)}
+      />
+      <button
+        onClick={() => fileRef.current?.click()}
         className={cx(
-          "mt-5 flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed px-6 py-12 text-center transition field-grid",
-          drag ? "border-accent bg-accent/5" : "border-edge hover:border-edgeStrong"
+          "mb-5 flex w-full flex-col items-center justify-center rounded-xl border border-dashed py-12 transition",
+          dragging
+            ? "border-accent/60 bg-accent/5"
+            : "border-edge hover:border-edgeStrong hover:bg-elevated/40"
         )}
       >
-        <input
-          ref={inputRef}
-          type="file"
-          accept=".jsonl,.json,.csv"
-          className="hidden"
-          onChange={(e) => accept(e.target.files?.[0]?.name || "records.jsonl")}
-        />
-        <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#7c8cff" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#7c8cff" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
           <path d="M12 15V4m0 0L8 8m4-4l4 4M4 17v2a1 1 0 001 1h14a1 1 0 001-1v-2" />
         </svg>
-        <p className="mt-3 text-sm text-ink">
-          {file ? file.name : "Drop a file or click to browse"}
-        </p>
-        <p className="mt-1 font-mono text-2xs text-subtle">
-          {file ? `${num(file.rows)} records detected` : "JSONL · JSON · CSV — up to 100MB"}
-        </p>
-      </div>
+        <span className="mt-2.5 text-xs text-ink">Drop files here, or click to choose</span>
+        <span className="mt-1 font-mono text-2xs text-subtle">
+          {formats.length ? formats.join("  ") : "loading formats…"}
+        </span>
+      </button>
 
-      {/* Run / progress */}
-      {file && (
-        <Card className="mt-4 p-4">
-          {stage === "done" ? (
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <span className="flex h-6 w-6 items-center justify-center rounded-full bg-heat-0/15">
-                  <span className="h-2 w-2 rounded-full bg-heat-0" />
+      <Card className="mb-5 p-4">
+        <Label className="mb-2 block">or paste text</Label>
+        <input
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+          placeholder="Title (optional)"
+          className="mb-2 w-full rounded-lg border border-edge bg-canvas px-3 py-2 text-xs text-ink outline-none focus:border-accent/60"
+        />
+        <textarea
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          rows={4}
+          placeholder="Paste a note, a report, a transcript…"
+          className="w-full resize-y rounded-lg border border-edge bg-canvas px-3 py-2 text-xs leading-relaxed text-ink outline-none focus:border-accent/60"
+        />
+        <div className="mt-2 flex justify-end">
+          <Button variant="primary" onClick={sendText} disabled={!text.trim() || !collectionId}>
+            Add to {collectionId || "…"}
+          </Button>
+        </div>
+      </Card>
+
+      {rows.length > 0 && (
+        <>
+          <Label className="mb-2 block">this session</Label>
+          <Card className="divide-y divide-edge/60">
+            {rows.map((r) => (
+              <div key={r.name} className="flex items-center gap-3 px-4 py-2.5">
+                {r.state === "done" ? (
+                  <span className="text-heat-0">✓</span>
+                ) : r.state === "failed" ? (
+                  <span className="text-danger">✕</span>
+                ) : (
+                  <span className="h-3 w-3 animate-spin rounded-full border-2 border-edgeStrong border-t-accent" />
+                )}
+                <Mono className="min-w-0 flex-1 truncate text-xs text-ink">{r.name}</Mono>
+                <span className="font-mono text-2xs text-subtle">
+                  {r.detail ||
+                    { sending: "sending…", indexing: "indexing…", done: "", failed: "" }[r.state]}
                 </span>
-                <div>
-                  <Mono className="text-xs text-ink">
-                    {num(file.rows)} vectors upserted into {col?.name}
-                  </Mono>
-                  <Label className="block">indexing continues in the background</Label>
-                </div>
+                <Chip
+                  tone={
+                    r.state === "done"
+                      ? "text-heat-0 border-heat-0/30 bg-heat-0/10"
+                      : r.state === "failed"
+                        ? "text-danger border-danger/30 bg-danger/10"
+                        : "text-muted border-edgeStrong bg-elevated"
+                  }
+                >
+                  {r.state}
+                </Chip>
               </div>
-              <Button size="sm" onClick={() => setFile(null)}>
-                Upload more
-              </Button>
-            </div>
-          ) : busy ? (
-            <div>
-              <div className="flex items-center justify-between">
-                <Mono className="text-xs text-muted">
-                  {stage === "embedding" ? "Embedding records…" : "Upserting vectors…"}
-                </Mono>
-                <Mono className="text-xs tabular-nums text-ink">{Math.min(100, Math.round(pct))}%</Mono>
-              </div>
-              <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-elevated">
-                <div
-                  className="h-full rounded-full bg-gradient-to-r from-heat-3 to-heat-0 transition-all"
-                  style={{ width: `${Math.min(100, pct)}%` }}
-                />
-              </div>
-            </div>
-          ) : (
-            <div className="flex items-center justify-between">
-              <Mono className="text-xs text-muted">
-                Ready to embed with <span className="text-heat-2">text-embedding-3-small</span> →{" "}
-                {col?.dims}d
-              </Mono>
-              <Button variant="primary" size="sm" onClick={run}>
-                Embed & upsert
-              </Button>
-            </div>
-          )}
-        </Card>
+            ))}
+          </Card>
+        </>
       )}
-
-      <div className="mt-6">
-        <Label className="mb-2 block">…or upsert programmatically</Label>
-        <Code code={snippet} filename="upsert.py" />
-      </div>
     </div>
   );
 }

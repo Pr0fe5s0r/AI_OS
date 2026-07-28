@@ -1,208 +1,359 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import * as api from "../api";
 import {
-  Cluster,
   Collection,
   HEAT_HEX,
   Trace,
-  TraceStatus,
+  TraceDetail,
   ago,
   cx,
   latencyBand,
-  makeTraces,
+  ms,
+  num,
   statusTone,
+  traceStatus,
 } from "../data";
-import { Card, Chip, Label, Mono } from "../ui/kit";
+import { Card, Chip, Empty, Label, Mono, Stat } from "../ui/kit";
 
-const OP_TONE: Record<string, string> = {
-  search: "text-heat-2 border-heat-2/40 bg-heat-2/10",
-  retrieve: "text-heat-1 border-heat-1/40 bg-heat-1/10",
-  upsert: "text-accentSoft border-accent/40 bg-accent/10",
-  delete: "text-danger border-danger/40 bg-danger/10",
-  create_index: "text-hot border-hot/40 bg-hot/10",
-};
+/** The trace console.
+ *
+ *  Every retrieval writes down what it did, so this screen answers the only
+ *  question that matters when an answer looks wrong: why did it return that?
+ *  A trace holds each arm's candidates and scores, what survived the filters,
+ *  and where the time went — so a bad result is a thing you read, not a thing
+ *  you guess at. */
+export function Traces({ collections }: { collections: Collection[] }) {
+  const [collectionId, setCollectionId] = useState<string | undefined>(undefined);
+  const [filter, setFilter] = useState<"all" | "empty" | "degraded">("all");
+  const [rows, setRows] = useState<Trace[] | null>(null);
+  const [stats, setStats] = useState<api.TraceStats | null>(null);
+  const [open, setOpen] = useState<TraceDetail | null>(null);
 
-export function Traces({ cluster, collections }: { cluster: Cluster; collections: Collection[] }) {
-  const all = useMemo(
-    () => makeTraces(52).filter((t) => t.clusterId === cluster.id),
-    [cluster.id]
-  );
-  const [colFilter, setColFilter] = useState<string | "all">("all");
-  const [statusFilter, setStatusFilter] = useState<TraceStatus | "all">("all");
-  const [open, setOpen] = useState<string | null>(null);
+  const load = useCallback(async () => {
+    const [list, summary] = await Promise.all([
+      api.traces(collectionId, {
+        onlyEmpty: filter === "empty",
+        onlyDegraded: filter === "degraded",
+      }),
+      api.traceStats(collectionId).catch(() => null),
+    ]);
+    setRows(list);
+    setStats(summary);
+  }, [collectionId, filter]);
 
-  const rows = all.filter(
-    (t) =>
-      (colFilter === "all" || t.collectionId === colFilter) &&
-      (statusFilter === "all" || t.status === statusFilter)
-  );
+  useEffect(() => {
+    setRows(null);
+    load();
+  }, [load]);
 
-  const p50 = percentile(rows.map((r) => r.latencyMs), 50);
-  const p99 = percentile(rows.map((r) => r.latencyMs), 99);
-  const errs = rows.filter((r) => r.status === "error").length;
-  const colName = (id: string) => collections.find((c) => c.id === id)?.name ?? id;
+  const maxMs = Math.max(1, ...(rows || []).map((r) => r.durationMs));
 
   return (
-    <div className="mx-auto max-w-6xl px-6 py-7">
-      <div className="flex items-center gap-3">
-        <h1 className="text-sm font-semibold text-ink">Trace console</h1>
-        <Chip tone="text-heat-1 border-heat-1/40 bg-heat-1/10">
-          <span className="mr-1 h-1.5 w-1.5 animate-pulse rounded-full bg-heat-1" />
-          live
-        </Chip>
-        <Mono className="ml-auto text-2xs text-subtle">{cluster.name}</Mono>
+    <div className="px-6 py-6">
+      <div className="mb-5 flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <h1 className="text-base font-semibold text-ink">Trace console</h1>
+          <p className="mt-1 max-w-xl text-xs leading-relaxed text-subtle">
+            Every query, and how it reached its answer. The same inputs against the same
+            index reproduce the same results — the trace is the derivation.
+          </p>
+        </div>
+        <button
+          onClick={load}
+          className="rounded-lg border border-edge bg-elevated px-3 py-1.5 font-mono text-2xs text-muted transition hover:text-ink"
+        >
+          refresh
+        </button>
       </div>
 
-      {/* Latency histogram — every request placed on the heat scale */}
-      <Card className="mt-4 p-4">
-        <div className="flex items-center justify-between">
-          <Label>request latency · last {rows.length} ops</Label>
-          <div className="flex gap-4">
-            <span className="font-mono text-2xs text-subtle">
-              p50 <span className="text-heat-1">{p50}ms</span>
-            </span>
-            <span className="font-mono text-2xs text-subtle">
-              p99 <span className="text-heat-3">{p99}ms</span>
-            </span>
-            <span className="font-mono text-2xs text-subtle">
-              errors <span className={errs ? "text-danger" : "text-success"}>{errs}</span>
-            </span>
-          </div>
-        </div>
-        <div className="mt-3 flex h-16 items-end gap-[3px]">
-          {rows
-            .slice()
-            .reverse()
-            .map((t) => {
-              const h = Math.max(8, Math.min(100, (t.latencyMs / 260) * 100));
-              return (
-                <div
-                  key={t.id}
-                  title={`${t.op} · ${t.latencyMs}ms`}
-                  onMouseEnter={() => setOpen(t.id)}
-                  className="flex-1 rounded-t-sm transition-opacity hover:opacity-100"
-                  style={{
-                    height: `${h}%`,
-                    background: HEAT_HEX[latencyBand(t.latencyMs)],
-                    opacity: open === t.id ? 1 : 0.72,
-                  }}
-                />
-              );
-            })}
-        </div>
-      </Card>
+      {stats && (
+        <Card className="mb-4 flex flex-wrap gap-x-10 gap-y-4 p-4">
+          <Stat value={num(stats.queries)} label={`queries · ${stats.window_hours}h`} />
+          <Stat value={ms(stats.avg_ms)} label="average" />
+          <Stat
+            value={ms(stats.p95_ms)}
+            label="p95"
+            tone={stats.p95_ms >= 2000 ? "text-warn" : undefined}
+          />
+          <Stat
+            value={num(stats.empty)}
+            label="no results"
+            tone={stats.empty ? "text-subtle" : undefined}
+          />
+          <Stat
+            value={num(stats.degraded)}
+            label="degraded"
+            tone={stats.degraded ? "text-hot" : undefined}
+          />
+        </Card>
+      )}
 
-      {/* Filters */}
-      <div className="mt-4 flex flex-wrap items-center gap-2">
+      {/* latency, most recent last */}
+      {rows && rows.length > 0 && (
+        <Card className="mb-4 p-4">
+          <Label className="mb-3 block">request latency · most recent last</Label>
+          <div className="flex h-20 items-end gap-[3px]">
+            {[...rows]
+              .reverse()
+              .slice(-64)
+              .map((r) => (
+                <div
+                  key={r.id}
+                  title={`${r.query} — ${ms(r.durationMs)}`}
+                  onClick={() => api.trace(r.id).then(setOpen)}
+                  style={{
+                    height: `${Math.max(6, (r.durationMs / maxMs) * 100)}%`,
+                    background: HEAT_HEX[latencyBand(r.durationMs)],
+                  }}
+                  className="flex-1 cursor-pointer rounded-sm opacity-80 transition hover:opacity-100"
+                />
+              ))}
+          </div>
+        </Card>
+      )}
+
+      <div className="mb-3 flex flex-wrap items-center gap-2">
         <Label>collection</Label>
-        <Chip active={colFilter === "all"} onClick={() => setColFilter("all")}>
+        <Chip active={!collectionId} onClick={() => setCollectionId(undefined)}>
           all
         </Chip>
         {collections.map((c) => (
-          <Chip key={c.id} active={colFilter === c.id} onClick={() => setColFilter(c.id)}>
-            {c.name}
-          </Chip>
-        ))}
-        <span className="mx-1 h-4 w-px bg-edge" />
-        <Label>status</Label>
-        {(["all", "ok", "slow", "error"] as const).map((s) => (
           <Chip
-            key={s}
-            active={statusFilter === s}
-            onClick={() => setStatusFilter(s)}
-            tone={s === "all" ? undefined : statusTone(s)}
+            key={c.id}
+            active={collectionId === c.id}
+            onClick={() => setCollectionId(c.id)}
           >
-            {s}
+            {c.id}
+          </Chip>
+        ))}
+        <span className="mx-2 h-4 w-px bg-edge" />
+        <Label>show</Label>
+        {(["all", "empty", "degraded"] as const).map((f) => (
+          <Chip key={f} active={filter === f} onClick={() => setFilter(f)}>
+            {f}
           </Chip>
         ))}
       </div>
 
-      {/* Trace rows */}
-      <div className="mt-3 overflow-hidden rounded-xl border border-edge">
-        <div className="grid grid-cols-[auto_1fr_1.2fr_auto_auto] items-center gap-3 bg-elevated/60 px-4 py-2.5">
-          {["op", "request", "collection", "latency", "when"].map((h) => (
-            <Label key={h}>{h}</Label>
-          ))}
-        </div>
-        {rows.map((t) => (
-          <TraceRow
-            key={t.id}
-            t={t}
-            colName={colName(t.collectionId)}
-            open={open === t.id}
-            onToggle={() => setOpen(open === t.id ? null : t.id)}
-          />
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function TraceRow({
-  t,
-  colName,
-  open,
-  onToggle,
-}: {
-  t: Trace;
-  colName: string;
-  open: boolean;
-  onToggle: () => void;
-}) {
-  const band = latencyBand(t.latencyMs);
-  return (
-    <div className="border-t border-edge">
-      <button
-        onClick={onToggle}
-        className={cx(
-          "grid w-full grid-cols-[auto_1fr_1.2fr_auto_auto] items-center gap-3 px-4 py-2.5 text-left transition hover:bg-elevated/50",
-          open && "bg-elevated/50"
-        )}
-      >
-        <Chip tone={OP_TONE[t.op]}>{t.op}</Chip>
-        <div className="flex min-w-0 items-center gap-2">
-          {t.status !== "ok" && (
-            <span
-              className={cx(
-                "h-1.5 w-1.5 shrink-0 rounded-full",
-                t.status === "error" ? "bg-danger" : "bg-warn"
-              )}
-            />
-          )}
-          <Mono className="truncate text-2xs text-muted">{t.id}</Mono>
-        </div>
-        <Mono className="truncate text-2xs text-subtle">{colName}</Mono>
-        <Mono className="tabular-nums text-2xs" >
-          <span style={{ color: HEAT_HEX[band] }}>{t.latencyMs}ms</span>
-        </Mono>
-        <Mono className="text-2xs text-subtle">{ago(t.ts)}</Mono>
-      </button>
-      {open && (
-        <div className="grid gap-2 border-t border-edge bg-canvas px-4 py-3 sm:grid-cols-2 card-in">
-          {[
-            ["request id", t.id],
-            ["operation", t.op],
-            ["collection", colName],
-            ["status", t.status],
-            ["latency", `${t.latencyMs}ms`],
-            ["vectors touched", `${t.vectors}`],
-            ["auth key", t.key],
-            ["detail", t.detail],
-          ].map(([l, v]) => (
-            <div key={l} className="flex items-center justify-between gap-3 border-b border-edge/60 pb-1.5">
-              <Label>{l}</Label>
-              <Mono className="truncate text-2xs text-ink">{v}</Mono>
-            </div>
-          ))}
-        </div>
+      {rows === null ? (
+        <div className="font-mono text-xs text-subtle">Loading traces…</div>
+      ) : rows.length === 0 ? (
+        <Empty
+          title={filter === "all" ? "No queries yet" : `No ${filter} queries`}
+          hint={
+            filter === "all"
+              ? "Run a search from Query & chat, or through the SDK, and it appears here with its full derivation."
+              : "Nothing matched that filter — which is the good outcome."
+          }
+        />
+      ) : (
+        <Card className="overflow-hidden">
+          <table className="w-full text-left">
+            <thead>
+              <tr className="border-b border-edge">
+                <Th className="pl-4">Query</Th>
+                <Th>Collection</Th>
+                <Th>Via</Th>
+                <Th className="text-right">Results</Th>
+                <Th className="text-right">Latency</Th>
+                <Th className="pr-4 text-right">When</Th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((t) => {
+                const status = traceStatus(t);
+                return (
+                  <tr
+                    key={t.id}
+                    onClick={() => api.trace(t.id).then(setOpen)}
+                    className="cursor-pointer border-b border-edge/60 transition last:border-0 hover:bg-elevated"
+                  >
+                    <td className="max-w-0 py-2.5 pl-4 pr-3">
+                      <div className="flex items-center gap-2">
+                        <Chip tone={statusTone(status)}>{status}</Chip>
+                        <span className="truncate text-xs text-ink">{t.query}</span>
+                      </div>
+                    </td>
+                    <td className="py-2.5 pr-3 font-mono text-2xs text-subtle">
+                      {t.collectionId || "—"}
+                    </td>
+                    <td className="py-2.5 pr-3">
+                      <Chip
+                        tone={
+                          t.via === "api_key"
+                            ? "text-hot border-hot/30 bg-hot/10"
+                            : "text-muted border-edgeStrong bg-elevated"
+                        }
+                      >
+                        {t.via}
+                      </Chip>
+                    </td>
+                    <td className="py-2.5 pr-3 text-right font-mono text-2xs tabular-nums text-muted">
+                      {t.resultCount}
+                    </td>
+                    <td
+                      className="py-2.5 pr-3 text-right font-mono text-2xs tabular-nums"
+                      style={{ color: HEAT_HEX[latencyBand(t.durationMs)] }}
+                    >
+                      {ms(t.durationMs)}
+                    </td>
+                    <td className="whitespace-nowrap py-2.5 pr-4 text-right font-mono text-2xs text-subtle">
+                      {ago(t.createdAt)}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </Card>
       )}
+
+      {open && <TracePanel trace={open} onClose={() => setOpen(null)} />}
     </div>
   );
 }
 
-function percentile(xs: number[], p: number): number {
-  if (!xs.length) return 0;
-  const s = [...xs].sort((a, b) => a - b);
-  return Math.round(s[Math.min(s.length - 1, Math.floor((p / 100) * s.length))]);
+/** One query, in full. */
+function TracePanel({ trace, onClose }: { trace: TraceDetail; onClose: () => void }) {
+  const timings = Object.entries(trace.timings_ms).filter(([k]) => k !== "total");
+  const total = trace.timings_ms.total || 1;
+
+  return (
+    <>
+      <div onClick={onClose} className="fixed inset-0 z-20 bg-black/50 backdrop-blur-[1px]" />
+      <aside className="fixed inset-y-0 right-0 z-30 flex w-[min(44rem,94vw)] flex-col border-l border-edge bg-panel shadow-2xl shadow-black/60 animate-slide">
+        <header className="flex items-start gap-3 border-b border-edge px-5 py-4">
+          <div className="min-w-0 flex-1">
+            <Label>query</Label>
+            <p className="mt-1 truncate text-sm text-ink">{trace.query}</p>
+            <Mono className="mt-1 block text-2xs text-subtle">{trace.id}</Mono>
+          </div>
+          <button
+            onClick={onClose}
+            className="rounded-lg border border-edge px-2 py-1 font-mono text-2xs text-muted transition hover:text-ink"
+          >
+            close
+          </button>
+        </header>
+
+        <div className="min-h-0 flex-1 space-y-5 overflow-y-auto px-5 py-5">
+          {trace.degraded && (
+            <div className="rounded-lg border border-hot/40 bg-hot/10 px-3 py-2 text-2xs text-hot">
+              {trace.degraded} — this answer was produced without one of the two arms.
+            </div>
+          )}
+
+          <section>
+            <Label className="mb-2 block">where the time went · {ms(total)} total</Label>
+            <div className="flex h-3 overflow-hidden rounded-md">
+              {timings.map(([k, v], i) => (
+                <div
+                  key={k}
+                  title={`${k} ${ms(v)}`}
+                  style={{ width: `${(v / total) * 100}%`, background: HEAT_HEX[i % 5] }}
+                />
+              ))}
+            </div>
+            <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1">
+              {timings.map(([k, v], i) => (
+                <span key={k} className="font-mono text-2xs text-subtle">
+                  <span style={{ color: HEAT_HEX[i % 5] }}>■</span> {k} {ms(v)}
+                </span>
+              ))}
+            </div>
+          </section>
+
+          <section className="grid gap-3 sm:grid-cols-2">
+            <Card className="p-3">
+              <Label>semantic arm</Label>
+              <div className="mt-1 font-mono text-lg text-ink">{trace.semantic.length}</div>
+              <p className="text-2xs text-subtle">
+                candidates by meaning
+                {trace.semantic[0] && ` · top ${trace.semantic[0].similarity.toFixed(3)}`}
+              </p>
+            </Card>
+            <Card className="p-3">
+              <Label>keyword arm</Label>
+              <div className="mt-1 font-mono text-lg text-ink">{trace.keyword.length}</div>
+              <p className="text-2xs text-subtle">
+                candidates by wording
+                {trace.keyword[0] && ` · top ${trace.keyword[0].rank.toFixed(4)}`}
+              </p>
+            </Card>
+          </section>
+
+          <section>
+            <Label className="mb-2 block">
+              fusion · {trace.fused.length} scored, {trace.returned.length} returned
+            </Label>
+            <Card className="overflow-hidden">
+              <table className="w-full text-left">
+                <thead>
+                  <tr className="border-b border-edge">
+                    <Th className="pl-3">Item</Th>
+                    <Th className="text-right">Score</Th>
+                    <Th className="text-right">Semantic</Th>
+                    <Th className="text-right">Keyword</Th>
+                    <Th className="pr-3 text-right">Recency</Th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {trace.fused.map((f) => (
+                    <tr
+                      key={f.item_id}
+                      className={cx(
+                        "border-b border-edge/60 last:border-0",
+                        !f.kept && "opacity-40"
+                      )}
+                    >
+                      <td className="py-2 pl-3">
+                        <Mono className="text-2xs text-muted">{f.item_id.slice(0, 12)}…</Mono>
+                        {!f.kept && (
+                          <span className="ml-2 font-mono text-2xs text-subtle">below floor</span>
+                        )}
+                      </td>
+                      <td className="py-2 text-right font-mono text-2xs tabular-nums text-ink">
+                        {f.score.toFixed(4)}
+                      </td>
+                      <td className="py-2 text-right font-mono text-2xs tabular-nums text-subtle">
+                        {f.semantic.toFixed(3)}
+                      </td>
+                      <td className="py-2 text-right font-mono text-2xs tabular-nums text-subtle">
+                        {f.keyword.toFixed(4)}
+                      </td>
+                      <td className="py-2 pr-3 text-right font-mono text-2xs tabular-nums text-subtle">
+                        {f.recency.toFixed(3)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </Card>
+          </section>
+
+          <section>
+            <Label className="mb-2 block">configuration it ran with</Label>
+            <pre className="overflow-x-auto rounded-lg border border-edge bg-canvas px-3 py-2.5 font-mono text-2xs leading-relaxed text-muted">
+              {JSON.stringify(trace.config, null, 2)}
+            </pre>
+          </section>
+        </div>
+      </aside>
+    </>
+  );
+}
+
+function Th({ children, className }: { children?: React.ReactNode; className?: string }) {
+  return (
+    <th
+      className={cx(
+        "py-2 pr-3 font-mono text-2xs font-medium uppercase tracking-[0.14em] text-subtle",
+        className
+      )}
+    >
+      {children}
+    </th>
+  );
 }

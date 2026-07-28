@@ -1,213 +1,229 @@
 "use client";
 
-import { useRef, useState } from "react";
-import { Collection, HEAT_HEX, Point, retrieve, simBand } from "../data";
-import { Button, Card, Chip, HeatLegend, Label, Mono, ScoreBar, VectorField } from "../ui/kit";
+import { useEffect, useRef, useState } from "react";
+import * as api from "../api";
+import { Collection, Point, cx, ms } from "../data";
+import { Card, Chip, HeatLegend, Label, Mono, ScoreBar, VectorField } from "../ui/kit";
 
+/** Query & chat.
+ *
+ *  This asks the store a question and shows what came back, with the passage
+ *  that matched and a link to the trace. It deliberately does NOT compose a
+ *  written answer: nothing here generates prose, so every line on screen is a
+ *  passage that exists in the store, attributable to a document. */
 type Turn = {
-  role: "user" | "assistant";
-  text: string;
-  points?: Point[];
-  ms?: number;
+  question: string;
+  matches: Point[];
+  tookMs: number;
+  traceId: string;
+  degraded: string | null;
 };
 
-const SUGGESTED = [
-  "How do I rotate an API key safely?",
-  "What does a 401 mean?",
-  "Can I use a write key in the browser?",
-];
-
 export function Query({ collections }: { collections: Collection[] }) {
-  const [col, setCol] = useState(collections[0]?.id || "");
-  const [input, setInput] = useState("");
+  const [collectionId, setCollectionId] = useState<string | undefined>(collections[0]?.id);
+  const [question, setQuestion] = useState("");
   const [turns, setTurns] = useState<Turn[]>([]);
   const [busy, setBusy] = useState(false);
-  const [live, setLive] = useState<Point[] | undefined>(undefined);
-  const scroller = useRef<HTMLDivElement>(null);
-  const collection = collections.find((c) => c.id === col);
+  const [error, setError] = useState<string | null>(null);
+  const endRef = useRef<HTMLDivElement>(null);
 
-  function ask(q: string) {
-    const query = q.trim();
-    if (!query || busy) return;
-    setInput("");
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [turns, busy]);
+
+  async function ask(text?: string) {
+    const q = (text ?? question).trim();
+    if (!q || busy) return;
     setBusy(true);
-    const points = retrieve(query);
-    setLive(points);
-    setTurns((t) => [...t, { role: "user", text: query }]);
-    const t0 = performance.now();
-    setTimeout(() => {
-      const ms = Math.round(6 + Math.random() * 14);
-      const answer = synth(query, points);
-      setTurns((t) => [...t, { role: "assistant", text: answer, points, ms }]);
+    setError(null);
+    setQuestion("");
+    try {
+      const out = await api.search(collectionId, q, 8);
+      setTurns((t) => [
+        ...t,
+        {
+          question: q,
+          matches: out.matches,
+          tookMs: out.tookMs,
+          traceId: out.traceId,
+          degraded: out.degraded,
+        },
+      ]);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
       setBusy(false);
-      requestAnimationFrame(() =>
-        scroller.current?.scrollTo({ top: scroller.current.scrollHeight, behavior: "smooth" })
-      );
-      void t0;
-    }, 620);
+    }
   }
 
+  const latest = turns[turns.length - 1];
+
   return (
-    <div className="flex h-full">
-      {/* Chat column */}
+    <div className="flex h-full min-h-0">
       <div className="flex min-w-0 flex-1 flex-col">
-        <div className="flex items-center gap-3 border-b border-edge px-6 py-3">
-          <h1 className="text-sm font-semibold text-ink">Query & chat</h1>
+        <header className="flex shrink-0 items-center gap-3 border-b border-edge px-6 py-3">
+          <h1 className="text-sm font-semibold text-ink">Query &amp; chat</h1>
           <div className="ml-auto flex items-center gap-2">
             <Label>collection</Label>
             <select
-              value={col}
-              onChange={(e) => setCol(e.target.value)}
-              className="rounded-lg border border-edge bg-elevated px-2.5 py-1.5 font-mono text-2xs text-ink outline-none focus:border-accent/60"
+              value={collectionId || ""}
+              onChange={(e) => setCollectionId(e.target.value || undefined)}
+              className="rounded-lg border border-edge bg-canvas px-2.5 py-1.5 font-mono text-2xs text-ink outline-none focus:border-accent/60"
             >
+              <option value="">all collections</option>
               {collections.map((c) => (
                 <option key={c.id} value={c.id}>
-                  {c.name}
+                  {c.id}
                 </option>
               ))}
             </select>
           </div>
-        </div>
+        </header>
 
-        <div ref={scroller} className="min-h-0 flex-1 space-y-4 overflow-y-auto px-6 py-6">
-          {turns.length === 0 && (
-            <div className="mx-auto max-w-lg pt-8 text-center">
-              <p className="text-sm text-ink">Ask your data a question</p>
-              <p className="mx-auto mt-1.5 max-w-sm text-xs leading-relaxed text-muted">
-                Your question is embedded, matched against{" "}
-                <Mono className="text-heat-2">{collection?.name}</Mono>, and the nearest
-                passages are fed to the model. Every answer cites the points it used.
+        <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5">
+          {turns.length === 0 && !busy && (
+            <div className="mx-auto max-w-lg py-16 text-center">
+              <h2 className="text-sm text-ink">Ask your data a question</h2>
+              <p className="mt-2 text-xs leading-relaxed text-subtle">
+                Your question is embedded and matched against the collection by meaning and
+                by exact wording together. Every passage shown is one that exists in a
+                document — nothing here is written for you.
               </p>
-              <div className="mt-4 flex flex-wrap justify-center gap-2">
-                {SUGGESTED.map((s) => (
-                  <Chip key={s} onClick={() => ask(s)} tone="text-muted border-edgeStrong bg-elevated">
-                    {s}
-                  </Chip>
-                ))}
-              </div>
             </div>
           )}
 
-          {turns.map((t, i) =>
-            t.role === "user" ? (
-              <div key={i} className="flex justify-end">
-                <div className="max-w-[80%] rounded-2xl rounded-br-sm bg-accent/15 px-4 py-2.5 text-sm text-ink">
-                  {t.text}
+          <div className="mx-auto max-w-2xl space-y-6">
+            {turns.map((t, i) => (
+              <div key={i} className="animate-rise">
+                <div className="mb-3 flex items-start gap-2.5">
+                  <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md bg-accent/20 font-mono text-2xs text-accentSoft">
+                    ?
+                  </span>
+                  <p className="text-sm text-ink">{t.question}</p>
                 </div>
-              </div>
-            ) : (
-              <div key={i} className="max-w-[88%] space-y-3 card-in">
-                <div className="rounded-2xl rounded-bl-sm border border-edge bg-panel px-4 py-3">
-                  <p className="text-sm leading-relaxed text-ink">{t.text}</p>
-                  <div className="mt-2 flex items-center gap-2">
-                    <Label>retrieved in {t.ms}ms</Label>
-                    <span className="text-subtle">·</span>
-                    <Label>{t.points?.length} points</Label>
-                  </div>
+
+                <div className="mb-2 flex flex-wrap items-center gap-2 pl-8">
+                  <Mono className="text-2xs text-subtle">
+                    {t.matches.length} passage{t.matches.length === 1 ? "" : "s"} · {ms(t.tookMs)}
+                  </Mono>
+                  <Chip title="the derivation of this answer">trace {t.traceId.slice(0, 8)}</Chip>
+                  {t.degraded && (
+                    <Chip tone="text-hot border-hot/40 bg-hot/10">{t.degraded}</Chip>
+                  )}
                 </div>
-                {t.points && (
-                  <div className="space-y-1.5 pl-1">
-                    {t.points.map((p) => (
-                      <div
-                        key={p.id}
-                        className="flex items-start gap-3 rounded-lg border border-edge bg-canvas px-3 py-2"
-                      >
-                        <span
-                          className="mt-1 h-2 w-2 shrink-0 rounded-full"
-                          style={{ background: HEAT_HEX[simBand(p.score)] }}
-                        />
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center justify-between gap-2">
-                            <Mono className="truncate text-2xs text-muted">
-                              {p.id} · {String(p.payload.title ?? "")}
-                            </Mono>
-                            <ScoreBar sim={p.score} />
+
+                {t.matches.length === 0 ? (
+                  <p className="pl-8 text-xs text-subtle">
+                    Nothing in this collection matched. The trace records what each arm
+                    looked at.
+                  </p>
+                ) : (
+                  <div className="space-y-2 pl-8">
+                    {t.matches.map((m) => (
+                      <Card key={m.id} className="p-3.5">
+                        <div className="flex items-start gap-3">
+                          <div className="min-w-0 flex-1">
+                            <div className="truncate text-xs font-medium text-ink">
+                              {m.title}
+                            </div>
+                            <p className="mt-1 text-xs leading-relaxed text-muted">
+                              …{m.excerpt}…
+                            </p>
+                            <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                              <Chip>{m.source}</Chip>
+                              <Mono className="text-2xs text-subtle">{m.locator}</Mono>
+                              {m.categories.map((c) => (
+                                <Chip key={c.class_id}>{c.name}</Chip>
+                              ))}
+                            </div>
                           </div>
-                          <p className="mt-1 line-clamp-2 text-2xs leading-relaxed text-subtle">
-                            {p.snippet}
-                          </p>
+                          <div className="shrink-0 pt-0.5">
+                            <ScoreBar sim={m.score} />
+                            <div className="mt-1 text-right font-mono text-2xs text-subtle">
+                              {m.semantic > 0.3 && m.keyword > 0.01
+                                ? "meaning + wording"
+                                : m.semantic > 0.3
+                                  ? "meaning"
+                                  : "wording"}
+                            </div>
+                          </div>
                         </div>
-                      </div>
+                      </Card>
                     ))}
                   </div>
                 )}
               </div>
-            )
-          )}
+            ))}
 
-          {busy && (
-            <div className="flex items-center gap-2 pl-1 text-2xs text-subtle">
-              <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-accent [animation-delay:-.2s]" />
-              <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-accent [animation-delay:-.1s]" />
-              <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-accent" />
-              <span className="ml-1 font-mono">searching {collection?.name}…</span>
-            </div>
-          )}
+            {busy && (
+              <div className="flex items-center gap-2 pl-8 font-mono text-2xs text-subtle">
+                <span className="h-3 w-3 animate-spin rounded-full border-2 border-edgeStrong border-t-accent" />
+                embedding and searching…
+              </div>
+            )}
+            {error && (
+              <p className="rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 font-mono text-2xs text-danger">
+                {error}
+              </p>
+            )}
+            <div ref={endRef} />
+          </div>
         </div>
 
-        <div className="border-t border-edge px-6 py-3">
+        <div className="shrink-0 border-t border-edge px-6 py-3">
           <form
             onSubmit={(e) => {
               e.preventDefault();
-              ask(input);
+              ask();
             }}
-            className="flex items-center gap-2"
+            className="mx-auto flex max-w-2xl gap-2"
           >
             <input
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              placeholder={`Ask ${collection?.name ?? "your collection"} anything…`}
-              className="flex-1 rounded-lg border border-edge bg-canvas px-3.5 py-2.5 text-sm text-ink outline-none placeholder:text-subtle focus:border-accent/60"
+              autoFocus
+              value={question}
+              onChange={(e) => setQuestion(e.target.value)}
+              placeholder={
+                collectionId ? `Ask ${collectionId} anything…` : "Ask across all collections…"
+              }
+              className="flex-1 rounded-lg border border-edge bg-canvas px-3.5 py-2.5 text-sm text-ink outline-none transition placeholder:text-subtle focus:border-accent/60"
             />
-            <Button variant="primary" type="submit" disabled={!input.trim() || busy}>
-              Send
-            </Button>
+            <button
+              type="submit"
+              disabled={busy || !question.trim()}
+              className="rounded-lg border border-accent bg-accent px-4 text-xs font-semibold text-canvas transition hover:bg-accentSoft disabled:opacity-40"
+            >
+              Ask
+            </button>
           </form>
         </div>
       </div>
 
-      {/* Retrieval inspector — the vector field mirrors the last query's k-NN */}
-      <aside className="hidden w-80 shrink-0 flex-col border-l border-edge bg-panel xl:flex">
-        <div className="border-b border-edge px-4 py-3">
-          <Label>retrieval space</Label>
+      {/* the retrieval space */}
+      <aside className="hidden w-72 shrink-0 flex-col border-l border-edge px-4 py-4 xl:flex">
+        <Label>retrieval space</Label>
+        <Card className="mt-2 overflow-hidden p-0">
+          <VectorField height={190} neighbours={latest?.matches} />
+        </Card>
+        <div className="mt-3">
+          <HeatLegend />
         </div>
-        <div className="p-3">
-          <Card className="overflow-hidden field-grid">
-            <VectorField neighbours={live} height={260} />
-          </Card>
-          <div className="mt-3 flex justify-center">
-            <HeatLegend />
-          </div>
-        </div>
-        <div className="border-t border-edge px-4 py-3">
-          <Label className="mb-2 block">last matches</Label>
-          {live ? (
-            <div className="space-y-1.5">
-              {live.map((p) => (
-                <div key={p.id} className="flex items-center justify-between">
-                  <Mono className="truncate text-2xs text-muted">{p.id}</Mono>
-                  <ScoreBar sim={p.score} />
-                </div>
-              ))}
-            </div>
-          ) : (
-            <p className="text-2xs text-subtle">Run a query to light up the field.</p>
-          )}
-        </div>
+
+        <Label className="mt-6 block">last matches</Label>
+        {!latest || latest.matches.length === 0 ? (
+          <p className="mt-2 text-2xs leading-relaxed text-subtle">
+            Run a query to light up the field.
+          </p>
+        ) : (
+          <ul className="mt-2 space-y-2">
+            {latest.matches.slice(0, 6).map((m) => (
+              <li key={m.id} className={cx("border-l-2 border-edge pl-2.5")}>
+                <div className="truncate text-2xs text-ink">{m.title}</div>
+                <Mono className="text-2xs text-subtle">{m.score.toFixed(3)}</Mono>
+              </li>
+            ))}
+          </ul>
+        )}
       </aside>
     </div>
   );
-}
-
-/** A tiny grounded-answer synthesiser: leans on the top passages so the reply
- *  reads like real RAG output without calling a model. */
-function synth(q: string, points: Point[]): string {
-  const top = points[0];
-  if (/401|unauth/i.test(q))
-    return "A 401 means the API key was missing, malformed, or revoked. Check the Authorization header reads `Bearer mvk_live_…` and confirm the key is still active on the API keys page.";
-  if (/rotat/i.test(q))
-    return "Rotate without downtime by creating a second key, deploying it, confirming traffic on the new key in the trace console, then revoking the old one. No requests are dropped because both keys are valid during the overlap.";
-  if (/browser|client|leak/i.test(q))
-    return "Don't ship a write key to the browser. Use a read-scoped key with a payload filter, or proxy queries through your own backend so the write key stays server-side.";
-  return `Based on ${top.id} (“${String(top.payload.title ?? "")}”): ${top.snippet}`;
 }
