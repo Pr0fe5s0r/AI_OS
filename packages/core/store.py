@@ -254,6 +254,7 @@ async def list_items(
     scope: Scope,
     source: str | None = None,
     status: Lifecycle = Lifecycle.ACTIVE,
+    class_id: str | None = None,
     limit: int = 50,
     offset: int = 0,
 ) -> list[Item]:
@@ -268,6 +269,15 @@ async def list_items(
     if source:
         clauses.append("source = :source")
         params["source"] = source
+    if class_id:
+        # EXISTS rather than a join: an item may carry several classes, and a
+        # join would return it once per class.
+        clauses.append(
+            "EXISTS (SELECT 1 FROM kb_item_classes ic "
+            "WHERE ic.item_id = kb_items.item_id AND ic.tenant_id = :tenant "
+            "AND ic.class_id = :class_id)"
+        )
+        params["class_id"] = class_id
     rows = (
         await session.execute(
             text(

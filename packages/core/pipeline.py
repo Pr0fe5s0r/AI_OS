@@ -46,6 +46,7 @@ async def _store(
     period_start: datetime | None,
     period_end: datetime | None,
     metadata: dict[str, Any] | None,
+    suggested: str | None = None,
 ) -> dict[str, Any]:
     """Shared tail: index the normalised content, queue embedding if it moved."""
     item = Item(
@@ -65,6 +66,9 @@ async def _store(
 
     if result.embedded_needed and (redis := ctx.get("redis")) is not None:
         await redis.enqueue_job("embed_item", scope.tenant_id, scope.brand_id, result.item.id)
+        await redis.enqueue_job(
+            "classify_new_item", scope.tenant_id, scope.brand_id, result.item.id, suggested
+        )
 
     return {
         "item_id": result.item.id,
@@ -85,6 +89,7 @@ async def ingest_file(
     period_start: datetime | None = None,
     period_end: datetime | None = None,
     metadata: dict[str, Any] | None = None,
+    suggested: str | None = None,
 ) -> dict[str, Any]:
     """A file — uploaded or pulled from a source — becomes an item.
 
@@ -106,7 +111,7 @@ async def ingest_file(
                 await session.commit()
         return {"item_id": item_id, "outcome": "failed", "reason": str(exc)}
 
-    return await _store(ctx, scope, ref, parsed, period_start, period_end, metadata)
+    return await _store(ctx, scope, ref, parsed, period_start, period_end, metadata, suggested)
 
 
 async def ingest_text(
@@ -121,12 +126,13 @@ async def ingest_text(
     period_start: datetime | None = None,
     period_end: datetime | None = None,
     metadata: dict[str, Any] | None = None,
+    suggested: str | None = None,
 ) -> dict[str, Any]:
     """Content that already is text: a generated report, a distilled session."""
     scope = _scope(tenant_id, brand_id)
     ref = SourceRef(source=source, locator=locator, url=url, fetched_at=datetime.now())
     parsed = normalise_text(body, title=title, source_name=locator)
-    return await _store(ctx, scope, ref, parsed, period_start, period_end, metadata)
+    return await _store(ctx, scope, ref, parsed, period_start, period_end, metadata, suggested)
 
 
 async def embed_item(
@@ -156,10 +162,35 @@ async def embed_item(
     return {"item_id": item.id, "outcome": "embedded"}
 
 
+async def classify_new_item(
+    ctx: dict[str, Any],
+    tenant_id: str,
+    brand_id: str | None,
+    item_id: str,
+    suggested: str | None = None,
+) -> dict[str, Any]:
+    """File the item. Separate from ingestion so a slow or unavailable
+    classifier delays filing, never the write."""
+    from packages.core.classify import classify_item
+
+    scope = _scope(tenant_id, brand_id)
+    async with Session() as session:
+        item = await get_item(session, scope, item_id)
+        if item is None:
+            return {"item_id": item_id, "outcome": "missing"}
+        assignments = await classify_item(session, scope, item, suggested)
+        await session.commit()
+    return {
+        "item_id": item_id,
+        "classes": [a.class_id for a in assignments],
+        "needs_review": any(a.needs_review for a in assignments),
+    }
+
+
 class WorkerSettings:
     """arq worker entry point."""
 
-    functions = [ingest_file, ingest_text, embed_item]
+    functions = [ingest_file, ingest_text, embed_item, classify_new_item]
     redis_settings = redis_settings()
     max_tries = 3
     job_timeout = 300

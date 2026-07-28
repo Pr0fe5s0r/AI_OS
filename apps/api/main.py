@@ -14,12 +14,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.auth_routes import router as auth_router
 from packages.core import graph
+from packages.core.classify import (
+    bulk_override,
+    classes_for,
+    create_class,
+    delete_class,
+    list_classes,
+    needs_review,
+    override,
+)
 from packages.core.db import Session
 from packages.core.normalise import supported
 from packages.core.pipeline import redis_settings
 from packages.core.search import RetrievalConfig, search
 from packages.core.store import get_item, item_versions, list_items
-from packages.core.tenancy import tenant_scope
+from packages.core.tenancy import current_principal, tenant_scope
 from packages.shared.schema import Lifecycle, Scope
 
 # ---------------------------------------------------------------------------
@@ -165,7 +174,15 @@ async def retrieve(
         include_superseded=include_superseded,
     )
     hits = await search(session, scope, q, cfg)
-    return {"query": q, "count": len(hits), "results": [h.model_dump() for h in hits]}
+    # Classes ride along so a result can be shown filed, without a call per hit.
+    tagged = await classes_for(session, scope, [h.item_id for h in hits])
+    return {
+        "query": q,
+        "count": len(hits),
+        "results": [
+            {**h.model_dump(), "classes": tagged.get(h.item_id, [])} for h in hits
+        ],
+    }
 
 
 # -------------------------------- the index --------------------------------
@@ -175,6 +192,7 @@ async def retrieve(
 async def catalogue(
     source: str | None = None,
     status: Lifecycle = Lifecycle.ACTIVE,
+    class_id: str | None = None,
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     scope: Scope = Depends(tenant_scope),
@@ -182,9 +200,157 @@ async def catalogue(
 ) -> dict[str, Any]:
     """What the KB holds — the listing and filtering KB-1 requires."""
     items = await list_items(
-        session, scope, source=source, status=status, limit=limit, offset=offset
+        session,
+        scope,
+        source=source,
+        status=status,
+        class_id=class_id,
+        limit=limit,
+        offset=offset,
     )
-    return {"count": len(items), "items": [i.model_dump() for i in items]}
+    tagged = await classes_for(session, scope, [i.id for i in items])
+    return {
+        "count": len(items),
+        "items": [
+            {**i.model_dump(), "classes": tagged.get(i.id, [])} for i in items
+        ],
+    }
+
+
+@app.get("/api/facets")
+async def facets(
+    scope: Scope = Depends(tenant_scope), session: AsyncSession = Depends(db)
+) -> dict[str, Any]:
+    """Counts for the filter rail: how many items per source and per class."""
+    by_source = (
+        await session.execute(
+            text(
+                "SELECT source, count(*) AS n FROM kb_items "
+                "WHERE tenant_id = :t AND status = 'active' GROUP BY source ORDER BY n DESC"
+            ),
+            {"t": scope.tenant_id},
+        )
+    ).all()
+    by_class = (
+        await session.execute(
+            text(
+                """
+                SELECT ic.class_id, COALESCE(c.name, ic.class_id) AS name, count(*) AS n
+                FROM kb_item_classes ic
+                JOIN kb_items i ON i.item_id = ic.item_id AND i.status = 'active'
+                LEFT JOIN kb_classes c ON c.class_id = ic.class_id
+                     AND (c.tenant_id IS NULL OR c.tenant_id = ic.tenant_id)
+                WHERE ic.tenant_id = :t
+                GROUP BY ic.class_id, c.name ORDER BY n DESC
+                """
+            ),
+            {"t": scope.tenant_id},
+        )
+    ).all()
+    total = (
+        await session.execute(
+            text(
+                "SELECT count(*) FROM kb_items WHERE tenant_id = :t AND status = 'active'"
+            ),
+            {"t": scope.tenant_id},
+        )
+    ).scalar_one()
+    return {
+        "total": total,
+        "sources": [{"source": r.source, "count": r.n} for r in by_source],
+        "classes": [
+            {"class_id": r.class_id, "name": r.name, "count": r.n} for r in by_class
+        ],
+    }
+
+
+# ----------------------------- taxonomy (KB-2) -----------------------------
+
+
+class ClassIn(BaseModel):
+    class_id: str = Field(min_length=1, pattern=r"^[a-z0-9][a-z0-9_-]*$")
+    name: str = Field(min_length=1)
+    parent_id: str | None = None
+    description: str | None = None
+
+
+class OverrideIn(BaseModel):
+    """A person's filing decision. Sticky, and never silently reverted."""
+
+    class_ids: list[str]
+    item_ids: list[str] | None = None  # present = bulk
+
+
+@app.get("/api/classes")
+async def taxonomy(
+    scope: Scope = Depends(tenant_scope), session: AsyncSession = Depends(db)
+) -> dict[str, Any]:
+    """The taxonomy this tenant can file into: platform classes plus their own."""
+    return {"classes": await list_classes(session, scope)}
+
+
+@app.post("/api/classes", status_code=201)
+async def add_class(
+    payload: ClassIn,
+    scope: Scope = Depends(tenant_scope),
+    session: AsyncSession = Depends(db),
+) -> dict[str, Any]:
+    """Adding a class is data, not a deployment (KB-2.0)."""
+    created = await create_class(
+        session,
+        scope,
+        payload.class_id,
+        payload.name,
+        parent_id=payload.parent_id,
+        description=payload.description,
+    )
+    await session.commit()
+    return created
+
+
+@app.delete("/api/classes/{class_id}")
+async def remove_class(
+    class_id: str,
+    scope: Scope = Depends(tenant_scope),
+    session: AsyncSession = Depends(db),
+) -> dict[str, bool]:
+    """Remove one of this tenant's own classes. System classes may be extended
+    but not deleted, so this refuses rather than pretending to succeed."""
+    removed = await delete_class(session, scope, class_id)
+    if not removed:
+        raise HTTPException(400, "Not a deletable class for this workspace.")
+    await session.commit()
+    return {"deleted": True}
+
+
+@app.put("/api/items/{item_id}/classes")
+async def set_classes(
+    item_id: str,
+    payload: OverrideIn,
+    scope: Scope = Depends(tenant_scope),
+    session: AsyncSession = Depends(db),
+    principal: dict[str, Any] = Depends(current_principal),
+) -> dict[str, Any]:
+    """A person files this item. Audited, and pinned so nothing reverts it."""
+    actor = str(principal.get("email") or principal.get("user_id") or "unknown")
+    if payload.item_ids:
+        count = await bulk_override(session, scope, payload.item_ids, payload.class_ids, actor)
+        await session.commit()
+        return {"updated": count, "class_ids": payload.class_ids}
+
+    await override(session, scope, item_id, payload.class_ids, actor)
+    await session.commit()
+    return {"item_id": item_id, "class_ids": payload.class_ids, "pinned": True}
+
+
+@app.get("/api/review")
+async def review_queue(
+    limit: int = Query(50, ge=1, le=200),
+    scope: Scope = Depends(tenant_scope),
+    session: AsyncSession = Depends(db),
+) -> dict[str, Any]:
+    """What the KB could not file confidently — surfaced, never buried."""
+    return {"items": await needs_review(session, scope, limit=limit)}
 
 
 @app.get("/api/items/{item_id}")
