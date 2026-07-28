@@ -35,6 +35,7 @@ from packages.core.keys import create_key, list_keys, revoke_key
 from packages.core.normalise import supported
 from packages.core.pipeline import redis_settings
 from packages.core.search import RetrievalConfig, search_traced
+from packages.core.snippets import build as build_snippets
 from packages.core.store import get_item, item_versions, list_items
 from packages.core.tenancy import require_write, resolve_caller, workspace_scope
 from packages.core.tracing import get_trace, list_traces, record, stats
@@ -653,6 +654,19 @@ async def drop_key(
         raise HTTPException(404, "No such key, or it is already revoked.")
     await session.commit()
     return {"revoked": True}
+
+
+@app.get("/api/snippets")
+async def code_snippets(
+    collection: str = Query("default", min_length=1),
+    principal: dict[str, Any] = Depends(resolve_caller),
+) -> dict[str, Any]:
+    """Ready-to-paste code for this collection.
+
+    The key is never interpolated — snippets get copied into chat, tickets and
+    screenshots, so they read it from the environment instead.
+    """
+    return build_snippets(os.getenv("PUBLIC_API_URL", "http://localhost:8000"), collection)
 
 
 @app.get("/api/whoami")
