@@ -283,6 +283,51 @@ async def related(scope: Scope, item_id: str, hops: int = 1) -> GraphResult:
     return GraphResult(center=item_id, nodes=nodes, edges=edges)
 
 
+async def collection_vectors(scope: Scope, limit: int = 200) -> list[dict]:
+    """Every item in scope with its embedding, for building a neighbour graph.
+
+    Returned in one query rather than one per item: a k-nearest-neighbour map
+    over 200 points is 200 vector-index probes if done node by node, which is
+    slower than fetching the vectors once and comparing them in memory.
+    """
+    clause, params = _scope_clause("i", scope)
+    return await _run(
+        f"""
+        MATCH (i:Item)
+        WHERE {clause} AND i.status = $active AND i.embedding IS NOT NULL
+        RETURN i.item_id AS id, i.title AS title, i.source AS source,
+               i.embedding AS embedding
+        LIMIT $limit
+        """,
+        active=str(Lifecycle.ACTIVE),
+        limit=limit,
+        **params,
+    )
+
+
+async def links_between(scope: Scope, item_ids: list[str]) -> list[dict]:
+    """Declared relationships among a set of items — lineage and derivation.
+
+    These are different in kind from similarity edges: one is something the
+    store recorded, the other is something it computed, and the view must not
+    blur them together.
+    """
+    if not item_ids:
+        return []
+    clause_a, params = _scope_clause("a", scope)
+    clause_b, _ = _scope_clause("b", scope)
+    return await _run(
+        f"""
+        MATCH (a:Item)-[r]->(b:Item)
+        WHERE {clause_a} AND {clause_b}
+          AND a.item_id IN $ids AND b.item_id IN $ids
+        RETURN a.item_id AS src, b.item_id AS dst, type(r) AS type
+        """,
+        ids=item_ids,
+        **params,
+    )
+
+
 async def count_nodes(scope: Scope | None = None) -> dict[str, int]:
     if scope is None:
         rows = await _run("MATCH (n) RETURN labels(n)[0] AS label, count(n) AS n")

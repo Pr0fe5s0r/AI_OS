@@ -32,6 +32,7 @@ from packages.core.collections import (
 )
 from packages.core.db import Session
 from packages.core.keys import create_key, list_keys, revoke_key
+from packages.core.neighbours import collection_graph
 from packages.core.normalise import supported
 from packages.core.pipeline import redis_settings
 from packages.core.search import RetrievalConfig, search_traced
@@ -592,6 +593,24 @@ async def collection_detail(
     if found is None:
         raise HTTPException(404, "No such collection.")
     return found
+
+
+@app.get("/api/collections/{collection_id}/graph")
+async def collection_shape(
+    collection_id: str,
+    k: int = Query(3, ge=1, le=8),
+    limit: int = Query(200, ge=10, le=400),
+    principal: dict[str, Any] = Depends(resolve_caller),
+    session: AsyncSession = Depends(db),
+) -> dict[str, Any]:
+    """The collection as a neighbour graph: points joined to their nearest
+    neighbours by cosine similarity, plus any relationships the store recorded.
+
+    Similarity edges are computed from the embeddings, so this is the actual
+    shape of the data rather than a diagram of it.
+    """
+    scope = Scope(workspace_id=str(principal["company_id"]), collection_id=collection_id)
+    return await collection_graph(session, scope, k=k, limit=limit)
 
 
 @app.delete("/api/collections/{collection_id}")

@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import * as api from "../api";
 import { Collection, CollectionDetail, Document, ago, bytes, cx, num } from "../data";
+import { CollectionGraph } from "../ui/graph";
 import { Button, Card, Chip, Empty, Label, Mono, Stat } from "../ui/kit";
 
 /** Collections, and what is inside one.
@@ -30,6 +31,9 @@ export function Collections({
   const [docs, setDocs] = useState<Document[] | null>(null);
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState("");
+  const [view, setView] = useState<"graph" | "table">("graph");
+  const [k, setK] = useState(3);
+  const [shape, setShape] = useState<api.CollectionShape | null>(null);
 
   useEffect(() => {
     let live = true;
@@ -53,6 +57,22 @@ export function Collections({
       live = false;
     };
   }, [selected]);
+
+  // The graph is loaded separately from the detail: it is the slower of the
+  // two (it reads every vector in the collection), and the stats should not
+  // wait on it.
+  useEffect(() => {
+    let live = true;
+    setShape(null);
+    if (!selected || view !== "graph") return;
+    api
+      .collectionGraph(selected, k)
+      .then((s) => live && setShape(s))
+      .catch(() => live && setShape({ nodes: [], edges: [], truncated: false, k }));
+    return () => {
+      live = false;
+    };
+  }, [selected, view, k]);
 
   async function create() {
     if (!name.trim()) return;
@@ -133,8 +153,54 @@ export function Collections({
               />
             </Card>
 
-            <Label className="mb-2 block">documents</Label>
-            {docs === null ? (
+            <div className="mb-2 flex items-center justify-between">
+              <Label>{view === "graph" ? "neighbour graph" : "documents"}</Label>
+              <div className="flex items-center gap-3">
+                {view === "graph" && (
+                  <div className="flex items-center gap-1.5">
+                    <Label>k</Label>
+                    {[2, 3, 5].map((n) => (
+                      <Chip key={n} active={k === n} onClick={() => setK(n)}>
+                        {n}
+                      </Chip>
+                    ))}
+                  </div>
+                )}
+                <div className="flex gap-1 rounded-lg border border-edge bg-elevated p-0.5">
+                  {(["graph", "table"] as const).map((v) => (
+                    <button
+                      key={v}
+                      onClick={() => setView(v)}
+                      className={cx(
+                        "rounded-md px-2.5 py-1 font-mono text-2xs transition",
+                        view === v ? "bg-accent/15 text-ink" : "text-subtle hover:text-muted"
+                      )}
+                    >
+                      {v}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {view === "graph" ? (
+              shape === null ? (
+                <div className="flex h-64 items-center justify-center rounded-xl border border-edge font-mono text-2xs text-subtle">
+                  building the neighbour graph…
+                </div>
+              ) : (
+                <>
+                  <CollectionGraph nodes={shape.nodes} edges={shape.edges} />
+                  <p className="mt-2 text-2xs leading-relaxed text-subtle">
+                    Each point is a document, joined to its {shape.k} nearest neighbours by
+                    cosine similarity — the edges are computed from the vectors, so this is
+                    the shape of the data rather than a diagram of it. Dashed orange edges are
+                    relationships the store recorded, such as one version superseding another.
+                    {shape.truncated && " Showing the first 200 documents."}
+                  </p>
+                </>
+              )
+            ) : docs === null ? (
               <div className="font-mono text-xs text-subtle">Loading…</div>
             ) : docs.length === 0 ? (
               <Empty

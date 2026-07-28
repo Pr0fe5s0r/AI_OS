@@ -150,6 +150,24 @@ export async function collection(id: string): Promise<CollectionDetail> {
 export const deleteCollection = (id: string) =>
   call<{ items_removed: number }>(`/api/collections/${id}`, { method: "DELETE" });
 
+export type CollectionShape = {
+  nodes: {
+    id: string;
+    title: string;
+    source: string;
+    degree: number;
+    category: string | null;
+    categoryName: string | null;
+  }[];
+  edges: { src: string; dst: string; similarity: number; kind: string }[];
+  truncated: boolean;
+  k: number;
+};
+
+/** The collection as a neighbour graph, built from the embeddings themselves. */
+export const collectionGraph = (id: string, k = 3) =>
+  call<CollectionShape>(`/api/collections/${id}/graph?k=${k}`);
+
 // ----------------------------------- keys -----------------------------------
 
 export async function keys(): Promise<ApiKey[]> {
