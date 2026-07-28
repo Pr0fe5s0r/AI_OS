@@ -14,17 +14,17 @@ if str(ROOT) not in sys.path:
 from packages.shared.schema import Scope  # noqa: E402
 
 # Every test works inside an explicit throwaway scope. Nothing in the suite may
-# touch a real workspace, and nothing may rely on a default tenant existing —
+# touch a real workspace, and nothing may rely on a default workspace existing —
 # tenancy is the one property the KB cannot get wrong, so the tests carry it
 # deliberately rather than inheriting it.
 
-TENANT = "test-agency"
-OTHER_TENANT = "other-agency"
+WORKSPACE = "test-agency"
+OTHER_WORKSPACE = "other-agency"
 
-SCOPE = Scope(tenant_id=TENANT)
-BRAND_A = Scope(tenant_id=TENANT, brand_id="brand-a")
-BRAND_B = Scope(tenant_id=TENANT, brand_id="brand-b")
-OTHER = Scope(tenant_id=OTHER_TENANT)
+SCOPE = Scope(workspace_id=WORKSPACE)
+COLL_A = Scope(workspace_id=WORKSPACE, collection_id="collection-a")
+COLL_B = Scope(workspace_id=WORKSPACE, collection_id="collection-b")
+OTHER = Scope(workspace_id=OTHER_WORKSPACE)
 
 
 def _database_reachable() -> bool:
@@ -96,7 +96,7 @@ async def db():
 async def clean_scope(request):
     """Remove anything the tests wrote, in both directions.
 
-    Test data lives under throwaway tenant ids that no real workspace uses, and
+    Test data lives under throwaway workspace ids that no real workspace uses, and
     is cleared before and after so a failed run cannot poison the next one.
     """
     if "db" not in request.fixturenames:
@@ -107,20 +107,29 @@ async def clean_scope(request):
 
     from packages.core.db import Session
 
+    # Each table is purged in its own transaction. Sharing one meant a single
+    # failing statement — a table that had been renamed out from under the
+    # fixture — silently rolled back every other delete, so test data
+    # accumulated and later assertions counted rows from earlier tests.
     async def purge():
-        try:
-            async with Session() as session:
-                await session.execute(
-                    text("DELETE FROM kb_items WHERE tenant_id = ANY(:t)"),
-                    {"t": [TENANT, OTHER_TENANT]},
-                )
-                await session.execute(
-                    text("DELETE FROM brands WHERE tenant_id = ANY(:t)"),
-                    {"t": [TENANT, OTHER_TENANT]},
-                )
-                await session.commit()
-        except Exception:
-            pass
+        ids = [WORKSPACE, OTHER_WORKSPACE]
+        for table, column in (
+            ("kb_items", "workspace_id"),
+            ("kb_item_classes", "workspace_id"),
+            ("kb_classes", "workspace_id"),
+            ("collections", "workspace_id"),
+            ("clusters", "workspace_id"),
+            ("api_keys", "workspace_id"),
+        ):
+            try:
+                async with Session() as session:
+                    await session.execute(
+                        text(f"DELETE FROM {table} WHERE {column} = ANY(:ids)"),  # noqa: S608
+                        {"ids": ids},
+                    )
+                    await session.commit()
+            except Exception:
+                pass
 
     await purge()
     yield

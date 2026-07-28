@@ -23,12 +23,20 @@ from packages.core.classify import (
     needs_review,
     override,
 )
+from packages.core.collections import (
+    create_cluster,
+    create_collection,
+    delete_collection,
+    get_collection,
+    list_clusters,
+)
 from packages.core.db import Session
+from packages.core.keys import create_key, list_keys, revoke_key
 from packages.core.normalise import supported
 from packages.core.pipeline import redis_settings
 from packages.core.search import RetrievalConfig, search
 from packages.core.store import get_item, item_versions, list_items
-from packages.core.tenancy import current_principal, tenant_scope
+from packages.core.tenancy import require_write, resolve_caller, workspace_scope
 from packages.shared.schema import Lifecycle, Scope
 
 # ---------------------------------------------------------------------------
@@ -37,8 +45,9 @@ from packages.shared.schema import Lifecycle, Scope
 #   POST /api/items    the ingest contract    — one write path for everything
 #   GET  /api/search   the retrieval contract — one read path for every agent
 #
-# Both are scoped by the caller's session (agency) plus an optional verified
-# brand header. No route accepts a tenant id as a parameter.
+# Both are scoped by the caller's credential — a session cookie or an API key —
+# plus an optional verified collection header. No route accepts a workspace id
+# as a parameter.
 # ---------------------------------------------------------------------------
 
 
@@ -96,12 +105,12 @@ class Accepted(BaseModel):
 
 
 @app.post("/api/items", response_model=Accepted, status_code=202)
-async def ingest_text_item(payload: TextIngest, scope: Scope = Depends(tenant_scope)) -> Accepted:
+async def ingest_text_item(payload: TextIngest, scope: Scope = Depends(workspace_scope)) -> Accepted:
     """Write text into the KB. Returns immediately — indexing never blocks."""
     job = await app.state.queue.enqueue_job(
         "ingest_text",
-        scope.tenant_id,
-        scope.brand_id,
+        scope.workspace_id,
+        scope.collection_id,
         payload.source,
         payload.locator,
         payload.body,
@@ -122,7 +131,7 @@ async def ingest_file_item(
     url: str | None = Form(None),
     period_start: datetime | None = Form(None),
     period_end: datetime | None = Form(None),
-    scope: Scope = Depends(tenant_scope),
+    scope: Scope = Depends(workspace_scope),
 ) -> Accepted:
     """Upload a document. The bytes become Markdown and are then discarded.
 
@@ -136,8 +145,8 @@ async def ingest_file_item(
 
     job = await app.state.queue.enqueue_job(
         "ingest_file",
-        scope.tenant_id,
-        scope.brand_id,
+        scope.workspace_id,
+        scope.collection_id,
         source,
         locator or filename,
         filename,
@@ -168,7 +177,7 @@ async def retrieve(
     period_from: datetime | None = None,
     period_to: datetime | None = None,
     include_superseded: bool = False,
-    scope: Scope = Depends(tenant_scope),
+    scope: Scope = Depends(workspace_scope),
     session: AsyncSession = Depends(db),
 ) -> dict[str, Any]:
     """The single read path. Every agent uses this; behaviour comes from config.
@@ -206,7 +215,7 @@ async def catalogue(
     class_id: str | None = None,
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
-    scope: Scope = Depends(tenant_scope),
+    scope: Scope = Depends(workspace_scope),
     session: AsyncSession = Depends(db),
 ) -> dict[str, Any]:
     """What the KB holds — the listing and filtering KB-1 requires."""
@@ -230,16 +239,16 @@ async def catalogue(
 
 @app.get("/api/facets")
 async def facets(
-    scope: Scope = Depends(tenant_scope), session: AsyncSession = Depends(db)
+    scope: Scope = Depends(workspace_scope), session: AsyncSession = Depends(db)
 ) -> dict[str, Any]:
     """Counts for the filter rail: how many items per source and per class."""
     by_source = (
         await session.execute(
             text(
                 "SELECT source, count(*) AS n FROM kb_items "
-                "WHERE tenant_id = :t AND status = 'active' GROUP BY source ORDER BY n DESC"
+                "WHERE workspace_id = :t AND status = 'active' GROUP BY source ORDER BY n DESC"
             ),
-            {"t": scope.tenant_id},
+            {"t": scope.workspace_id},
         )
     ).all()
     by_class = (
@@ -250,20 +259,20 @@ async def facets(
                 FROM kb_item_classes ic
                 JOIN kb_items i ON i.item_id = ic.item_id AND i.status = 'active'
                 LEFT JOIN kb_classes c ON c.class_id = ic.class_id
-                     AND (c.tenant_id IS NULL OR c.tenant_id = ic.tenant_id)
-                WHERE ic.tenant_id = :t
+                     AND (c.workspace_id IS NULL OR c.workspace_id = ic.workspace_id)
+                WHERE ic.workspace_id = :t
                 GROUP BY ic.class_id, c.name ORDER BY n DESC
                 """
             ),
-            {"t": scope.tenant_id},
+            {"t": scope.workspace_id},
         )
     ).all()
     total = (
         await session.execute(
             text(
-                "SELECT count(*) FROM kb_items WHERE tenant_id = :t AND status = 'active'"
+                "SELECT count(*) FROM kb_items WHERE workspace_id = :t AND status = 'active'"
             ),
-            {"t": scope.tenant_id},
+            {"t": scope.workspace_id},
         )
     ).scalar_one()
     return {
@@ -294,16 +303,16 @@ class OverrideIn(BaseModel):
 
 @app.get("/api/classes")
 async def taxonomy(
-    scope: Scope = Depends(tenant_scope), session: AsyncSession = Depends(db)
+    scope: Scope = Depends(workspace_scope), session: AsyncSession = Depends(db)
 ) -> dict[str, Any]:
-    """The taxonomy this tenant can file into: platform classes plus their own."""
+    """The taxonomy this workspace can file into: platform classes plus their own."""
     return {"classes": await list_classes(session, scope)}
 
 
 @app.post("/api/classes", status_code=201)
 async def add_class(
     payload: ClassIn,
-    scope: Scope = Depends(tenant_scope),
+    scope: Scope = Depends(workspace_scope),
     session: AsyncSession = Depends(db),
 ) -> dict[str, Any]:
     """Adding a class is data, not a deployment (KB-2.0)."""
@@ -322,10 +331,10 @@ async def add_class(
 @app.delete("/api/classes/{class_id}")
 async def remove_class(
     class_id: str,
-    scope: Scope = Depends(tenant_scope),
+    scope: Scope = Depends(workspace_scope),
     session: AsyncSession = Depends(db),
 ) -> dict[str, bool]:
-    """Remove one of this tenant's own classes. System classes may be extended
+    """Remove one of this workspace's own classes. System classes may be extended
     but not deleted, so this refuses rather than pretending to succeed."""
     removed = await delete_class(session, scope, class_id)
     if not removed:
@@ -338,9 +347,9 @@ async def remove_class(
 async def set_classes(
     item_id: str,
     payload: OverrideIn,
-    scope: Scope = Depends(tenant_scope),
+    scope: Scope = Depends(workspace_scope),
     session: AsyncSession = Depends(db),
-    principal: dict[str, Any] = Depends(current_principal),
+    principal: dict[str, Any] = Depends(resolve_caller),
 ) -> dict[str, Any]:
     """A person files this item. Audited, and pinned so nothing reverts it."""
     actor = str(principal.get("email") or principal.get("user_id") or "unknown")
@@ -357,7 +366,7 @@ async def set_classes(
 @app.get("/api/review")
 async def review_queue(
     limit: int = Query(50, ge=1, le=200),
-    scope: Scope = Depends(tenant_scope),
+    scope: Scope = Depends(workspace_scope),
     session: AsyncSession = Depends(db),
 ) -> dict[str, Any]:
     """What the KB could not file confidently — surfaced, never buried."""
@@ -368,7 +377,7 @@ async def review_queue(
 async def one_item(
     item_id: str,
     version: int | None = None,
-    scope: Scope = Depends(tenant_scope),
+    scope: Scope = Depends(workspace_scope),
     session: AsyncSession = Depends(db),
 ) -> dict[str, Any]:
     """One item: what it is, where it came from, and whether it is current."""
@@ -385,7 +394,7 @@ async def one_item(
 @app.get("/api/items/{item_id}/versions")
 async def versions(
     item_id: str,
-    scope: Scope = Depends(tenant_scope),
+    scope: Scope = Depends(workspace_scope),
     session: AsyncSession = Depends(db),
 ) -> dict[str, Any]:
     """The lineage of an item, newest first."""
@@ -397,7 +406,7 @@ async def versions(
 
 @app.get("/api/items/{item_id}/related")
 async def related_items(
-    item_id: str, hops: int = Query(1, ge=1, le=3), scope: Scope = Depends(tenant_scope)
+    item_id: str, hops: int = Query(1, ge=1, le=3), scope: Scope = Depends(workspace_scope)
 ) -> dict[str, Any]:
     """What this item connects to — lineage and derivation."""
     return (await graph.related(scope, item_id, hops=hops)).model_dump()
@@ -407,26 +416,26 @@ async def related_items(
 
 
 class BrandIn(BaseModel):
-    brand_id: str = Field(min_length=1)
+    collection_id: str = Field(min_length=1)
     name: str = Field(min_length=1)
 
 
 @app.get("/api/brands")
 async def list_brands(
-    scope: Scope = Depends(tenant_scope), session: AsyncSession = Depends(db)
+    scope: Scope = Depends(workspace_scope), session: AsyncSession = Depends(db)
 ) -> dict[str, Any]:
     rows = (
         await session.execute(
             text(
-                "SELECT brand_id, name, created_at FROM brands "
-                "WHERE tenant_id = :tenant ORDER BY name"
+                "SELECT collection_id, name, created_at FROM brands "
+                "WHERE workspace_id = :workspace ORDER BY name"
             ),
-            {"tenant": scope.tenant_id},
+            {"workspace": scope.workspace_id},
         )
     ).all()
     return {
         "brands": [
-            {"brand_id": r.brand_id, "name": r.name, "created_at": r.created_at.isoformat()}
+            {"collection_id": r.collection_id, "name": r.name, "created_at": r.created_at.isoformat()}
             for r in rows
         ]
     }
@@ -435,18 +444,168 @@ async def list_brands(
 @app.post("/api/brands", status_code=201)
 async def create_brand(
     payload: BrandIn,
-    scope: Scope = Depends(tenant_scope),
+    scope: Scope = Depends(workspace_scope),
     session: AsyncSession = Depends(db),
 ) -> dict[str, str]:
     await session.execute(
         text(
-            "INSERT INTO brands (tenant_id, brand_id, name) VALUES (:tenant, :brand, :name) "
-            "ON CONFLICT (tenant_id, brand_id) DO UPDATE SET name = EXCLUDED.name"
+            "INSERT INTO brands (workspace_id, collection_id, name) VALUES (:workspace, :collection, :name) "
+            "ON CONFLICT (workspace_id, collection_id) DO UPDATE SET name = EXCLUDED.name"
         ),
-        {"tenant": scope.tenant_id, "brand": payload.brand_id, "name": payload.name},
+        {"workspace": scope.workspace_id, "collection": payload.collection_id, "name": payload.name},
     )
     await session.commit()
-    return {"brand_id": payload.brand_id}
+    return {"collection_id": payload.collection_id}
+
+
+# --------------------------- clusters & collections ---------------------------
+
+
+class CollectionIn(BaseModel):
+    name: str = Field(min_length=1)
+    collection_id: str | None = None
+    cluster_id: str | None = None
+    description: str | None = None
+
+
+class ClusterIn(BaseModel):
+    name: str = Field(min_length=1)
+    cluster_id: str | None = None
+
+
+@app.get("/api/clusters")
+async def clusters(
+    principal: dict[str, Any] = Depends(resolve_caller),
+    session: AsyncSession = Depends(db),
+) -> dict[str, Any]:
+    """The whole tree — clusters, their collections, and live item counts."""
+    return {"clusters": await list_clusters(session, str(principal["company_id"]))}
+
+
+@app.post("/api/clusters", status_code=201)
+async def add_cluster(
+    payload: ClusterIn,
+    principal: dict[str, Any] = Depends(resolve_caller),
+    session: AsyncSession = Depends(db),
+) -> dict[str, Any]:
+    require_write(principal)
+    try:
+        created = await create_cluster(
+            session, str(principal["company_id"]), payload.name, payload.cluster_id
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    await session.commit()
+    return created
+
+
+@app.post("/api/collections", status_code=201)
+async def add_collection(
+    payload: CollectionIn,
+    principal: dict[str, Any] = Depends(resolve_caller),
+    session: AsyncSession = Depends(db),
+) -> dict[str, Any]:
+    """Create a collection. Its embedding model and dimensions are fixed now,
+    because changing either later invalidates every vector inside it."""
+    require_write(principal)
+    try:
+        created = await create_collection(
+            session,
+            str(principal["company_id"]),
+            payload.name,
+            collection_id=payload.collection_id,
+            cluster_id=payload.cluster_id,
+            description=payload.description,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    await session.commit()
+    return created
+
+
+@app.get("/api/collections/{collection_id}")
+async def collection_detail(
+    collection_id: str,
+    principal: dict[str, Any] = Depends(resolve_caller),
+    session: AsyncSession = Depends(db),
+) -> dict[str, Any]:
+    found = await get_collection(session, str(principal["company_id"]), collection_id)
+    if found is None:
+        raise HTTPException(404, "No such collection.")
+    return found
+
+
+@app.delete("/api/collections/{collection_id}")
+async def drop_collection(
+    collection_id: str,
+    principal: dict[str, Any] = Depends(resolve_caller),
+    session: AsyncSession = Depends(db),
+) -> dict[str, Any]:
+    """Delete a collection and its contents, reporting how much went."""
+    require_write(principal)
+    removed = await delete_collection(session, str(principal["company_id"]), collection_id)
+    await session.commit()
+    return {"deleted": True, "items_removed": removed}
+
+
+# ---------------------------------- keys ----------------------------------
+
+
+class KeyIn(BaseModel):
+    name: str = Field(min_length=1)
+    scopes: str = "read,write"
+
+
+@app.get("/api/keys")
+async def keys(
+    principal: dict[str, Any] = Depends(resolve_caller),
+    session: AsyncSession = Depends(db),
+) -> dict[str, Any]:
+    """Existing keys — prefixes and usage only. The keys themselves are gone."""
+    return {"keys": await list_keys(session, str(principal["company_id"]))}
+
+
+@app.post("/api/keys", status_code=201)
+async def add_key(
+    payload: KeyIn,
+    principal: dict[str, Any] = Depends(resolve_caller),
+    session: AsyncSession = Depends(db),
+) -> dict[str, Any]:
+    """Issue a key. The plaintext is in this response and nowhere else, ever."""
+    require_write(principal)
+    created = await create_key(
+        session,
+        str(principal["company_id"]),
+        payload.name,
+        created_by=str(principal.get("email") or ""),
+        scopes=payload.scopes,
+    )
+    await session.commit()
+    return created
+
+
+@app.delete("/api/keys/{key_id}")
+async def drop_key(
+    key_id: str,
+    principal: dict[str, Any] = Depends(resolve_caller),
+    session: AsyncSession = Depends(db),
+) -> dict[str, bool]:
+    require_write(principal)
+    if not await revoke_key(session, str(principal["company_id"]), key_id):
+        raise HTTPException(404, "No such key, or it is already revoked.")
+    await session.commit()
+    return {"revoked": True}
+
+
+@app.get("/api/whoami")
+async def whoami(principal: dict[str, Any] = Depends(resolve_caller)) -> dict[str, Any]:
+    """What this credential is. Useful when wiring up an SDK or MCP client."""
+    return {
+        "workspace_id": principal["company_id"],
+        "identified_as": principal.get("email"),
+        "via": principal.get("via"),
+        "scopes": principal.get("scopes", []),
+    }
 
 
 # ---------------------------------- health ----------------------------------

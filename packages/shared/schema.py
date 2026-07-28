@@ -28,16 +28,16 @@ class Lifecycle(StrEnum):
 
 
 class Scope(BaseModel):
-    """Two-level tenancy: an agency, and a client brand beneath it.
+    """Two-level tenancy: an agency, and a client collection beneath it.
 
     Isolation between agencies AND between brands is a precondition, so this
     travels with every write and every query rather than being remembered at
-    each call site. ``brand_id`` is optional because some items belong to the
+    each call site. ``collection_id`` is optional because some items belong to the
     agency itself rather than to one of its clients.
     """
 
-    tenant_id: str
-    brand_id: str | None = None
+    workspace_id: str
+    collection_id: str | None = None
 
     model_config = {"frozen": True}
 
@@ -144,7 +144,7 @@ class Connection(BaseModel):
     store and is only unsealed at the moment of a fetch.
     """
 
-    tenant_id: str
+    workspace_id: str
     source: str
     connected: bool = True
     config: dict[str, Any] = Field(default_factory=dict)
@@ -153,8 +153,8 @@ class Connection(BaseModel):
 
 class GraphNode(BaseModel):
     id: str
-    tenant_id: str
-    brand_id: str | None = None
+    workspace_id: str
+    collection_id: str | None = None
     title: str
     status: str = Lifecycle.ACTIVE
     source: str | None = None

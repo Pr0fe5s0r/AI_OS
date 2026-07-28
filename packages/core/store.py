@@ -30,10 +30,10 @@ def stable_item_id(scope: Scope, source: SourceRef) -> str:
 
     Deliberately derived from scope + origin and NOT from the content: an
     edited document is the same item at a new version, not a new item. The
-    tenant is part of it because two agencies may sync the same public file
+    workspace is part of it because two agencies may sync the same public file
     and must never collide.
     """
-    seed = "\x1f".join([scope.tenant_id, scope.brand_id or "", source.source, source.locator])
+    seed = "\x1f".join([scope.workspace_id, scope.collection_id or "", source.source, source.locator])
     return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
 
 
@@ -62,7 +62,7 @@ _CURRENT = text(
     """
     SELECT item_id, version, hash, title, body, status
     FROM kb_items
-    WHERE tenant_id = :tenant AND item_id = :item_id AND status = :active
+    WHERE workspace_id = :workspace AND item_id = :item_id AND status = :active
     ORDER BY version DESC
     LIMIT 1
     """
@@ -71,11 +71,11 @@ _CURRENT = text(
 _INSERT = text(
     """
     INSERT INTO kb_items
-        (item_id, version, tenant_id, brand_id, title, body, body_tsv,
+        (item_id, version, workspace_id, collection_id, title, body, body_tsv,
          source, locator, url, hash, supersedes, status,
          created_at, updated_at, period_start, period_end, metadata)
     VALUES
-        (:item_id, :version, :tenant, :brand, :title, :body,
+        (:item_id, :version, :workspace, :collection, :title, :body,
          to_tsvector('english', :title || ' ' || :body),
          :source, :locator, :url, :hash, :supersedes, :status,
          :created_at, now(), :period_start, :period_end, CAST(:metadata AS jsonb))
@@ -93,7 +93,7 @@ _SUPERSEDE = text(
     """
     UPDATE kb_items
     SET status = :superseded, updated_at = now()
-    WHERE tenant_id = :tenant AND item_id = :item_id AND version < :version
+    WHERE workspace_id = :workspace AND item_id = :item_id AND version < :version
       AND status = :active
     """
 )
@@ -116,7 +116,7 @@ async def put_item(session: AsyncSession, item: Item) -> PutResult:
     current = (
         await session.execute(
             _CURRENT,
-            {"tenant": item.scope.tenant_id, "item_id": item_id, "active": Lifecycle.ACTIVE},
+            {"workspace": item.scope.workspace_id, "item_id": item_id, "active": Lifecycle.ACTIVE},
         )
     ).first()
 
@@ -147,7 +147,7 @@ async def put_item(session: AsyncSession, item: Item) -> PutResult:
         await session.execute(
             _SUPERSEDE,
             {
-                "tenant": stored.scope.tenant_id,
+                "workspace": stored.scope.workspace_id,
                 "item_id": item_id,
                 "version": version,
                 "active": Lifecycle.ACTIVE,
@@ -160,8 +160,8 @@ async def put_item(session: AsyncSession, item: Item) -> PutResult:
         {
             "item_id": item_id,
             "version": version,
-            "tenant": stored.scope.tenant_id,
-            "brand": stored.scope.brand_id,
+            "workspace": stored.scope.workspace_id,
+            "collection": stored.scope.collection_id,
             "title": stored.title,
             "body": stored.body,
             "source": stored.source.source,
@@ -184,7 +184,7 @@ def _row_to_item(row: Any) -> Item:
     md = row.metadata if isinstance(row.metadata, dict) else json.loads(row.metadata or "{}")
     return Item(
         id=row.item_id,
-        scope=Scope(tenant_id=row.tenant_id, brand_id=row.brand_id),
+        scope=Scope(workspace_id=row.workspace_id, collection_id=row.collection_id),
         title=row.title,
         body=row.body,
         source=SourceRef(source=row.source, locator=row.locator, url=row.url),
@@ -200,7 +200,7 @@ def _row_to_item(row: Any) -> Item:
 
 
 _SELECT = """
-    SELECT item_id, version, tenant_id, brand_id, title, body, source, locator,
+    SELECT item_id, version, workspace_id, collection_id, title, body, source, locator,
            url, hash, supersedes, status, created_at, period_start, period_end, metadata
     FROM kb_items
 """
@@ -210,17 +210,17 @@ async def get_item(
     session: AsyncSession, scope: Scope, item_id: str, version: int | None = None
 ) -> Item | None:
     """One item — its current version, or a specific one for point-in-time reads."""
-    clauses = ["tenant_id = :tenant", "item_id = :item_id"]
-    params: dict[str, Any] = {"tenant": scope.tenant_id, "item_id": item_id}
+    clauses = ["workspace_id = :workspace", "item_id = :item_id"]
+    params: dict[str, Any] = {"workspace": scope.workspace_id, "item_id": item_id}
     if version is None:
         clauses.append("status = :active")
         params["active"] = Lifecycle.ACTIVE
     else:
         clauses.append("version = :version")
         params["version"] = version
-    if scope.brand_id is not None:
-        clauses.append("brand_id = :brand")
-        params["brand"] = scope.brand_id
+    if scope.collection_id is not None:
+        clauses.append("collection_id = :collection")
+        params["collection"] = scope.collection_id
 
     row = (
         await session.execute(
@@ -236,15 +236,15 @@ async def get_items_by_ids(
     """Batch hydrate — one query, not N. The graph holds ids only."""
     if not item_ids:
         return []
-    clauses = ["tenant_id = :tenant", "item_id = ANY(:ids)", "status = :active"]
+    clauses = ["workspace_id = :workspace", "item_id = ANY(:ids)", "status = :active"]
     params: dict[str, Any] = {
-        "tenant": scope.tenant_id,
+        "workspace": scope.workspace_id,
         "ids": list(item_ids),
         "active": Lifecycle.ACTIVE,
     }
-    if scope.brand_id is not None:
-        clauses.append("brand_id = :brand")
-        params["brand"] = scope.brand_id
+    if scope.collection_id is not None:
+        clauses.append("collection_id = :collection")
+        params["collection"] = scope.collection_id
     rows = (await session.execute(text(f"{_SELECT} WHERE {' AND '.join(clauses)}"), params)).all()
     return [_row_to_item(r) for r in rows]
 
@@ -259,13 +259,13 @@ async def list_items(
     offset: int = 0,
 ) -> list[Item]:
     """The catalogue view: what is held, filterable — KB-1's listing requirement."""
-    clauses = ["tenant_id = :tenant", "status = :status"]
+    clauses = ["workspace_id = :workspace", "status = :status"]
     params: dict[str, Any] = {
-        "tenant": scope.tenant_id, "status": status, "limit": limit, "offset": offset,
+        "workspace": scope.workspace_id, "status": status, "limit": limit, "offset": offset,
     }
-    if scope.brand_id is not None:
-        clauses.append("brand_id = :brand")
-        params["brand"] = scope.brand_id
+    if scope.collection_id is not None:
+        clauses.append("collection_id = :collection")
+        params["collection"] = scope.collection_id
     if source:
         clauses.append("source = :source")
         params["source"] = source
@@ -274,7 +274,7 @@ async def list_items(
         # join would return it once per class.
         clauses.append(
             "EXISTS (SELECT 1 FROM kb_item_classes ic "
-            "WHERE ic.item_id = kb_items.item_id AND ic.tenant_id = :tenant "
+            "WHERE ic.item_id = kb_items.item_id AND ic.workspace_id = :workspace "
             "AND ic.class_id = :class_id)"
         )
         params["class_id"] = class_id
@@ -294,8 +294,8 @@ async def item_versions(session: AsyncSession, scope: Scope, item_id: str) -> li
     """Every version of an item, newest first — the lineage KB-1 requires."""
     rows = (
         await session.execute(
-            text(f"{_SELECT} WHERE tenant_id = :tenant AND item_id = :item_id ORDER BY version DESC"),
-            {"tenant": scope.tenant_id, "item_id": item_id},
+            text(f"{_SELECT} WHERE workspace_id = :workspace AND item_id = :item_id ORDER BY version DESC"),
+            {"workspace": scope.workspace_id, "item_id": item_id},
         )
     ).all()
     return [_row_to_item(r) for r in rows]
@@ -314,12 +314,12 @@ async def mark_failed(
                 -- type inside jsonb_build_object and refuses the statement
                 metadata = metadata || jsonb_build_object('failure', CAST(:reason AS text)),
                 updated_at = now()
-            WHERE tenant_id = :tenant AND item_id = :item_id AND version = :version
+            WHERE workspace_id = :workspace AND item_id = :item_id AND version = :version
             """
         ),
         {
             "failed": Lifecycle.FAILED, "reason": reason,
-            "tenant": scope.tenant_id, "item_id": item_id, "version": version,
+            "workspace": scope.workspace_id, "item_id": item_id, "version": version,
         },
     )
 

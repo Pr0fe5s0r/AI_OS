@@ -47,18 +47,18 @@ class Assignment:
 
 
 async def list_classes(session: AsyncSession, scope: Scope) -> list[dict[str, Any]]:
-    """Every class this tenant can use: the platform set plus their own."""
+    """Every class this workspace can use: the platform set plus their own."""
     rows = (
         await session.execute(
             text(
                 """
-                SELECT class_id, tenant_id, parent_id, name, description, system, created_at
+                SELECT class_id, workspace_id, parent_id, name, description, system, created_at
                 FROM kb_classes
-                WHERE tenant_id IS NULL OR tenant_id = :tenant
-                ORDER BY (tenant_id IS NOT NULL), COALESCE(parent_id, class_id), class_id
+                WHERE workspace_id IS NULL OR workspace_id = :workspace
+                ORDER BY (workspace_id IS NOT NULL), COALESCE(parent_id, class_id), class_id
                 """
             ),
-            {"tenant": scope.tenant_id},
+            {"workspace": scope.workspace_id},
         )
     ).all()
     return [
@@ -68,7 +68,7 @@ async def list_classes(session: AsyncSession, scope: Scope) -> list[dict[str, An
             "description": r.description,
             "parent_id": r.parent_id,
             "system": r.system,
-            "scope": "platform" if r.tenant_id is None else "tenant",
+            "scope": "platform" if r.workspace_id is None else "workspace",
         }
         for r in rows
     ]
@@ -86,9 +86,9 @@ async def create_class(
     await session.execute(
         text(
             """
-            INSERT INTO kb_classes (class_id, tenant_id, parent_id, name, description, system)
-            VALUES (:cid, :tenant, :parent, :name, :description, false)
-            ON CONFLICT (COALESCE(tenant_id, ''), class_id)
+            INSERT INTO kb_classes (class_id, workspace_id, parent_id, name, description, system)
+            VALUES (:cid, :workspace, :parent, :name, :description, false)
+            ON CONFLICT (COALESCE(workspace_id, ''), class_id)
             DO UPDATE SET name = EXCLUDED.name,
                           parent_id = EXCLUDED.parent_id,
                           description = EXCLUDED.description
@@ -96,17 +96,17 @@ async def create_class(
         ),
         {
             "cid": class_id,
-            "tenant": scope.tenant_id,
+            "workspace": scope.workspace_id,
             "parent": parent_id,
             "name": name,
             "description": description,
         },
     )
-    return {"class_id": class_id, "name": name, "parent_id": parent_id, "scope": "tenant"}
+    return {"class_id": class_id, "name": name, "parent_id": parent_id, "scope": "workspace"}
 
 
 async def delete_class(session: AsyncSession, scope: Scope, class_id: str) -> bool:
-    """Remove a tenant's own class. System classes may be extended, not deleted.
+    """Remove a workspace's own class. System classes may be extended, not deleted.
 
     Assignments to it go too — otherwise items keep a class that no longer
     exists and the taxonomy stops describing the index.
@@ -114,15 +114,15 @@ async def delete_class(session: AsyncSession, scope: Scope, class_id: str) -> bo
     result = await session.execute(
         text(
             "DELETE FROM kb_classes "
-            "WHERE tenant_id = :tenant AND class_id = :cid AND NOT system"
+            "WHERE workspace_id = :workspace AND class_id = :cid AND NOT system"
         ),
-        {"tenant": scope.tenant_id, "cid": class_id},
+        {"workspace": scope.workspace_id, "cid": class_id},
     )
     if not result.rowcount:
         return False
     await session.execute(
-        text("DELETE FROM kb_item_classes WHERE tenant_id = :tenant AND class_id = :cid"),
-        {"tenant": scope.tenant_id, "cid": class_id},
+        text("DELETE FROM kb_item_classes WHERE workspace_id = :workspace AND class_id = :cid"),
+        {"workspace": scope.workspace_id, "cid": class_id},
     )
     return True
 
@@ -229,9 +229,9 @@ async def classify_item(
         await session.execute(
             text(
                 "SELECT class_id, confidence, basis FROM kb_item_classes "
-                "WHERE item_id = :i AND tenant_id = :t AND pinned"
+                "WHERE item_id = :i AND workspace_id = :t AND pinned"
             ),
-            {"i": item.id, "t": scope.tenant_id},
+            {"i": item.id, "t": scope.workspace_id},
         )
     ).all()
     if pinned:
@@ -251,22 +251,22 @@ async def _replace_auto(
     await session.execute(
         text(
             "DELETE FROM kb_item_classes "
-            "WHERE item_id = :i AND tenant_id = :t AND NOT pinned"
+            "WHERE item_id = :i AND workspace_id = :t AND NOT pinned"
         ),
-        {"i": item_id, "t": scope.tenant_id},
+        {"i": item_id, "t": scope.workspace_id},
     )
     for a in assignments:
         await session.execute(
             text(
                 """
                 INSERT INTO kb_item_classes
-                    (item_id, class_id, tenant_id, confidence, basis, pinned, actor)
+                    (item_id, class_id, workspace_id, confidence, basis, pinned, actor)
                 VALUES (:i, :c, :t, :conf, :basis, false, NULL)
                 ON CONFLICT (item_id, class_id) DO NOTHING
                 """
             ),
             {
-                "i": item_id, "c": a.class_id, "t": scope.tenant_id,
+                "i": item_id, "c": a.class_id, "t": scope.workspace_id,
                 "conf": a.confidence, "basis": a.basis,
             },
         )
@@ -290,28 +290,28 @@ async def override(
     """
     before = (
         await session.execute(
-            text("SELECT class_id FROM kb_item_classes WHERE item_id = :i AND tenant_id = :t"),
-            {"i": item_id, "t": scope.tenant_id},
+            text("SELECT class_id FROM kb_item_classes WHERE item_id = :i AND workspace_id = :t"),
+            {"i": item_id, "t": scope.workspace_id},
         )
     ).scalars().all()
 
     await session.execute(
-        text("DELETE FROM kb_item_classes WHERE item_id = :i AND tenant_id = :t"),
-        {"i": item_id, "t": scope.tenant_id},
+        text("DELETE FROM kb_item_classes WHERE item_id = :i AND workspace_id = :t"),
+        {"i": item_id, "t": scope.workspace_id},
     )
     for class_id in class_ids:
         await session.execute(
             text(
                 """
                 INSERT INTO kb_item_classes
-                    (item_id, class_id, tenant_id, confidence, basis, pinned, actor)
+                    (item_id, class_id, workspace_id, confidence, basis, pinned, actor)
                 VALUES (:i, :c, :t, 1.0, 'set by a person', true, :actor)
                 ON CONFLICT (item_id, class_id) DO UPDATE
                 SET pinned = true, confidence = 1.0, actor = EXCLUDED.actor,
                     basis = 'set by a person', assigned_at = now()
                 """
             ),
-            {"i": item_id, "c": class_id, "t": scope.tenant_id, "actor": actor},
+            {"i": item_id, "c": class_id, "t": scope.workspace_id, "actor": actor},
         )
 
     await session.execute(
@@ -322,7 +322,7 @@ async def override(
             """
         ),
         {
-            "t": scope.tenant_id, "actor": actor, "i": item_id,
+            "t": scope.workspace_id, "actor": actor, "i": item_id,
             "meta": json.dumps({"from": sorted(before), "to": sorted(class_ids)}),
         },
     )
@@ -360,12 +360,12 @@ async def classes_for(
                 FROM kb_item_classes ic
                 LEFT JOIN kb_classes c
                        ON c.class_id = ic.class_id
-                      AND (c.tenant_id IS NULL OR c.tenant_id = ic.tenant_id)
-                WHERE ic.tenant_id = :t AND ic.item_id = ANY(:ids)
+                      AND (c.workspace_id IS NULL OR c.workspace_id = ic.workspace_id)
+                WHERE ic.workspace_id = :t AND ic.item_id = ANY(:ids)
                 ORDER BY ic.pinned DESC, ic.confidence DESC
                 """
             ),
-            {"t": scope.tenant_id, "ids": list(item_ids)},
+            {"t": scope.workspace_id, "ids": list(item_ids)},
         )
     ).all()
     out: dict[str, list[dict[str, Any]]] = {}
@@ -394,14 +394,14 @@ async def needs_review(
                 SELECT ic.item_id, ic.class_id, ic.confidence, ic.basis, i.title
                 FROM kb_item_classes ic
                 JOIN kb_items i ON i.item_id = ic.item_id AND i.status = 'active'
-                WHERE ic.tenant_id = :t AND NOT ic.pinned
+                WHERE ic.workspace_id = :t AND NOT ic.pinned
                   AND (ic.class_id = :fallback OR ic.confidence < :floor)
                 ORDER BY ic.confidence ASC
                 LIMIT :limit
                 """
             ),
             {
-                "t": scope.tenant_id, "fallback": FALLBACK,
+                "t": scope.workspace_id, "fallback": FALLBACK,
                 "floor": MIN_CONFIDENCE, "limit": limit,
             },
         )

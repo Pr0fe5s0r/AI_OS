@@ -13,12 +13,12 @@ from packages.shared.schema import GraphEdge, GraphNode, GraphResult, Lifecycle,
 # the same rule as the single LLM client.
 #
 # Data model (Neo4j 5):
-#   (:Item {item_id, tenant_id, brand_id, title, status, source, embedding})
+#   (:Item {item_id, workspace_id, collection_id, title, status, source, embedding})
 #     A lightweight mirror: the body stays in Postgres and is joined by id.
 #     The node exists for two things only — vector recall, and relationships.
 #   (:Item)-[:SUPERSEDES|DERIVES_FROM|REFERENCES]->(:Item)
 #
-# EVERY query filters on tenant_id. Where a brand is given it filters that too.
+# EVERY query filters on workspace_id. Where a collection is given it filters that too.
 # Tenancy is not optional and is not left to the caller to remember.
 # ============================================================================
 
@@ -70,11 +70,11 @@ def _rel(link: Link | str) -> str:
 
 def _scope_clause(alias: str, scope: Scope) -> tuple[str, dict[str, Any]]:
     """Tenancy, applied identically everywhere it is needed."""
-    clause = f"{alias}.tenant_id = $tenant"
-    params: dict[str, Any] = {"tenant": scope.tenant_id}
-    if scope.brand_id is not None:
-        clause += f" AND {alias}.brand_id = $brand"
-        params["brand"] = scope.brand_id
+    clause = f"{alias}.workspace_id = $workspace"
+    params: dict[str, Any] = {"workspace": scope.workspace_id}
+    if scope.collection_id is not None:
+        clause += f" AND {alias}.collection_id = $collection"
+        params["collection"] = scope.collection_id
     return clause, params
 
 
@@ -85,8 +85,8 @@ async def bootstrap() -> None:
     """Constraints and indexes, created idempotently. Safe on every boot."""
     for stmt in [
         "CREATE CONSTRAINT item_id IF NOT EXISTS FOR (i:Item) REQUIRE i.item_id IS UNIQUE",
-        "CREATE INDEX item_tenant IF NOT EXISTS FOR (i:Item) ON (i.tenant_id)",
-        "CREATE INDEX item_scope IF NOT EXISTS FOR (i:Item) ON (i.tenant_id, i.brand_id)",
+        "CREATE INDEX item_tenant IF NOT EXISTS FOR (i:Item) ON (i.workspace_id)",
+        "CREATE INDEX item_scope IF NOT EXISTS FOR (i:Item) ON (i.workspace_id, i.collection_id)",
         f"""
         CREATE VECTOR INDEX {VECTOR_INDEX} IF NOT EXISTS
         FOR (i:Item) ON (i.embedding)
@@ -114,15 +114,15 @@ async def upsert_item(
     await _run(
         """
         MERGE (i:Item {item_id: $item_id})
-        SET i.tenant_id = $tenant,
-            i.brand_id  = $brand,
+        SET i.workspace_id = $workspace,
+            i.collection_id  = $collection,
             i.title     = $title,
             i.source    = $source,
             i.status    = $status
         """,
         item_id=item_id,
-        tenant=scope.tenant_id,
-        brand=scope.brand_id,
+        workspace=scope.workspace_id,
+        collection=scope.collection_id,
         title=title,
         source=source,
         status=str(status),
@@ -227,7 +227,7 @@ async def related(scope: Scope, item_id: str, hops: int = 1) -> GraphResult:
         }}
         UNWIND cluster AS node
         RETURN node.item_id AS item_id, node.title AS title, node.status AS status,
-               node.source AS source, node.brand_id AS brand_id, rels AS rels
+               node.source AS source, node.collection_id AS collection_id, rels AS rels
         """,
         item_id=item_id,
         **params,
@@ -242,8 +242,8 @@ async def related(scope: Scope, item_id: str, hops: int = 1) -> GraphResult:
         nodes.append(
             GraphNode(
                 id=r["item_id"],
-                tenant_id=scope.tenant_id,
-                brand_id=r["brand_id"],
+                workspace_id=scope.workspace_id,
+                collection_id=r["collection_id"],
                 title=r["title"] or r["item_id"],
                 status=r["status"] or Lifecycle.ACTIVE,
                 source=r["source"],
@@ -269,10 +269,10 @@ async def count_nodes(scope: Scope | None = None) -> dict[str, int]:
     return out
 
 
-async def wipe_tenant(tenant_id: str) -> int:
-    """Remove every node for a tenant — offboarding and test teardown."""
+async def wipe_tenant(workspace_id: str) -> int:
+    """Remove every node for a workspace — offboarding and test teardown."""
     rows = await _run(
-        "MATCH (n) WHERE n.tenant_id = $tenant DETACH DELETE n RETURN count(n) AS n",
-        tenant=tenant_id,
+        "MATCH (n) WHERE n.workspace_id = $workspace DETACH DELETE n RETURN count(n) AS n",
+        workspace=workspace_id,
     )
     return rows[0]["n"] if rows else 0

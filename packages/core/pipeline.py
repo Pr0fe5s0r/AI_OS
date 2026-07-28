@@ -34,8 +34,8 @@ def redis_settings() -> RedisSettings:
     return RedisSettings.from_dsn(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
 
 
-def _scope(tenant_id: str, brand_id: str | None) -> Scope:
-    return Scope(tenant_id=tenant_id, brand_id=brand_id)
+def _scope(workspace_id: str, collection_id: str | None) -> Scope:
+    return Scope(workspace_id=workspace_id, collection_id=collection_id)
 
 
 async def _store(
@@ -65,9 +65,9 @@ async def _store(
         await session.commit()
 
     if result.embedded_needed and (redis := ctx.get("redis")) is not None:
-        await redis.enqueue_job("embed_item", scope.tenant_id, scope.brand_id, result.item.id)
+        await redis.enqueue_job("embed_item", scope.workspace_id, scope.collection_id, result.item.id)
         await redis.enqueue_job(
-            "classify_new_item", scope.tenant_id, scope.brand_id, result.item.id, suggested
+            "classify_new_item", scope.workspace_id, scope.collection_id, result.item.id, suggested
         )
 
     return {
@@ -79,8 +79,8 @@ async def _store(
 
 async def ingest_file(
     ctx: dict[str, Any],
-    tenant_id: str,
-    brand_id: str | None,
+    workspace_id: str,
+    collection_id: str | None,
     source: str,
     locator: str,
     filename: str,
@@ -96,7 +96,7 @@ async def ingest_file(
     The bytes are read, converted, and dropped. What survives is Markdown plus
     the link back (KB-7): the KB is not a file store.
     """
-    scope = _scope(tenant_id, brand_id)
+    scope = _scope(workspace_id, collection_id)
     ref = SourceRef(source=source, locator=locator, url=url, fetched_at=datetime.now())
     try:
         parsed = await asyncio.to_thread(normalise, data, filename)
@@ -116,8 +116,8 @@ async def ingest_file(
 
 async def ingest_text(
     ctx: dict[str, Any],
-    tenant_id: str,
-    brand_id: str | None,
+    workspace_id: str,
+    collection_id: str | None,
     source: str,
     locator: str,
     body: str,
@@ -129,14 +129,14 @@ async def ingest_text(
     suggested: str | None = None,
 ) -> dict[str, Any]:
     """Content that already is text: a generated report, a distilled session."""
-    scope = _scope(tenant_id, brand_id)
+    scope = _scope(workspace_id, collection_id)
     ref = SourceRef(source=source, locator=locator, url=url, fetched_at=datetime.now())
     parsed = normalise_text(body, title=title, source_name=locator)
     return await _store(ctx, scope, ref, parsed, period_start, period_end, metadata, suggested)
 
 
 async def embed_item(
-    ctx: dict[str, Any], tenant_id: str, brand_id: str | None, item_id: str
+    ctx: dict[str, Any], workspace_id: str, collection_id: str | None, item_id: str
 ) -> dict[str, Any]:
     """Mirror the item into the graph and give it a vector.
 
@@ -144,7 +144,7 @@ async def embed_item(
     already committed, so a failure here costs recall until the retry, never
     the item itself.
     """
-    scope = _scope(tenant_id, brand_id)
+    scope = _scope(workspace_id, collection_id)
     async with Session() as session:
         item = await get_item(session, scope, item_id)
     if item is None:
@@ -164,8 +164,8 @@ async def embed_item(
 
 async def classify_new_item(
     ctx: dict[str, Any],
-    tenant_id: str,
-    brand_id: str | None,
+    workspace_id: str,
+    collection_id: str | None,
     item_id: str,
     suggested: str | None = None,
 ) -> dict[str, Any]:
@@ -173,7 +173,7 @@ async def classify_new_item(
     classifier delays filing, never the write."""
     from packages.core.classify import classify_item
 
-    scope = _scope(tenant_id, brand_id)
+    scope = _scope(workspace_id, collection_id)
     async with Session() as session:
         item = await get_item(session, scope, item_id)
         if item is None:

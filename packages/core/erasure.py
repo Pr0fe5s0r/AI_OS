@@ -25,17 +25,21 @@ from packages.core import graph
 # happened survives even though who/what did not. Callers may request a hard
 # "purge" of audit_log instead via ``audit_policy``.
 
-# Every table that carries tenant data, with the column naming the tenant.
+# Every table that carries workspace data, with the column naming the workspace.
 # Offboarding must leave nothing behind (NFR Data retention), so this mapping
-# is the one place a new tenant-scoped table has to be registered — missing one
-# means a tenant's content survives their own deletion request.
+# is the one place a new workspace-scoped table has to be registered — missing one
+# means a workspace's content survives their own deletion request.
 #
-# The column differs by vintage: the KB's own tables say `tenant_id`, while the
+# The column differs by vintage: the KB's own tables say `workspace_id`, while the
 # platform tables it inherited say `company_id`. Carried as data rather than
 # assumed, because assuming it silently deleted nothing at all.
 _TABLES: tuple[tuple[str, str], ...] = (
-    ("kb_items", "tenant_id"),
-    ("brands", "tenant_id"),
+    ("kb_item_classes", "workspace_id"),
+    ("kb_classes", "workspace_id"),
+    ("kb_items", "workspace_id"),
+    ("collections", "workspace_id"),
+    ("clusters", "workspace_id"),
+    ("api_keys", "workspace_id"),
     ("settings", "company_id"),
     ("action_tokens", "company_id"),
     ("credentials", "company_id"),

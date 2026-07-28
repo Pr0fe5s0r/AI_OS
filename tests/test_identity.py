@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from packages.core.store import stable_item_id
 from packages.shared.schema import Scope, SourceRef, content_hash
-from tests.conftest import BRAND_A, BRAND_B, OTHER, SCOPE
+from tests.conftest import COLL_A, COLL_B, OTHER, SCOPE
 
 # The hash and the item id are the two things the whole write path turns on,
 # and both are pure functions — so they are provable without a database.
@@ -34,14 +34,14 @@ def test_an_item_id_survives_its_content_changing():
 
 def test_two_agencies_syncing_the_same_file_never_collide():
     """Both may sync the same public document. If the id were derived from the
-    source alone, one tenant's write would overwrite the other's."""
+    source alone, one workspace's write would overwrite the other's."""
     assert stable_item_id(SCOPE, REF) != stable_item_id(OTHER, REF)
 
 
 def test_two_brands_hold_the_same_file_separately():
-    assert stable_item_id(BRAND_A, REF) != stable_item_id(BRAND_B, REF)
-    # And a brand's copy is distinct from one held at agency level.
-    assert stable_item_id(BRAND_A, REF) != stable_item_id(SCOPE, REF)
+    assert stable_item_id(COLL_A, REF) != stable_item_id(COLL_B, REF)
+    # And a collection's copy is distinct from one held at agency level.
+    assert stable_item_id(COLL_A, REF) != stable_item_id(SCOPE, REF)
 
 
 def test_different_locations_are_different_items():
@@ -57,9 +57,9 @@ def test_the_same_path_on_two_providers_is_two_items():
 def test_scope_is_immutable():
     """Scope travels through every call. If a caller could mutate one in
     flight, isolation would depend on nobody ever doing so."""
-    scope = Scope(tenant_id="a", brand_id="b")
+    scope = Scope(workspace_id="a", collection_id="b")
     try:
-        scope.tenant_id = "hijacked"  # type: ignore[misc]
+        scope.workspace_id = "hijacked"  # type: ignore[misc]
     except Exception:
         return
     raise AssertionError("Scope must be frozen")

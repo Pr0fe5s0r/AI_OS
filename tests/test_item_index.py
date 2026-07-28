@@ -10,7 +10,7 @@ from packages.core.store import (
     put_item,
 )
 from packages.shared.schema import Item, Lifecycle, SourceRef
-from tests.conftest import BRAND_A, BRAND_B, OTHER, SCOPE
+from tests.conftest import COLL_A, COLL_B, OTHER, SCOPE
 
 # The write path has exactly three outcomes. These tests pin all three, plus
 # the integrity rule that makes "is this current?" answerable.
@@ -80,9 +80,9 @@ async def test_only_one_version_is_ever_current(db):
         await db.execute(
             text(
                 "SELECT count(*) AS n FROM kb_items "
-                "WHERE tenant_id = :t AND status = 'active'"
+                "WHERE workspace_id = :t AND status = 'active'"
             ),
-            {"t": SCOPE.tenant_id},
+            {"t": SCOPE.workspace_id},
         )
     ).scalar_one()
     assert active == 1
@@ -114,7 +114,7 @@ async def test_a_point_in_time_read_returns_the_old_version(db):
 
 
 async def test_another_agency_cannot_read_this_one(db):
-    """Cross-tenant leakage is a critical defect, so it is asserted directly."""
+    """Cross-workspace leakage is a critical defect, so it is asserted directly."""
     created = await put_item(db, item("confidential"))
     await db.commit()
 
@@ -122,27 +122,27 @@ async def test_another_agency_cannot_read_this_one(db):
     assert await list_items(db, OTHER) == []
 
 
-async def test_brands_are_isolated_from_each_other(db):
+async def test_collections_are_isolated_from_each_other(db):
     """The second level of tenancy: two client brands under one agency."""
-    a = await put_item(db, item("brand a content", scope=BRAND_A))
+    a = await put_item(db, item("collection a content", scope=COLL_A))
     await db.commit()
-    await put_item(db, item("brand b content", scope=BRAND_B))
+    await put_item(db, item("collection b content", scope=COLL_B))
     await db.commit()
 
-    assert await get_item(db, BRAND_B, a.item.id) is None
+    assert await get_item(db, COLL_B, a.item.id) is None
 
-    only_a = await list_items(db, BRAND_A)
-    assert [i.body for i in only_a] == ["brand a content"]
+    only_a = await list_items(db, COLL_A)
+    assert [i.body for i in only_a] == ["collection a content"]
 
     # The agency itself sees across its own brands.
     everything = await list_items(db, SCOPE)
     assert len(everything) == 2
 
 
-async def test_the_same_file_in_two_brands_stays_two_items(db):
-    await put_item(db, item("shared doc", locator="same.pdf", scope=BRAND_A))
+async def test_the_same_file_in_two_collections_stays_two_items(db):
+    await put_item(db, item("shared doc", locator="same.pdf", scope=COLL_A))
     await db.commit()
-    await put_item(db, item("shared doc", locator="same.pdf", scope=BRAND_B))
+    await put_item(db, item("shared doc", locator="same.pdf", scope=COLL_B))
     await db.commit()
 
     assert len(await list_items(db, SCOPE)) == 2

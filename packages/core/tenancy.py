@@ -7,20 +7,21 @@ from sqlalchemy import text
 
 from packages.core.auth import resolve_session
 from packages.core.db import Session
+from packages.core.keys import resolve_key
 from packages.shared.schema import Scope
 
-# Multi-tenancy: every request is scoped to one company_id, and that id comes
-# from the SESSION — never from the request.
+# Every request is scoped to one workspace, and that id comes from the
+# CREDENTIAL — never from the request body, query or path.
 #
 # It used to come from a query parameter. That was honest while there was no
-# login (nothing was being protected, and pretending otherwise would have been
-# worse), but the moment identity exists it becomes a hole: `?company_id=` would
-# let anyone read any workspace by guessing its name. Reading it from the
-# session closes that by construction rather than by remembering to check.
+# login, but the moment identity exists it becomes a hole: `?workspace_id=`
+# would let anyone read any workspace by guessing its name. Deriving it from
+# the credential closes that by construction rather than by remembering to
+# check on every endpoint.
 #
-# Every endpoint already depends on company_scope, so switching the source here
-# secures all of them at once — and any new endpoint that forgets to scope
-# simply has no company to work with.
+# There are two credentials, and exactly one rule between them: a browser
+# presents a session cookie, everything else presents an API key. Both resolve
+# to the same principal shape, so no endpoint needs to know which was used.
 
 SESSION_COOKIE = "markos_session"
 
@@ -38,39 +39,83 @@ async def current_principal(
     return principal
 
 
+async def resolve_caller(
+    markos_session: str | None = Cookie(default=None),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Whoever is calling: a signed-in person, or a program holding a key.
+
+    The key is checked first because a programmatic caller may also be carrying
+    a stale cookie from the same browser, and the credential it explicitly
+    presented is the one it means to use.
+    """
+    if authorization and authorization.lower().startswith("bearer "):
+        presented = authorization[7:].strip()
+        async with Session() as session:
+            holder = await resolve_key(session, presented)
+            await session.commit()  # persist last_used_at
+        if holder is None:
+            raise HTTPException(401, "Invalid or revoked API key.")
+        return {
+            "company_id": holder["workspace_id"],
+            "user_id": None,
+            "email": f"key:{holder['name']}",
+            "key_id": holder["key_id"],
+            "scopes": holder["scopes"],
+            "via": "api_key",
+        }
+
+    async with Session() as session:
+        principal = await resolve_session(session, markos_session)
+        await session.commit()
+    if principal is None:
+        raise HTTPException(
+            401, "Not signed in. Provide a session cookie or an API key."
+        )
+    return {**principal, "via": "session", "scopes": ["read", "write"]}
+
+
+def require_write(principal: dict[str, Any]) -> None:
+    """A read-only key must not be able to write. Checked at the edge, once."""
+    if "write" not in principal.get("scopes", ["write"]):
+        raise HTTPException(403, "This key is read-only.")
+
+
 async def company_scope(principal: dict[str, Any] = Depends(current_principal)) -> str:
     return str(principal["company_id"])
 
 
-async def tenant_scope(
-    principal: dict[str, Any] = Depends(current_principal),
-    x_brand_id: str | None = Header(default=None),
+async def workspace_scope(
+    principal: dict[str, Any] = Depends(resolve_caller),
+    x_collection: str | None = Header(default=None),
 ) -> Scope:
-    """The two-level scope every KB call runs inside: agency, then client brand.
+    """The scope every call runs inside: a workspace, and optionally one
+    collection within it.
 
-    The tenant still comes from the session and never from the request. The
-    brand may be named by the caller — an operator legitimately switches
-    between the brands they work on — but it is VERIFIED against that tenant
-    before it is trusted. Without this check `X-Brand-Id` would be exactly the
-    hole `?company_id=` used to be: a header that reads another client's
-    content by guessing its name.
+    The workspace comes from the caller's credential and never from the
+    request. The collection may be named by the caller — that is the whole
+    point of collections — but it is VERIFIED against that workspace before it
+    is trusted. Without the check, `X-Collection` would be exactly the hole
+    `?workspace_id=` would be: a header that reads someone else's data by
+    guessing its name.
 
-    Omitting the header scopes to the whole agency, which is the correct
-    default for an operator looking across their clients.
+    Omitting the header scopes to the entire workspace, which is the right
+    default for a console looking across collections.
     """
-    tenant_id = str(principal["company_id"])
-    if x_brand_id is None:
-        return Scope(tenant_id=tenant_id)
+    workspace_id = str(principal["company_id"])
+    if x_collection is None:
+        return Scope(workspace_id=workspace_id)
 
     async with Session() as session:
         known = (
             await session.execute(
                 text(
-                    "SELECT 1 FROM brands WHERE tenant_id = :tenant AND brand_id = :brand LIMIT 1"
+                    "SELECT 1 FROM collections "
+                    "WHERE workspace_id = :workspace AND collection_id = :collection LIMIT 1"
                 ),
-                {"tenant": tenant_id, "brand": x_brand_id},
+                {"workspace": workspace_id, "collection": x_collection},
             )
         ).first()
     if known is None:
-        raise HTTPException(404, "Unknown brand for this workspace.")
-    return Scope(tenant_id=tenant_id, brand_id=x_brand_id)
+        raise HTTPException(404, "Unknown collection for this workspace.")
+    return Scope(workspace_id=workspace_id, collection_id=x_collection)

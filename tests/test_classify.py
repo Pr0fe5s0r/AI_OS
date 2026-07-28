@@ -17,7 +17,7 @@ from packages.core.classify import (
 )
 from packages.core.store import list_items, put_item
 from packages.shared.schema import Item, Scope, SourceRef
-from tests.conftest import SCOPE, TENANT
+from tests.conftest import SCOPE, WORKSPACE
 
 pytestmark = pytest.mark.needs_db
 
@@ -34,11 +34,11 @@ def doc(body: str, locator: str = "doc-1", title: str = "A document") -> Item:
 
 async def _clean_classes(session):
     await session.execute(
-        text("DELETE FROM kb_item_classes WHERE tenant_id = :t"), {"t": TENANT}
+        text("DELETE FROM kb_item_classes WHERE workspace_id = :t"), {"t": WORKSPACE}
     )
-    await session.execute(text("DELETE FROM kb_classes WHERE tenant_id = :t"), {"t": TENANT})
+    await session.execute(text("DELETE FROM kb_classes WHERE workspace_id = :t"), {"t": WORKSPACE})
     await session.execute(
-        text("DELETE FROM audit_log WHERE company_id = :t"), {"t": TENANT}
+        text("DELETE FROM audit_log WHERE company_id = :t"), {"t": WORKSPACE}
     )
     await session.commit()
 
@@ -63,7 +63,7 @@ async def test_a_tenant_can_add_a_class_without_a_deployment(db):
 
     mine = {c["class_id"]: c for c in await list_classes(db, SCOPE)}
     assert mine["retainer"]["name"] == "Retainer"
-    assert mine["retainer"]["scope"] == "tenant"
+    assert mine["retainer"]["scope"] == "workspace"
 
 
 async def test_classes_support_hierarchy(db):
@@ -87,7 +87,7 @@ async def test_another_tenants_class_is_invisible(db):
     await create_class(db, SCOPE, "private-cat", "Private category")
     await db.commit()
 
-    other = Scope(tenant_id="unrelated-agency")
+    other = Scope(workspace_id="unrelated-agency")
     assert "private-cat" not in {c["class_id"] for c in await list_classes(db, other)}
 
 
@@ -205,7 +205,7 @@ async def test_an_override_is_audited_with_before_and_after(db, monkeypatch):
                 "SELECT actor, action, target, metadata FROM audit_log "
                 "WHERE company_id = :t AND action = 'classification.override'"
             ),
-            {"t": TENANT},
+            {"t": WORKSPACE},
         )
     ).one()
     assert row.actor == "kim@agency.com"

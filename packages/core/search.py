@@ -20,7 +20,7 @@ from packages.shared.schema import Hit, Lifecycle, Scope, SourceRef
 #
 # Both are needed and neither is sufficient. Semantic finds a document about
 # "quarterly performance dip" when the query says "why did results fall";
-# keyword finds "SKU-4471" and brand names, which embeddings routinely miss.
+# keyword finds "SKU-4471" and collection names, which embeddings routinely miss.
 # Fusing them is what makes retrieval reliable enough to answer from, which is
 # why there is no re-ranking stage here: hybrid already returns the right
 # content, and re-ranking would add cost and latency for marginal reordering.
@@ -86,11 +86,11 @@ _HYDRATE = """
 
 def _filters(scope: Scope, cfg: RetrievalConfig) -> tuple[str, dict[str, Any]]:
     """Tenancy, lifecycle, source and period — applied to every arm alike."""
-    clauses = ["tenant_id = :tenant"]
-    params: dict[str, Any] = {"tenant": scope.tenant_id}
-    if scope.brand_id is not None:
-        clauses.append("brand_id = :brand")
-        params["brand"] = scope.brand_id
+    clauses = ["workspace_id = :workspace"]
+    params: dict[str, Any] = {"workspace": scope.workspace_id}
+    if scope.collection_id is not None:
+        clauses.append("collection_id = :collection")
+        params["collection"] = scope.collection_id
     if not cfg.include_superseded:
         clauses.append("status = :active")
         params["active"] = str(Lifecycle.ACTIVE)
