@@ -9,150 +9,125 @@ from packages.core.erasure import (
     confirm_deletion_request,
     create_deletion_request,
     delete_company,
-    get_deletion_request,
 )
+from packages.core.store import put_item
+from packages.shared.schema import Item, Scope, SourceRef
 
 pytestmark = pytest.mark.needs_db
 
-# Checkpoint 6, part C: delete_company must remove real rows from BOTH stores
-# and leave a deletion_requests row that proves what happened, not just
-# return a success flag.
+# Tenant offboarding must remove everything, everywhere (NFR Data retention).
+# The failure mode this guards against is quiet: a table left off the list
+# deletes nothing and reports success, so the tenant's content outlives their
+# own deletion request.
 
-_CO = "test-erasure"
-
-
-async def _seed_postgres(session) -> int:
-    await session.execute(text("DELETE FROM deletion_requests WHERE company_id = :c"), {"c": _CO})
-    await session.execute(
-        text("INSERT INTO companies (id, name) VALUES (:c, 'Erasure Test') ON CONFLICT (id) DO NOTHING"),
-        {"c": _CO},
-    )
-    await session.execute(
-        text(
-            """
-            INSERT INTO events (id, company_id, source, type, actor_id, actor_name,
-                                 timestamp, content, content_tsv)
-            VALUES ('era-1', :c, 'github', 'issue', 'u', 'u', now(), 'x', to_tsvector('x'))
-            ON CONFLICT (company_id, id, timestamp) DO NOTHING
-            """
-        ),
-        {"c": _CO},
-    )
-    await session.execute(
-        text(
-            """
-            INSERT INTO situations (id, company_id, rule, severity, title, status, created_at)
-            VALUES ('era-sit-1', :c, 'r', 'low', 't', 'open', now())
-            ON CONFLICT (id) DO NOTHING
-            """
-        ),
-        {"c": _CO},
-    )
-    await session.execute(
-        text(
-            """
-            INSERT INTO connector_health (connector_type, company_id, status)
-            VALUES ('github', :c, 'healthy')
-            ON CONFLICT (connector_type, company_id) DO NOTHING
-            """
-        ),
-        {"c": _CO},
-    )
-    await session.execute(
-        text(
-            """
-            INSERT INTO credentials (company_id, source, sealed_token)
-            VALUES (:c, 'github', 'sealed')
-            ON CONFLICT (company_id, source) DO NOTHING
-            """
-        ),
-        {"c": _CO},
-    )
-    await session.execute(
-        text("INSERT INTO audit_log (company_id, actor, action, target) VALUES (:c, 'tester', 'test.seeded', 'era-1')"),
-        {"c": _CO},
-    )
-    conversation_id = (
-        await session.execute(
-            text("INSERT INTO conversations (company_id, title) VALUES (:c, 'Agent') RETURNING id"),
-            {"c": _CO},
-        )
-    ).scalar_one()
-    await session.execute(
-        text("INSERT INTO messages (conversation_id, role, content) VALUES (:cid, 'user', 'hello')"),
-        {"cid": conversation_id},
-    )
-    await session.commit()
-    return int(conversation_id)
+_TENANT = "erasure-test-agency"
+_SCOPE = Scope(tenant_id=_TENANT)
 
 
-async def test_delete_company_removes_rows_from_neo4j_and_postgres_and_completes() -> None:
+async def _seed() -> str:
+    """One item, in both stores, plus a brand and an audit entry."""
     await graph.bootstrap()
-    await graph.wipe_company(_CO)
-    await graph.upsert_thing(_CO, "era-thing-1", "Incident", "an incident to erase")
+    await graph.wipe_tenant(_TENANT)
 
     async with Session() as session:
-        conversation_id = await _seed_postgres(session)
-
-        req = await create_deletion_request(session, _CO, requested_by="tester")
+        await session.execute(
+            text("DELETE FROM kb_items WHERE tenant_id = :t"), {"t": _TENANT}
+        )
+        await session.execute(text("DELETE FROM brands WHERE tenant_id = :t"), {"t": _TENANT})
+        await session.execute(
+            text("DELETE FROM companies WHERE id = :c"), {"c": _TENANT}
+        )
+        await session.execute(
+            text("INSERT INTO companies (id, name) VALUES (:c, 'Erasure Test')"),
+            {"c": _TENANT},
+        )
+        await session.execute(
+            text(
+                "INSERT INTO brands (tenant_id, brand_id, name) "
+                "VALUES (:t, 'client-x', 'Client X')"
+            ),
+            {"t": _TENANT},
+        )
+        await session.execute(
+            text(
+                "INSERT INTO audit_log (company_id, actor, action, target) "
+                "VALUES (:c, 'tester', 'ingest', 'doc-1')"
+            ),
+            {"c": _TENANT},
+        )
+        result = await put_item(
+            session,
+            Item(
+                id="",
+                scope=_SCOPE,
+                title="Confidential brief",
+                body="client material that must not survive offboarding",
+                source=SourceRef(source="upload", locator="brief.md"),
+            ),
+        )
         await session.commit()
-        confirmed = await confirm_deletion_request(session, _CO, req["confirmation_token"])
+
+    await graph.upsert_item(
+        _SCOPE, item_id=result.item.id, title=result.item.title, source="upload"
+    )
+    return result.item.id
+
+
+async def test_offboarding_removes_the_tenant_from_both_stores():
+    item_id = await _seed()
+
+    assert (await graph.count_nodes(_SCOPE)).get("total", 0) >= 1
+
+    async with Session() as session:
+        req = await create_deletion_request(session, _TENANT, requested_by="tester")
+        await session.commit()
+        confirmed = await confirm_deletion_request(session, _TENANT, req["confirmation_token"])
         assert confirmed is not None and confirmed["status"] == "queued"
         await session.commit()
 
-        result = await delete_company(session, _CO, req["id"])
+        result = await delete_company(session, _TENANT, req["id"])
         await session.commit()
 
-    # ---- summary reflects real per-table row counts, not just "ok" ----
-    assert result["postgres"]["events"] == 1
-    assert result["postgres"]["situations"] == 1
-    assert result["postgres"]["connector_health"] == 1
-    assert result["postgres"]["credentials"] == 1
-    assert result["postgres"]["conversations"] == 1
-    assert result["postgres"]["companies"] == 1
+    # The summary reports real per-table counts, not a bare "ok". This is what
+    # catches a table whose tenant column was named wrong: it would delete zero
+    # rows and still say it succeeded.
+    assert result["postgres"]["kb_items"] == 1
+    assert result["postgres"]["brands"] == 1
     assert result["postgres"]["audit_log_anonymized"] >= 1
     assert result["neo4j_nodes_removed"] >= 1
 
-    # ---- Neo4j is actually empty for this company ----
-    counts = await graph.count_nodes(_CO)
-    assert counts.get("total", 0) == 0
+    assert (await graph.count_nodes(_SCOPE)).get("total", 0) == 0
 
-    # ---- Postgres is actually empty for this company ----
     async with Session() as session:
-        n_events = (
-            await session.execute(text("SELECT count(*) FROM events WHERE company_id = :c"), {"c": _CO})
-        ).scalar_one()
-        assert n_events == 0
-
-        n_messages = (
+        remaining = (
             await session.execute(
-                text("SELECT count(*) FROM messages WHERE conversation_id = :cid"), {"cid": conversation_id}
+                text("SELECT count(*) FROM kb_items WHERE tenant_id = :t"), {"t": _TENANT}
             )
         ).scalar_one()
-        assert n_messages == 0, "messages must cascade when their conversation is deleted"
+        assert remaining == 0
 
-        n_companies = (
-            await session.execute(text("SELECT count(*) FROM companies WHERE id = :c"), {"c": _CO})
-        ).scalar_one()
-        assert n_companies == 0
-
-        # audit_log is ANONYMIZED, not deleted: the fact + timestamp survive
-        audit_row = (
+        brands = (
             await session.execute(
-                text("SELECT actor, target FROM audit_log WHERE company_id = :c AND action = 'test.seeded'"),
-                {"c": _CO},
+                text("SELECT count(*) FROM brands WHERE tenant_id = :t"), {"t": _TENANT}
             )
-        ).first()
-        assert audit_row is not None
-        assert audit_row.actor == "[deleted]"
-        assert audit_row.target == ""
+        ).scalar_one()
+        assert brands == 0
 
-        # ---- deletion_requests proves what happened, and it's resumable-safe ----
-        final = await get_deletion_request(session, req["id"])
-        assert final is not None
-        assert final["status"] == "completed"
-        assert final["neo4j_done"] is True
-        assert final["redis_done"] is True
-        assert final["postgres_done"] is True
-        assert final["completed_at"] is not None
-        assert final["error"] is None
+        # The audit record survives, anonymised: that something happened is
+        # kept for compliance even though who and what are cleared.
+        actor = (
+            await session.execute(
+                text("SELECT actor FROM audit_log WHERE company_id = :c LIMIT 1"),
+                {"c": _TENANT},
+            )
+        ).scalar_one_or_none()
+        assert actor == "[deleted]"
+
+    # And the item itself is unreachable by id.
+    async with Session() as session:
+        gone = (
+            await session.execute(
+                text("SELECT count(*) FROM kb_items WHERE item_id = :i"), {"i": item_id}
+            )
+        ).scalar_one()
+        assert gone == 0

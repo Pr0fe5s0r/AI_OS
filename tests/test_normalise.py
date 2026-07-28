@@ -29,6 +29,13 @@ def test_a_title_is_always_found():
     assert title_from("\n\n.\n", "reports/june.pdf") == "june.pdf"
 
 
+def test_our_own_scaffolding_is_never_the_title():
+    """The PDF parser inserts page markers and rules. Titling an item with
+    them made every document in the index read as '<!-- page 1 -->'."""
+    body = "<!-- page 1 -->\nQ2 Performance Review\n\n---\n\nmore text"
+    assert title_from(body, "q2.pdf") == "Q2 Performance Review"
+
+
 def test_markdown_passes_through_as_itself():
     out = normalise(b"# Heading\n\nSome content.", "note.md")
     assert out.title == "Heading"

@@ -138,6 +138,23 @@ async def put_item(session: AsyncSession, item: Item) -> PutResult:
         }
     )
 
+    # The previous version stops being current BEFORE the new one lands. The
+    # partial unique index allows exactly one active version per item, so the
+    # other order is not merely untidy — it is rejected outright. Both
+    # statements share the caller's transaction, so there is no window in
+    # which the item has no active version: it commits as one or not at all.
+    if current is not None:
+        await session.execute(
+            _SUPERSEDE,
+            {
+                "tenant": stored.scope.tenant_id,
+                "item_id": item_id,
+                "version": version,
+                "active": Lifecycle.ACTIVE,
+                "superseded": Lifecycle.SUPERSEDED,
+            },
+        )
+
     await session.execute(
         _INSERT,
         {
@@ -159,20 +176,6 @@ async def put_item(session: AsyncSession, item: Item) -> PutResult:
             "metadata": json.dumps(stored.metadata),
         },
     )
-    # Older versions stop being current. Done after the insert so a failure
-    # between the two leaves the previous version live rather than leaving the
-    # item with no active version at all.
-    if current is not None:
-        await session.execute(
-            _SUPERSEDE,
-            {
-                "tenant": stored.scope.tenant_id,
-                "item_id": item_id,
-                "version": version,
-                "active": Lifecycle.ACTIVE,
-                "superseded": Lifecycle.SUPERSEDED,
-            },
-        )
 
     return PutResult("created" if current is None else "versioned", stored, embedded_needed=True)
 
@@ -297,7 +300,9 @@ async def mark_failed(
             """
             UPDATE kb_items
             SET status = :failed,
-                metadata = metadata || jsonb_build_object('failure', :reason),
+                -- the cast is required: asyncpg cannot infer a parameter's
+                -- type inside jsonb_build_object and refuses the statement
+                metadata = metadata || jsonb_build_object('failure', CAST(:reason AS text)),
                 updated_at = now()
             WHERE tenant_id = :tenant AND item_id = :item_id AND version = :version
             """

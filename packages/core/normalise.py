@@ -65,9 +65,18 @@ def tidy(text: str) -> str:
 
 
 def title_from(body: str, filename: str) -> str:
-    """First real line, else the filename. Every item needs a human handle."""
+    """First real line of content, else the filename.
+
+    Structural markup is skipped rather than treated as content: page markers
+    and horizontal rules are things WE inserted, and titling an item with its
+    own scaffolding ("<!-- page 1 -->") makes every document in the index look
+    identical to a person scanning it.
+    """
     for line in body.splitlines():
-        cleaned = line.lstrip("# ").strip()
+        cleaned = line.strip()
+        if cleaned.startswith("<!--") or set(cleaned) <= {"-", "=", "*", " "}:
+            continue
+        cleaned = cleaned.lstrip("# ").strip()
         if len(cleaned) > 2:
             return cleaned[:200]
     return filename.rsplit("/", 1)[-1][:200] or "untitled"
