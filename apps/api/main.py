@@ -34,9 +34,10 @@ from packages.core.db import Session
 from packages.core.keys import create_key, list_keys, revoke_key
 from packages.core.normalise import supported
 from packages.core.pipeline import redis_settings
-from packages.core.search import RetrievalConfig, search
+from packages.core.search import RetrievalConfig, search_traced
 from packages.core.store import get_item, item_versions, list_items
 from packages.core.tenancy import require_write, resolve_caller, workspace_scope
+from packages.core.tracing import get_trace, list_traces, record, stats
 from packages.shared.schema import Lifecycle, Scope
 
 # ---------------------------------------------------------------------------
@@ -178,6 +179,7 @@ async def retrieve(
     period_to: datetime | None = None,
     include_superseded: bool = False,
     scope: Scope = Depends(workspace_scope),
+    principal: dict[str, Any] = Depends(resolve_caller),
     session: AsyncSession = Depends(db),
 ) -> dict[str, Any]:
     """The single read path. Every agent uses this; behaviour comes from config.
@@ -193,16 +195,72 @@ async def retrieve(
         period_to=period_to,
         include_superseded=include_superseded,
     )
-    hits = await search(session, scope, q, cfg)
+    hits, trace = await search_traced(session, scope, q, cfg)
+    await record(
+        session,
+        scope,
+        trace,
+        via=str(principal.get("via", "session")),
+        actor=str(principal.get("email") or ""),
+    )
+    await session.commit()
+
     # Classes ride along so a result can be shown filed, without a call per hit.
     tagged = await classes_for(session, scope, [h.item_id for h in hits])
     return {
         "query": q,
         "count": len(hits),
+        # The trace id comes back with the answer, so any result can be taken
+        # straight to the explanation of why it was returned.
+        "trace_id": trace.trace_id,
+        "degraded": trace.degraded,
+        "took_ms": trace.duration_ms,
         "results": [
             {**h.model_dump(), "classes": tagged.get(h.item_id, [])} for h in hits
         ],
     }
+
+
+# --------------------------------- traces ---------------------------------
+
+
+@app.get("/api/traces")
+async def traces(
+    limit: int = Query(50, ge=1, le=200),
+    only_empty: bool = False,
+    only_degraded: bool = False,
+    scope: Scope = Depends(workspace_scope),
+    session: AsyncSession = Depends(db),
+) -> dict[str, Any]:
+    """Recent queries. The interesting ones returned nothing or ran degraded."""
+    return {
+        "traces": await list_traces(
+            session, scope, limit=limit, only_empty=only_empty, only_degraded=only_degraded
+        )
+    }
+
+
+@app.get("/api/traces/stats")
+async def trace_stats(
+    hours: int = Query(24, ge=1, le=720),
+    scope: Scope = Depends(workspace_scope),
+    session: AsyncSession = Depends(db),
+) -> dict[str, Any]:
+    """How retrieval has been behaving over a window."""
+    return await stats(session, scope, hours=hours)
+
+
+@app.get("/api/traces/{trace_id}")
+async def trace_detail(
+    trace_id: str,
+    scope: Scope = Depends(workspace_scope),
+    session: AsyncSession = Depends(db),
+) -> dict[str, Any]:
+    """One query, in full: every candidate, every score, every timing."""
+    found = await get_trace(session, scope, trace_id)
+    if found is None:
+        raise HTTPException(404, "No such trace.")
+    return found
 
 
 # -------------------------------- the index --------------------------------

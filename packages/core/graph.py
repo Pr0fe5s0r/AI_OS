@@ -81,6 +81,30 @@ def _scope_clause(alias: str, scope: Scope) -> tuple[str, dict[str, Any]]:
 # ------------------------------- bootstrap -------------------------------
 
 
+async def migrate_legacy_properties() -> int:
+    """Carry nodes written before the scope rename onto the new property names.
+
+    Postgres columns were renamed by a migration; graph properties have no such
+    mechanism, so nodes written as `tenant_id`/`brand_id` simply stopped
+    matching any scope filter — present in the store, invisible to search, with
+    no error anywhere. Found by reading a query trace that showed one semantic
+    candidate where there should have been nine.
+
+    Idempotent: only touches nodes that have not been carried over yet.
+    """
+    rows = await _run(
+        """
+        MATCH (i:Item)
+        WHERE i.tenant_id IS NOT NULL AND i.workspace_id IS NULL
+        SET i.workspace_id = i.tenant_id,
+            i.collection_id = i.brand_id
+        REMOVE i.tenant_id, i.brand_id
+        RETURN count(i) AS n
+        """
+    )
+    return rows[0]["n"] if rows else 0
+
+
 async def bootstrap() -> None:
     """Constraints and indexes, created idempotently. Safe on every boot."""
     for stmt in [
@@ -97,6 +121,9 @@ async def bootstrap() -> None:
         """,
     ]:
         await _run(stmt)
+    # Runs on every boot so a deploy carries legacy nodes across without
+    # anyone having to remember a one-off script.
+    await migrate_legacy_properties()
 
 
 # --------------------------------- items ---------------------------------
