@@ -52,8 +52,19 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Knowledge Base", lifespan=lifespan)
+# Named origins, not "*": the session travels as a cookie, and a browser
+# refuses a wildcard origin on any credentialed request — so "*" would not be
+# permissive, it would simply break every call the UI makes.
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+    CORSMiddleware,
+    allow_origins=[
+        o.strip()
+        for o in os.getenv("WEB_ORIGINS", "http://localhost:3000").split(",")
+        if o.strip()
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 app.include_router(auth_router)
 
@@ -364,7 +375,11 @@ async def one_item(
     item = await get_item(session, scope, item_id, version=version)
     if item is None:
         raise HTTPException(404, "No such item.")
-    return item.model_dump()
+    # Filing travels with the item everywhere it is returned. Without this the
+    # detail view showed "not filed yet" for an item the list had just shown
+    # three categories against.
+    tagged = await classes_for(session, scope, [item.id])
+    return {**item.model_dump(), "classes": tagged.get(item.id, [])}
 
 
 @app.get("/api/items/{item_id}/versions")

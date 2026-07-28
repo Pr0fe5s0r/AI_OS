@@ -2,8 +2,9 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "MarkOS",
-  description: "The AI work agent that watches your tools, links what happened, and acts with your approval",
+  title: "Knowledge Base",
+  description:
+    "Everything your agency knows, in one place your team and your agents can both read from.",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

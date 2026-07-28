@@ -67,9 +67,14 @@ _KEYWORD = """
 
 _HYDRATE = """
     SELECT item_id, title, source, locator, url, created_at,
+           -- Custom delimiters, not the default <b></b>: the excerpt is data
+           -- travelling to an API and then to a browser, and HTML in it either
+           -- renders as literal tags or has to be trusted as markup. Neither is
+           -- acceptable, so the marks are inert tokens the client can style.
            ts_headline(
                'english', body, plainto_tsquery('english', :q),
-               'MaxWords=40, MinWords=15, ShortWord=3, MaxFragments=1'
+               'MaxWords=40, MinWords=15, ShortWord=3, MaxFragments=1,'
+               'StartSel="[[", StopSel="]]"'
            ) AS excerpt,
            left(body, 320) AS head,
            exp(-EXTRACT(EPOCH FROM (now() - COALESCE(period_end, created_at)))

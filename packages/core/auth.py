@@ -200,20 +200,15 @@ async def role_in(session: AsyncSession, user_id: int, company_id: str) -> str |
 async def create_workspace(
     session: AsyncSession, name: str, owner_id: int
 ) -> dict[str, Any]:
-    from packages.core.profile import Profile, save_profile
-
     company_id = workspace_id(name)
     await session.execute(
         text("INSERT INTO companies (id, name) VALUES (:id, :n)"),
         {"id": company_id, "n": name.strip() or company_id},
     )
     await add_membership(session, owner_id, company_id, "owner")
-    # An EMPTY profile, not the absence of one. This is not a seed — it holds
-    # no domain knowledge whatsoever — but without it every profile-scoped
-    # endpoint 404s until discovery runs, and a new workspace looks like a
-    # broken app instead of an empty one. Discovery proposes version 2 from
-    # real events; the universal watchers already work against version 1.
-    await save_profile(session, Profile(company_id=company_id), status="confirmed")
+    # Nothing else is planted. A new workspace holds no documents and no
+    # categories of its own — the platform taxonomy is already available to it,
+    # and an empty library is the correct resting state, not a broken one.
     return {"company_id": company_id, "name": name.strip(), "role": "owner"}
 
 

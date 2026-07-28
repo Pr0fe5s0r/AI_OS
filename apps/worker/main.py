@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from apps.common.deletion import delete_company_job
 from packages.core import graph
-from packages.core.pipeline import embed_item, ingest_file, ingest_text, redis_settings
+from packages.core.pipeline import (
+    classify_new_item,
+    embed_item,
+    ingest_file,
+    ingest_text,
+    redis_settings,
+)
 
 # arq worker:  arq apps.worker.main.WorkerSettings
 #
@@ -12,7 +18,7 @@ from packages.core.pipeline import embed_item, ingest_file, ingest_text, redis_s
 
 
 class WorkerSettings:
-    functions = [ingest_file, ingest_text, embed_item, delete_company_job]
+    functions = [ingest_file, ingest_text, embed_item, classify_new_item, delete_company_job]
     redis_settings = redis_settings()
     max_tries = 3
     job_timeout = 300
