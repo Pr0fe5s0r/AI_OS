@@ -1,4 +1,4 @@
-﻿@tailwind base;
+@tailwind base;
 @tailwind components;
 @tailwind utilities;
 
@@ -13,11 +13,20 @@ body {
 
 body {
   margin: 0;
-  background: #0a0a0a;
-  color: #e8e8e8;
-  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: #070809;
+  color: #e7ecf2;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+}
+
+/* A faint grid, like a coordinate space the points live in. Barely there —
+   it reads as "this is a spatial index" without becoming decoration. */
+.field-grid {
+  background-image:
+    linear-gradient(to right, rgba(124, 140, 255, 0.05) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(124, 140, 255, 0.05) 1px, transparent 1px);
+  background-size: 32px 32px;
 }
 
 ::-webkit-scrollbar {
@@ -25,113 +34,73 @@ body {
   height: 10px;
 }
 ::-webkit-scrollbar-thumb {
-  background: #2a2a2a;
+  background: #232a33;
   border-radius: 999px;
-  border: 2px solid #0a0a0a;
+  border: 2px solid #070809;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #383838;
+  background: #303a46;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 
 ::selection {
-  background: rgba(63, 185, 80, 0.3);
+  background: rgba(124, 140, 255, 0.32);
 }
 
 *:focus-visible {
-  outline: 2px solid rgba(63, 185, 80, 0.55);
+  outline: 2px solid rgba(124, 140, 255, 0.6);
   outline-offset: 2px;
+  border-radius: 4px;
 }
 
-@keyframes cardIn {
+@keyframes fieldPulse {
+  0%,
+  100% {
+    opacity: 0.5;
+    r: var(--r, 3);
+  }
+  50% {
+    opacity: 1;
+    r: calc(var(--r, 3) * 1.35);
+  }
+}
+.field-pulse {
+  animation: fieldPulse 2.6s ease-in-out infinite;
+}
+
+@keyframes traceSweep {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(100%);
+  }
+}
+.trace-sweep {
+  animation: traceSweep 2.2s linear infinite;
+}
+
+.card-in {
+  animation: rise 0.22s ease-out both;
+}
+@keyframes rise {
   from {
     opacity: 0;
-    transform: translateY(8px);
+    transform: translateY(6px);
   }
   to {
     opacity: 1;
     transform: none;
   }
 }
-@keyframes toastIn {
-  from {
-    opacity: 0;
-    transform: translate(-50%, 10px);
-  }
-  to {
-    opacity: 1;
-    transform: translate(-50%, 0);
-  }
-}
-@keyframes blink {
-  0%,
-  80%,
-  100% {
-    opacity: 0.25;
-  }
-  40% {
-    opacity: 1;
-  }
-}
-
-.card-in {
-  animation: cardIn 0.3s ease;
-}
-.toast-in {
-  animation: toastIn 0.3s ease;
-}
-
-@keyframes memoryFlow {
-  to {
-    stroke-dashoffset: -28;
-  }
-}
-
-@keyframes memoryPulse {
-  0%, 100% {
-    opacity: 0.25;
-    transform: scale(0.92);
-    transform-origin: center;
-  }
-  50% {
-    opacity: 0.62;
-    transform: scale(1.08);
-    transform-origin: center;
-  }
-}
-
-.memory-edge {
-  animation: memoryFlow 4.8s linear infinite;
-}
-
-.memory-pulse {
-  animation: memoryPulse 2.4s ease-in-out infinite;
-}
-
-/* A node that just landed pops in rather than silently appearing mid-layout
-   — the visible cue that the graph is live, not a static snapshot. */
-@keyframes nodePop {
-  0% {
-    transform: scale(0);
-  }
-  60% {
-    transform: scale(1.25);
-  }
-  100% {
-    transform: scale(1);
-  }
-}
-.memory-node-new {
-  animation: nodePop 0.5s cubic-bezier(0.34, 1.56, 0.64, 1);
-  transform-origin: center;
-}
 
 @media (prefers-reduced-motion: reduce) {
-  .memory-edge,
-  .memory-pulse,
-  .memory-node-new {
-    animation: none;
+  .field-pulse,
+  .trace-sweep,
+  .card-in,
+  .animate-ping2 {
+    animation: none !important;
   }
 }
