@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import Cookie, Depends, HTTPException
+from fastapi import Cookie, Depends, Header, HTTPException
+from sqlalchemy import text
 
 from packages.core.auth import resolve_session
 from packages.core.db import Session
+from packages.shared.schema import Scope
 
 # Multi-tenancy: every request is scoped to one company_id, and that id comes
 # from the SESSION — never from the request.
@@ -38,3 +40,37 @@ async def current_principal(
 
 async def company_scope(principal: dict[str, Any] = Depends(current_principal)) -> str:
     return str(principal["company_id"])
+
+
+async def tenant_scope(
+    principal: dict[str, Any] = Depends(current_principal),
+    x_brand_id: str | None = Header(default=None),
+) -> Scope:
+    """The two-level scope every KB call runs inside: agency, then client brand.
+
+    The tenant still comes from the session and never from the request. The
+    brand may be named by the caller — an operator legitimately switches
+    between the brands they work on — but it is VERIFIED against that tenant
+    before it is trusted. Without this check `X-Brand-Id` would be exactly the
+    hole `?company_id=` used to be: a header that reads another client's
+    content by guessing its name.
+
+    Omitting the header scopes to the whole agency, which is the correct
+    default for an operator looking across their clients.
+    """
+    tenant_id = str(principal["company_id"])
+    if x_brand_id is None:
+        return Scope(tenant_id=tenant_id)
+
+    async with Session() as session:
+        known = (
+            await session.execute(
+                text(
+                    "SELECT 1 FROM brands WHERE tenant_id = :tenant AND brand_id = :brand LIMIT 1"
+                ),
+                {"tenant": tenant_id, "brand": x_brand_id},
+            )
+        ).first()
+    if known is None:
+        raise HTTPException(404, "Unknown brand for this workspace.")
+    return Scope(tenant_id=tenant_id, brand_id=x_brand_id)

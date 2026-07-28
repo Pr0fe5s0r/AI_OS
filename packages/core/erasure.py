@@ -25,10 +25,20 @@ from packages.core import graph
 # happened survives even though who/what did not. Callers may request a hard
 # "purge" of audit_log instead via ``audit_policy``.
 
-_TABLES = (
-    "situations", "actions", "conversations", "connector_health",
-    "norm_baselines", "norm_resets", "settings", "action_tokens", "tickets",
-    "credentials", "events", "profiles",
+# Every table that carries tenant data, with the column naming the tenant.
+# Offboarding must leave nothing behind (NFR Data retention), so this mapping
+# is the one place a new tenant-scoped table has to be registered — missing one
+# means a tenant's content survives their own deletion request.
+#
+# The column differs by vintage: the KB's own tables say `tenant_id`, while the
+# platform tables it inherited say `company_id`. Carried as data rather than
+# assumed, because assuming it silently deleted nothing at all.
+_TABLES: tuple[tuple[str, str], ...] = (
+    ("kb_items", "tenant_id"),
+    ("brands", "tenant_id"),
+    ("settings", "company_id"),
+    ("action_tokens", "company_id"),
+    ("credentials", "company_id"),
 )
 
 
@@ -161,7 +171,7 @@ async def _complete(session: AsyncSession, request_id: int, result: dict) -> Non
 async def _delete_neo4j(company_id: str) -> int:
     """Covers the graph AND its embeddings — vectors live on :Event nodes,
     not a separate store."""
-    return await graph.wipe_company(company_id)
+    return await graph.wipe_tenant(company_id)
 
 
 async def _delete_redis(company_id: str) -> int:
@@ -196,9 +206,9 @@ async def _anonymize_audit_log(session: AsyncSession, company_id: str) -> int:
 
 async def _delete_postgres(session: AsyncSession, company_id: str, audit_policy: str) -> dict[str, int]:
     counts: dict[str, int] = {}
-    for table in _TABLES:
+    for table, column in _TABLES:
         result = await session.execute(
-            text(f"DELETE FROM {table} WHERE company_id = :c"),  # noqa: S608 (table from the fixed _TABLES tuple, never user input)
+            text(f"DELETE FROM {table} WHERE {column} = :c"),  # noqa: S608 (table and column come from the fixed _TABLES tuple, never user input)
             {"c": company_id},
         )
         counts[table] = int(cast(CursorResult, result).rowcount or 0)

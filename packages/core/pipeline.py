@@ -2,146 +2,172 @@ from __future__ import annotations
 
 import asyncio
 import os
-import random
 from datetime import datetime
+from typing import Any
 
 from arq.connections import RedisSettings
 
-from packages.connectors.base import field_presence, validate_raw
-from packages.core import connector_health as ch
 from packages.core import graph
 from packages.core.db import Session
-from packages.core.ingest import ingest
 from packages.core.llm import embed
-from packages.core.resolve import resolve
-from packages.core.store import get_event, store_event
+from packages.core.normalise import Normalised, UnsupportedFormat, normalise, normalise_text
+from packages.core.store import get_item, mark_failed, put_item, stable_item_id
+from packages.shared.schema import Item, Scope, SourceRef
 
-# Generic arq ingestion pipeline. Jobs take everything as DATA (source_config
-# and the profile's things/links slots), so the core never needs to know which
-# company or source produced them.
+# ---------------------------------------------------------------------------
+# The ingestion pipeline. Everything the KB is given enters through here, and
+# nothing user-facing ever waits on it (KB-3).
 #
-# Flow:  ingest_raw -> (commit to Postgres) -> embed_event (Neo4j mirror +
-# vector) -> resolve_event (Things + typed links, all in Cypher via core.graph)
-# Resilient: the event is committed before embedding; if embedding fails, only
-# the (retryable) embed job fails — the event has already landed.
+#   ingest_*  ->  normalise to Markdown
+#             ->  write to the item index (the hash decides create/skip/version)
+#             ->  embed ONLY if the content actually changed
 #
-# Self-monitoring (checkpoint 6, part A): ingest_raw validates the raw payload
-# against its connector's declared schema BEFORE normalizing. A validation
-# failure records to connector_health and returns — it never raises, so it
-# never crashes ingestion for any other (already-independently-queued) event.
-
-_FIELD_SAMPLE_RATE = 0.01  # ~1% of ingested events get a field-completeness check
+# The embed step is a separate job on purpose: the item is committed first, so
+# a failing embedding costs a retry of the embedding, not the ingestion. And
+# because put_item reports `unchanged`, re-syncing a drive that has not moved
+# performs no model calls at all — the cost control in KB-8 is that check,
+# not a policy engine layered on top of it.
+# ---------------------------------------------------------------------------
 
 
 def redis_settings() -> RedisSettings:
     return RedisSettings.from_dsn(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
 
 
-async def ingest_raw(
-    ctx, source_config: dict, raw: dict, resolve_cfg: dict | None = None, backfilled: bool = False
-) -> str:
-    """Normalize a raw payload -> Event, append to the store, queue embedding.
-
-    ``backfilled`` distinguishes a history walk (checkpoint 2, part A) from a
-    live sync/webhook — the watcher engine only evaluates backfilled=false
-    events, so old history can enrich norms without triggering fresh alerts.
-    """
-    company_id = source_config.get("company_id", "default")
-    connector_type = source_config.get("connector_type")
-
-    if connector_type:
-        error = validate_raw(connector_type, raw)
-        async with Session() as session:
-            if error:
-                await ch.record_failure(session, connector_type, company_id, error)
-                await session.commit()
-                return ""
-            await ch.record_success(session, connector_type, company_id)
-            if random.random() < _FIELD_SAMPLE_RATE:
-                await ch.record_sample(session, connector_type, company_id, field_presence(connector_type, raw))
-            await session.commit()
-
-    event = ingest(source_config, raw, backfilled=backfilled)
-    async with Session() as session:
-        # which metadata key holds a record's state is profile data, and the
-        # store needs it to notice open -> merged
-        await store_event(
-            session, event, status_field=(resolve_cfg or {}).get("things", {}).get("status_field")
-        )
-        await session.commit()
-    await ctx["redis"].enqueue_job(
-        "embed_event",
-        event.id,
-        event.company_id,
-        event.content,
-        event.timestamp.isoformat(),
-        event.source,
-        resolve_cfg,
-    )
-    return event.id
+def _scope(tenant_id: str, brand_id: str | None) -> Scope:
+    return Scope(tenant_id=tenant_id, brand_id=brand_id)
 
 
-async def backfill_source(
-    ctx, spec: dict, resolve_cfg: dict | None = None, since_days: int = 90
-) -> dict:
-    """Walk one connector's history back to ``since_days`` ago, tagging every
-    event backfilled=true (checkpoint 2, part A).
-
-    Low priority by nature, not by a dedicated queue: arq has no separate
-    priority lanes, so "low priority" here means it paces itself (each
-    connector's own polite rate limiting between pages) and processes raws
-    one at a time in this single job rather than fanning out a burst of
-    concurrent enqueues the way a live sync's fan-out does — it never
-    contends for a source's rate-limit budget against a live sync.
-    """
-    from packages.connectors.base import build_connector
-
-    connector = build_connector(spec)
-    backfill = getattr(connector, "backfill", None)
-    raws = await backfill(since_days) if backfill is not None else await connector.fetch_raw()
-
-    stored = 0
-    for raw in raws:
-        event_id = await ingest_raw(ctx, spec["source_config"], raw, resolve_cfg, backfilled=True)
-        if event_id:
-            stored += 1
-    return {"source": spec["source"], "since_days": since_days, "fetched": len(raws), "stored": stored}
-
-
-async def embed_event(
-    ctx,
-    event_id: str,
-    company_id: str,
-    content: str,
-    event_time: str,
-    source: str,
-    resolve_cfg: dict | None = None,
-) -> str:
-    """Embed one event and mirror it into the graph. Raising lets arq retry."""
-    vector = await asyncio.to_thread(embed, content)
-    await graph.mirror_event(
-        company_id=company_id,
-        event_id=event_id,
-        event_time=datetime.fromisoformat(event_time),
+async def _store(
+    ctx: dict[str, Any],
+    scope: Scope,
+    source: SourceRef,
+    parsed: Normalised,
+    period_start: datetime | None,
+    period_end: datetime | None,
+    metadata: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Shared tail: index the normalised content, queue embedding if it moved."""
+    item = Item(
+        id=stable_item_id(scope, source),
+        scope=scope,
+        title=parsed.title,
+        body=parsed.body,
         source=source,
+        period_start=period_start,
+        period_end=period_end,
+        metadata={**parsed.metadata, **(metadata or {})},
+    )
+
+    async with Session() as session:
+        result = await put_item(session, item)
+        await session.commit()
+
+    if result.embedded_needed and (redis := ctx.get("redis")) is not None:
+        await redis.enqueue_job("embed_item", scope.tenant_id, scope.brand_id, result.item.id)
+
+    return {
+        "item_id": result.item.id,
+        "version": result.item.version,
+        "outcome": result.outcome,
+    }
+
+
+async def ingest_file(
+    ctx: dict[str, Any],
+    tenant_id: str,
+    brand_id: str | None,
+    source: str,
+    locator: str,
+    filename: str,
+    data: bytes,
+    url: str | None = None,
+    period_start: datetime | None = None,
+    period_end: datetime | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """A file — uploaded or pulled from a source — becomes an item.
+
+    The bytes are read, converted, and dropped. What survives is Markdown plus
+    the link back (KB-7): the KB is not a file store.
+    """
+    scope = _scope(tenant_id, brand_id)
+    ref = SourceRef(source=source, locator=locator, url=url, fetched_at=datetime.now())
+    try:
+        parsed = await asyncio.to_thread(normalise, data, filename)
+    except UnsupportedFormat as exc:
+        # Visible and re-runnable, never silent. The item id is deterministic,
+        # so a later retry lands on the same row rather than orphaning this one.
+        item_id = stable_item_id(scope, ref)
+        async with Session() as session:
+            existing = await get_item(session, scope, item_id)
+            if existing is not None:
+                await mark_failed(session, scope, item_id, existing.version, str(exc))
+                await session.commit()
+        return {"item_id": item_id, "outcome": "failed", "reason": str(exc)}
+
+    return await _store(ctx, scope, ref, parsed, period_start, period_end, metadata)
+
+
+async def ingest_text(
+    ctx: dict[str, Any],
+    tenant_id: str,
+    brand_id: str | None,
+    source: str,
+    locator: str,
+    body: str,
+    title: str | None = None,
+    url: str | None = None,
+    period_start: datetime | None = None,
+    period_end: datetime | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Content that already is text: a generated report, a distilled session."""
+    scope = _scope(tenant_id, brand_id)
+    ref = SourceRef(source=source, locator=locator, url=url, fetched_at=datetime.now())
+    parsed = normalise_text(body, title=title, source_name=locator)
+    return await _store(ctx, scope, ref, parsed, period_start, period_end, metadata)
+
+
+async def embed_item(
+    ctx: dict[str, Any], tenant_id: str, brand_id: str | None, item_id: str
+) -> dict[str, Any]:
+    """Mirror the item into the graph and give it a vector.
+
+    Runs only for content that changed. Retryable in isolation: the item is
+    already committed, so a failure here costs recall until the retry, never
+    the item itself.
+    """
+    scope = _scope(tenant_id, brand_id)
+    async with Session() as session:
+        item = await get_item(session, scope, item_id)
+    if item is None:
+        return {"item_id": item_id, "outcome": "missing"}
+
+    vector = await asyncio.to_thread(embed, f"{item.title}\n\n{item.body}")
+    await graph.upsert_item(
+        scope,
+        item_id=item.id,
+        title=item.title,
+        source=item.source.source,
+        status=str(item.status),
         embedding=vector,
     )
-    if resolve_cfg:
-        await ctx["redis"].enqueue_job("resolve_event", event_id, company_id, resolve_cfg)
-    return event_id
+    return {"item_id": item.id, "outcome": "embedded"}
 
 
-async def resolve_event(ctx, event_id: str, company_id: str, resolve_cfg: dict) -> int:
-    """Link this event into the knowledge graph (incremental Understand layer).
+class WorkerSettings:
+    """arq worker entry point."""
 
-    resolve_cfg = {"things": <profile.things>, "links": <profile.links>}
-    """
-    async with Session() as session:
-        event = await get_event(session, company_id, event_id)
-        if event is None:
-            return 0
-        links = await resolve(
-            session, event, resolve_cfg.get("things", {}), resolve_cfg.get("links", {})
-        )
-        await session.commit()
-    return len(links)
+    functions = [ingest_file, ingest_text, embed_item]
+    redis_settings = redis_settings()
+    max_tries = 3
+    job_timeout = 300
+
+    @staticmethod
+    async def on_startup(ctx: dict[str, Any]) -> None:
+        await graph.bootstrap()
+
+    @staticmethod
+    async def on_shutdown(ctx: dict[str, Any]) -> None:
+        await graph.close_driver()

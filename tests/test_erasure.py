@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from sqlalchemy import text
 
 from packages.core import graph
@@ -10,6 +11,8 @@ from packages.core.erasure import (
     delete_company,
     get_deletion_request,
 )
+
+pytestmark = pytest.mark.needs_db
 
 # Checkpoint 6, part C: delete_company must remove real rows from BOTH stores
 # and leave a deletion_requests row that proves what happened, not just

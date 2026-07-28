@@ -1,266 +1,322 @@
 from __future__ import annotations
 
+import hashlib
 import json
-from typing import Any
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any, Literal
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.shared.schema import Event
+from packages.shared.schema import Item, Lifecycle, Scope, SourceRef, content_hash
 
-# Append-only, month-partitioned events table (created by the migration).
-# Postgres is the system of record for event CONTENT; the embedding lives on
-# the Neo4j :Event mirror (see core.graph), written by a retryable second job.
+# ---------------------------------------------------------------------------
+# THE ITEM INDEX — the catalogue of what the knowledge base holds.
+#
+# One table, one write path, and one mechanism that everything turns on: the
+# content hash. A write either creates, changes nothing, or supersedes.
+#
+# Identity: an item's id is STABLE across re-ingestion, re-embedding and
+# content updates (KB-1), because it is derived from where the content came
+# from rather than from the content itself. Versions live under that id, so
+# "the same document, changed" keeps its identity while its history is kept.
+# The primary key is (item_id, version); exactly one version is `active`.
+# ---------------------------------------------------------------------------
 
-_INSERT_EVENT = text(
+
+def stable_item_id(scope: Scope, source: SourceRef) -> str:
+    """A durable id for a logical item — same source, same id, forever.
+
+    Deliberately derived from scope + origin and NOT from the content: an
+    edited document is the same item at a new version, not a new item. The
+    tenant is part of it because two agencies may sync the same public file
+    and must never collide.
     """
-    INSERT INTO events
-        (id, company_id, source, type, actor_id, actor_name, actor_email,
-         timestamp, content, metadata, raw, content_tsv, backfilled)
-    VALUES
-        (:id, :company_id, :source, :type, :actor_id, :actor_name, :actor_email,
-         :timestamp, :content, CAST(:metadata AS jsonb), CAST(:raw AS jsonb),
-         to_tsvector('english', :content), :backfilled)
-    -- company_id is part of the key: an event id is the SOURCE's id (GitHub
-    -- numbers issue_4 in every repo), so without the tenant two workspaces
-    -- watching the same repo collide and one quietly overwrites the other.
-    ON CONFLICT (company_id, id, timestamp) DO UPDATE SET
-        source      = EXCLUDED.source,
-        type        = EXCLUDED.type,
-        actor_id    = EXCLUDED.actor_id,
-        actor_name  = EXCLUDED.actor_name,
-        actor_email = EXCLUDED.actor_email,
-        content     = EXCLUDED.content,
-        metadata    = EXCLUDED.metadata,
-        raw         = EXCLUDED.raw,
-        content_tsv = EXCLUDED.content_tsv
-        -- backfilled is deliberately NOT overwritten: it records how the
-        -- event was FIRST ingested, so a re-sync can never quietly relabel
-        -- a real live event as backfilled (or vice versa)
+    seed = "\x1f".join([scope.tenant_id, scope.brand_id or "", source.source, source.locator])
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
+
+
+Outcome = Literal["created", "unchanged", "versioned"]
+
+
+@dataclass(slots=True)
+class PutResult:
+    """What a write actually did — never a silent success.
+
+    `unchanged` is the important one: it is the signal the pipeline uses to
+    skip embedding entirely, which is where the cost of re-syncing a large
+    drive is avoided (KB-8).
+    """
+
+    outcome: Outcome
+    item: Item
+    embedded_needed: bool
+
+    @property
+    def changed(self) -> bool:
+        return self.outcome != "unchanged"
+
+
+_CURRENT = text(
+    """
+    SELECT item_id, version, hash, title, body, status
+    FROM kb_items
+    WHERE tenant_id = :tenant AND item_id = :item_id AND status = :active
+    ORDER BY version DESC
+    LIMIT 1
     """
 )
 
-# Fields whose change is worth remembering, and what to call them to a person.
-# Deliberately a small, closed set: metadata carries dozens of keys that churn
-# for no reason anyone cares about (etags, comment counts, url variants), and
-# logging every one of them would bury the two or three that mean something.
-# Names, not paths — the profile decides which metadata key holds "status", so
-# the caller passes the mapping in rather than this module guessing.
-
-
-def _first_line(content: str | None) -> str:
-    return (content or "").strip().splitlines()[0][:200] if (content or "").strip() else ""
-
-
-def _rest(content: str | None) -> str:
-    """Everything a record says past its first line, normalized so that
-    reformatting alone never reads as a change."""
-    lines = (content or "").strip().splitlines()[1:]
-    return "\n".join(line.strip() for line in lines if line.strip())[:1000]
-
-
-async def _record_transitions(
-    session: AsyncSession, event: Event, changes: list[tuple[str, Any, Any]]
-) -> None:
-    """Log what changed about this record since we last saw it.
-
-    Ingest overwrites, so without this a record's history is simply gone: a
-    pull request that went open → merged left no trace, and "has this moved?"
-    — the question the whole product is built around — could only ever be
-    answered about the present.
-
-    The before-value comes from the STORED SNAPSHOT, not from the last
-    transition row. Reading it from the transition log looked equivalent and
-    was not: on the first scan after this shipped, every existing record had a
-    snapshot but no history, so each one logged "status → closed" with an empty
-    before — a change nobody made, on ten records at once. The snapshot always
-    knows what we previously believed.
-
-    The second condition guards the other direction: two workers handed the
-    same payload would otherwise both write the same row. Not a unique index,
-    because an issue closed, reopened and closed again really did change three
-    times and an index would swallow the second close.
+_INSERT = text(
     """
-    for field, old_value, new_value in changes:
+    INSERT INTO kb_items
+        (item_id, version, tenant_id, brand_id, title, body, body_tsv,
+         source, locator, url, hash, supersedes, status,
+         created_at, updated_at, period_start, period_end, metadata)
+    VALUES
+        (:item_id, :version, :tenant, :brand, :title, :body,
+         to_tsvector('english', :title || ' ' || :body),
+         :source, :locator, :url, :hash, :supersedes, :status,
+         :created_at, now(), :period_start, :period_end, CAST(:metadata AS jsonb))
+    ON CONFLICT (item_id, version) DO UPDATE SET
+        title      = EXCLUDED.title,
+        body       = EXCLUDED.body,
+        body_tsv   = EXCLUDED.body_tsv,
+        url        = EXCLUDED.url,
+        updated_at = now(),
+        metadata   = EXCLUDED.metadata
+    """
+)
+
+_SUPERSEDE = text(
+    """
+    UPDATE kb_items
+    SET status = :superseded, updated_at = now()
+    WHERE tenant_id = :tenant AND item_id = :item_id AND version < :version
+      AND status = :active
+    """
+)
+
+
+async def put_item(session: AsyncSession, item: Item) -> PutResult:
+    """Write an item, honouring the hash.
+
+    Three outcomes and no others:
+      created    — first time we have seen this source location
+      unchanged  — identical content already held; nothing is written or embedded
+      versioned  — content differs; a new version lands and the prior is superseded
+
+    The unchanged path is checked BEFORE any model call is made, which is what
+    makes re-syncing an unchanged drive close to free.
+    """
+    item = item.with_hash()
+    item_id = item.id or stable_item_id(item.scope, item.source)
+
+    current = (
         await session.execute(
-            text(
-                """
-                INSERT INTO record_transitions
-                    (company_id, record_id, source, field, old_value, new_value)
-                SELECT :c, :r, :s, :f, :old, :new
-                WHERE (
-                    SELECT new_value FROM record_transitions
-                    WHERE company_id = :c AND record_id = :r AND field = :f
-                    ORDER BY observed_at DESC, id DESC LIMIT 1
-                ) IS DISTINCT FROM :new
-                """
-            ),
+            _CURRENT,
+            {"tenant": item.scope.tenant_id, "item_id": item_id, "active": Lifecycle.ACTIVE},
+        )
+    ).first()
+
+    if current is not None and current.hash == item.hash:
+        held = item.model_copy(
+            update={"id": item_id, "version": current.version, "status": Lifecycle.ACTIVE}
+        )
+        return PutResult("unchanged", held, embedded_needed=False)
+
+    version = 1 if current is None else current.version + 1
+    supersedes = f"{item_id}@{current.version}" if current is not None else None
+    stored = item.model_copy(
+        update={
+            "id": item_id,
+            "version": version,
+            "supersedes": supersedes,
+            "status": Lifecycle.ACTIVE,
+            "created_at": item.created_at or datetime.now(UTC),
+        }
+    )
+
+    await session.execute(
+        _INSERT,
+        {
+            "item_id": item_id,
+            "version": version,
+            "tenant": stored.scope.tenant_id,
+            "brand": stored.scope.brand_id,
+            "title": stored.title,
+            "body": stored.body,
+            "source": stored.source.source,
+            "locator": stored.source.locator,
+            "url": stored.source.url,
+            "hash": stored.hash,
+            "supersedes": supersedes,
+            "status": Lifecycle.ACTIVE,
+            "created_at": stored.created_at,
+            "period_start": stored.period_start,
+            "period_end": stored.period_end,
+            "metadata": json.dumps(stored.metadata),
+        },
+    )
+    # Older versions stop being current. Done after the insert so a failure
+    # between the two leaves the previous version live rather than leaving the
+    # item with no active version at all.
+    if current is not None:
+        await session.execute(
+            _SUPERSEDE,
             {
-                "c": event.company_id, "r": event.id, "s": event.source, "f": field,
-                "old": None if old_value is None else str(old_value),
-                "new": None if new_value is None else str(new_value),
+                "tenant": stored.scope.tenant_id,
+                "item_id": item_id,
+                "version": version,
+                "active": Lifecycle.ACTIVE,
+                "superseded": Lifecycle.SUPERSEDED,
             },
         )
 
+    return PutResult("created" if current is None else "versioned", stored, embedded_needed=True)
 
-async def store_event(
-    session: AsyncSession, event: Event, status_field: str | None = None
-) -> None:
-    """Append (or refresh) one event, and remember anything that changed.
 
-    ``status_field`` is profile data — GitHub says "state", an inventory
-    profile says "status" — so the caller supplies it and this module stays
-    free of any tool's vocabulary. Omitted, only the title is watched.
-    """
-    previous = (
-        await session.execute(
-            text(
-                "SELECT content, metadata FROM events "
-                "WHERE company_id = :c AND id = :i LIMIT 1"
-            ),
-            {"c": event.company_id, "i": event.id},
-        )
-    ).first()
-
-    await session.execute(
-        _INSERT_EVENT,
-        {
-            "id": event.id,
-            "company_id": event.company_id,
-            "source": event.source,
-            "type": event.type,
-            "actor_id": event.actor.id,
-            "actor_name": event.actor.name,
-            "actor_email": event.actor.email,
-            "timestamp": event.timestamp,
-            "content": event.content,
-            "metadata": json.dumps(event.metadata),
-            "raw": json.dumps(event.raw),
-            "backfilled": event.backfilled,
-        },
+def _row_to_item(row: Any) -> Item:
+    md = row.metadata if isinstance(row.metadata, dict) else json.loads(row.metadata or "{}")
+    return Item(
+        id=row.item_id,
+        scope=Scope(tenant_id=row.tenant_id, brand_id=row.brand_id),
+        title=row.title,
+        body=row.body,
+        source=SourceRef(source=row.source, locator=row.locator, url=row.url),
+        hash=row.hash,
+        version=row.version,
+        supersedes=row.supersedes,
+        status=Lifecycle(row.status),
+        created_at=row.created_at,
+        period_start=row.period_start,
+        period_end=row.period_end,
+        metadata=md,
     )
 
-    # Only against a record we had already seen. The first sighting of an issue
-    # is not it "changing to open" — logging that would fill the history of a
-    # freshly connected workspace with transitions nobody made.
-    if previous is None:
-        return
 
-    old_meta = previous.metadata if isinstance(previous.metadata, dict) else json.loads(previous.metadata or "{}")
-    changes: list[tuple[str, Any, Any]] = []
-
-    def _add(field: str, old: Any, new: Any) -> None:
-        if old != new:
-            changes.append((field, old, new))
-
-    _add("title", _first_line(previous.content), _first_line(event.content))
-    # Everything past the title: a description being edited, and whatever the
-    # connector appends about what has happened since — which files a pull
-    # request touches, the commit messages on it. Without this a PR that gained
-    # a second commit had NO transition at all, so "what changed?" answered
-    # "nothing" about work that had visibly moved. A record can change without
-    # its status or its name changing; that is the normal case, not the edge.
-    _add("detail", _rest(previous.content), _rest(event.content))
-    if status_field:
-        _add("status", (old_meta or {}).get(status_field), event.metadata.get(status_field))
-    if changes:
-        await _record_transitions(session, event, changes)
+_SELECT = """
+    SELECT item_id, version, tenant_id, brand_id, title, body, source, locator,
+           url, hash, supersedes, status, created_at, period_start, period_end, metadata
+    FROM kb_items
+"""
 
 
-async def list_transitions(
-    session: AsyncSession, company_id: str, record_id: str | None = None, limit: int = 50
-) -> list[dict[str, Any]]:
-    """What has changed lately — for one record, or across the workspace.
-
-    The counterpart to a snapshot: `events` says what is true now, this says
-    what stopped being true and when we noticed.
-    """
-    clauses = ["company_id = :c"]
-    params: dict[str, Any] = {"c": company_id, "l": limit}
-    if record_id:
-        clauses.append("record_id = :r")
-        params["r"] = record_id
-    rows = await session.execute(
-        text(
-            f"""
-            SELECT record_id, source, field, old_value, new_value, observed_at
-            FROM record_transitions
-            WHERE {" AND ".join(clauses)}
-            ORDER BY observed_at DESC, id DESC
-            LIMIT :l
-            """
-        ),
-        params,
-    )
-    return [
-        {
-            "record_id": r.record_id, "source": r.source, "field": r.field,
-            "from": r.old_value, "to": r.new_value,
-            "observed_at": r.observed_at.isoformat(),
-        }
-        for r in rows
-    ]
-
-
-async def get_event(session: AsyncSession, company_id: str, event_id: str) -> Event | None:
-    from packages.shared.schema import Actor
+async def get_item(
+    session: AsyncSession, scope: Scope, item_id: str, version: int | None = None
+) -> Item | None:
+    """One item — its current version, or a specific one for point-in-time reads."""
+    clauses = ["tenant_id = :tenant", "item_id = :item_id"]
+    params: dict[str, Any] = {"tenant": scope.tenant_id, "item_id": item_id}
+    if version is None:
+        clauses.append("status = :active")
+        params["active"] = Lifecycle.ACTIVE
+    else:
+        clauses.append("version = :version")
+        params["version"] = version
+    if scope.brand_id is not None:
+        clauses.append("brand_id = :brand")
+        params["brand"] = scope.brand_id
 
     row = (
         await session.execute(
-            text(
-                """
-                SELECT id, company_id, source, type, actor_id, actor_name, actor_email,
-                       timestamp, content, metadata, raw, backfilled
-                FROM events WHERE company_id = :c AND id = :i LIMIT 1
-                """
-            ),
-            {"c": company_id, "i": event_id},
+            text(f"{_SELECT} WHERE {' AND '.join(clauses)} ORDER BY version DESC LIMIT 1"), params
         )
     ).first()
-    if row is None:
-        return None
-    return _row_to_event(row, Actor)
+    return _row_to_item(row) if row else None
 
 
-async def get_events_by_ids(
-    session: AsyncSession, company_id: str, event_ids: list[str]
-) -> list[Event]:
-    """Batch form of get_event — one query, not N.
-
-    The graph mirror stores ids only, so any screen showing graph nodes with
-    their real content needs exactly this join back to the system of record.
-    """
-    from packages.shared.schema import Actor
-
-    if not event_ids:
+async def get_items_by_ids(
+    session: AsyncSession, scope: Scope, item_ids: list[str]
+) -> list[Item]:
+    """Batch hydrate — one query, not N. The graph holds ids only."""
+    if not item_ids:
         return []
+    clauses = ["tenant_id = :tenant", "item_id = ANY(:ids)", "status = :active"]
+    params: dict[str, Any] = {
+        "tenant": scope.tenant_id,
+        "ids": list(item_ids),
+        "active": Lifecycle.ACTIVE,
+    }
+    if scope.brand_id is not None:
+        clauses.append("brand_id = :brand")
+        params["brand"] = scope.brand_id
+    rows = (await session.execute(text(f"{_SELECT} WHERE {' AND '.join(clauses)}"), params)).all()
+    return [_row_to_item(r) for r in rows]
+
+
+async def list_items(
+    session: AsyncSession,
+    scope: Scope,
+    source: str | None = None,
+    status: Lifecycle = Lifecycle.ACTIVE,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[Item]:
+    """The catalogue view: what is held, filterable — KB-1's listing requirement."""
+    clauses = ["tenant_id = :tenant", "status = :status"]
+    params: dict[str, Any] = {
+        "tenant": scope.tenant_id, "status": status, "limit": limit, "offset": offset,
+    }
+    if scope.brand_id is not None:
+        clauses.append("brand_id = :brand")
+        params["brand"] = scope.brand_id
+    if source:
+        clauses.append("source = :source")
+        params["source"] = source
     rows = (
         await session.execute(
             text(
-                """
-                SELECT id, company_id, source, type, actor_id, actor_name, actor_email,
-                       timestamp, content, metadata, raw, backfilled
-                FROM events WHERE company_id = :c AND id = ANY(:ids)
-                """
+                f"{_SELECT} WHERE {' AND '.join(clauses)} "
+                "ORDER BY updated_at DESC LIMIT :limit OFFSET :offset"
             ),
-            {"c": company_id, "ids": list(event_ids)},
+            params,
         )
     ).all()
-    return [_row_to_event(r, Actor) for r in rows]
+    return [_row_to_item(r) for r in rows]
 
 
-def _row_to_event(row: Any, actor_cls: Any) -> Event:
-    md = row.metadata if isinstance(row.metadata, dict) else json.loads(row.metadata)
-    raw = row.raw if isinstance(row.raw, dict) else json.loads(row.raw)
-    return Event(
-        id=row.id,
-        company_id=row.company_id,
-        source=row.source,
-        type=row.type,
-        actor=actor_cls(id=row.actor_id, name=row.actor_name, email=row.actor_email),
-        timestamp=row.timestamp,
-        content=row.content,
-        metadata=md or {},
-        raw=raw or {},
-        backfilled=row.backfilled,
+async def item_versions(session: AsyncSession, scope: Scope, item_id: str) -> list[Item]:
+    """Every version of an item, newest first — the lineage KB-1 requires."""
+    rows = (
+        await session.execute(
+            text(f"{_SELECT} WHERE tenant_id = :tenant AND item_id = :item_id ORDER BY version DESC"),
+            {"tenant": scope.tenant_id, "item_id": item_id},
+        )
+    ).all()
+    return [_row_to_item(r) for r in rows]
+
+
+async def mark_failed(
+    session: AsyncSession, scope: Scope, item_id: str, version: int, reason: str
+) -> None:
+    """Ingestion failures are visible and re-runnable, never silent (KB-1/KB-3)."""
+    await session.execute(
+        text(
+            """
+            UPDATE kb_items
+            SET status = :failed,
+                metadata = metadata || jsonb_build_object('failure', :reason),
+                updated_at = now()
+            WHERE tenant_id = :tenant AND item_id = :item_id AND version = :version
+            """
+        ),
+        {
+            "failed": Lifecycle.FAILED, "reason": reason,
+            "tenant": scope.tenant_id, "item_id": item_id, "version": version,
+        },
     )
+
+
+__all__ = [
+    "PutResult",
+    "content_hash",
+    "get_item",
+    "get_items_by_ids",
+    "item_versions",
+    "list_items",
+    "mark_failed",
+    "put_item",
+    "stable_item_id",
+]

@@ -9,6 +9,8 @@ from packages.core.db import Session
 from packages.core.oauth import OAuthError, OAuthProvider, authorize_url, exchange_code
 from packages.core.tokens import consume_token, issue_token
 
+pytestmark = pytest.mark.needs_db
+
 _CO = "test-oauth"
 _PURPOSE = "oauth_state"
 

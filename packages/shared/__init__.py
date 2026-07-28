@@ -1,3 +1,3 @@
-from packages.shared.schema import Actor, Event
+from packages.shared.schema import Hit, Item, Lifecycle, Link, Scope, SourceRef
 
-__all__ = ["Actor", "Event"]
+__all__ = ["Hit", "Item", "Lifecycle", "Link", "Scope", "SourceRef"]

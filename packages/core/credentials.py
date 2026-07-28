@@ -61,7 +61,7 @@ async def list_connections(session: AsyncSession, company_id: str) -> list[Conne
         cfg = r.config if isinstance(r.config, dict) else json.loads(r.config)
         out.append(
             Connection(
-                company_id=company_id,
+                tenant_id=company_id,
                 source=r.source,
                 connected=True,
                 config=cfg or {},

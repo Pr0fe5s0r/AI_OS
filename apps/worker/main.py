@@ -1,106 +1,26 @@
 from __future__ import annotations
 
-from arq import cron
-
 from apps.common.deletion import delete_company_job
-from apps.common.health import evaluate_connector_health
-from apps.common.scheduling import (
-    analyze_company,
-    first_sync,
-    scan_enabled,
-    scan_minutes,
-    scheduled_scan,
-)
-from apps.common.triggers import run_scheduled_workflows
-from apps.common.watching import evaluate_all_watchers
 from packages.core import graph
-from packages.core.pipeline import (
-    backfill_source,
-    embed_event,
-    ingest_raw,
-    redis_settings,
-    resolve_event,
-)
+from packages.core.pipeline import embed_item, ingest_file, ingest_text, redis_settings
 
-# arq worker: `arq apps.worker.main.WorkerSettings`
-# Composes the generic core pipeline jobs. All domain knowledge (source_config,
-# things/links slots) arrives as job arguments loaded from profile rows.
-
-_SCAN = cron(
-    scheduled_scan,
-    minute=scan_minutes(),
-    # unique: with two workers running, only one scan happens per tick
-    unique=True,
-    # never on boot — a restart must not fire off a round of real emails
-    run_at_startup=False,
-    # a retried scan would re-email everyone; fail loudly instead
-    max_tries=1,
-    # ingest waits for the queue, then every situation gets an LLM call
-    timeout=900,
-)
-
-# Self-monitoring: independent of the business scan cadence, always every 15
-# minutes, on its own cron minutes so a slow business scan never delays it.
-_HEALTH_SCAN = cron(
-    evaluate_connector_health,
-    minute={0, 15, 30, 45},
-    unique=True,
-    run_at_startup=False,
-    max_tries=1,
-    timeout=300,
-)
-
-# The watcher engine (checkpoint 2, part C): every 5 minutes, its own
-# cadence, faster than the LLM-heavier business scan because the universal
-# built-in primitives are pure algorithms — no LLM call, no external fetch.
-_WATCHER_SCAN = cron(
-    evaluate_all_watchers,
-    minute={0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55},
-    unique=True,
-    run_at_startup=False,
-    max_tries=1,
-    timeout=300,
-)
-
-
-# Schedule-triggered workflows: every minute, because a workflow's cadence is
-# its OWN cron string — this tick just asks each one "is this your minute?".
-# Cheap when nothing is due (one indexed query, no LLM, no external call).
-_WORKFLOW_SCAN = cron(
-    run_scheduled_workflows,
-    minute=set(range(60)),
-    unique=True,
-    # a restart must not replay every schedule that passed while we were down
-    run_at_startup=False,
-    # a retry would re-fire actions; the fire-claim would block it anyway, but
-    # failing loudly is the honest behaviour
-    max_tries=1,
-    timeout=300,
-)
-
-
-async def startup(ctx: dict) -> None:
-    # constraints + vector index must exist before the first embed job lands
-    await graph.bootstrap()
-
-
-async def shutdown(ctx: dict) -> None:
-    await graph.close_driver()
+# arq worker:  arq apps.worker.main.WorkerSettings
+#
+# Three jobs, one flow: normalise -> index -> embed. Nothing is scheduled yet;
+# source polling arrives with the providers in workstream 4, at which point a
+# cron lands here and calls the same ingest jobs the API already uses.
 
 
 class WorkerSettings:
-    # analyze_company is the event-driven path: enqueued by webhooks seconds
-    # after something changes, debounced so bursts run once.
-    functions = [
-        ingest_raw, embed_event, resolve_event, analyze_company,
-        evaluate_connector_health, delete_company_job, backfill_source,
-        run_scheduled_workflows, first_sync,
-    ]
-    cron_jobs = ([_SCAN] if scan_enabled() else []) + [
-        _HEALTH_SCAN, _WATCHER_SCAN, _WORKFLOW_SCAN,
-    ]
-    on_startup = startup
-    on_shutdown = shutdown
+    functions = [ingest_file, ingest_text, embed_item, delete_company_job]
     redis_settings = redis_settings()
-    max_tries = 4
-    keep_result = 3600
+    max_tries = 3
+    job_timeout = 300
+
+    @staticmethod
+    async def on_startup(ctx) -> None:
+        await graph.bootstrap()
+
+    @staticmethod
+    async def on_shutdown(ctx) -> None:
+        await graph.close_driver()

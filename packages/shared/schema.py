@@ -1,74 +1,170 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, Field
 
+# ---------------------------------------------------------------------------
+# The Knowledge Base speaks about exactly one unit of knowledge: an Item.
+#
+# Every other word the requirements use for it — content, record, document,
+# knowledge object — means this. Whatever produced it (an uploaded file, a
+# synced Drive document, a generated report), by the time it reaches storage
+# it is an Item: Markdown, plus the metadata needed to find it, scope it and
+# know whether it is still current.
+# ---------------------------------------------------------------------------
 
-class Actor(BaseModel):
-    """Who performed an event."""
 
-    id: str
-    name: str
-    email: str | None = None
+class Lifecycle(StrEnum):
+    """Where an item is in its life. Retrieval serves ACTIVE only."""
+
+    ACTIVE = "active"
+    SUPERSEDED = "superseded"  # a newer version of the same source exists
+    ARCHIVED = "archived"  # withdrawn deliberately
+    FAILED = "failed"  # ingestion did not complete; visible, never silent
 
 
-class Event(BaseModel):
-    """Generic, source-agnostic event.
+class Scope(BaseModel):
+    """Two-level tenancy: an agency, and a client brand beneath it.
 
-    The core engine stores and searches these. Verticals decide which
-    ``source`` / ``type`` values are meaningful — the schema itself carries no
-    domain logic.
+    Isolation between agencies AND between brands is a precondition, so this
+    travels with every write and every query rather than being remembered at
+    each call site. ``brand_id`` is optional because some items belong to the
+    agency itself rather than to one of its clients.
     """
 
+    tenant_id: str
+    brand_id: str | None = None
+
+    model_config = {"frozen": True}
+
+
+class SourceRef(BaseModel):
+    """Where an item came from, and how to get back to it.
+
+    The KB never keeps the original binary (KB-7), so this is the only route
+    back to it. ``locator`` is whatever the source needs to re-fetch: a Drive
+    file id, an S3 key, a URL, a chat session id.
+    """
+
+    source: str  # "upload" | "gdrive" | "s3" | "notion" | ...
+    locator: str
+    url: str | None = None
+    fetched_at: datetime | None = None
+
+
+def content_hash(markdown: str) -> str:
+    """The hash the whole write path turns on.
+
+    One mechanism answers four separate requirements: skip duplicates (KB-1),
+    reprocess only what changed on sync (KB-4), never re-embed unchanged
+    content (KB-8), and decide when a new version supersedes the last (KB-1).
+    Computed over the normalised Markdown, not the original bytes — the same
+    document re-exported produces different bytes but identical knowledge.
+    """
+    return hashlib.sha256(markdown.strip().encode("utf-8")).hexdigest()
+
+
+class Item(BaseModel):
+    """One unit of knowledge in the KB."""
+
     id: str
-    company_id: str = "default"
-    source: str  # "github" | "slack" | "zendesk" | ...
-    type: str  # e.g. "issue", "message", "ticket"
-    actor: Actor
-    timestamp: datetime
-    content: str  # the text we embed + full-text index
+    scope: Scope
+    title: str
+    body: str  # Markdown — the canonical stored representation
+    source: SourceRef
+    hash: str = ""
+    version: int = 1
+    supersedes: str | None = None  # id of the version this replaced
+    status: Lifecycle = Lifecycle.ACTIVE
+
+    # When the content was written vs. the period it *describes*. A July report
+    # about Q2 has a created_at in July and a period covering Q2; time-aware
+    # retrieval needs both and they are routinely different.
+    created_at: datetime | None = None
+    period_start: datetime | None = None
+    period_end: datetime | None = None
+
     metadata: dict[str, Any] = Field(default_factory=dict)
-    raw: dict[str, Any] = Field(default_factory=dict)  # untouched source payload
-    backfilled: bool = False  # from history walk vs. a live sync/webhook
 
     model_config = {"extra": "forbid"}
 
+    def with_hash(self) -> Item:
+        return self.model_copy(update={"hash": self.hash or content_hash(self.body)})
+
+
+class Classification(BaseModel):
+    """One class assigned to an item.
+
+    The KB owns this decision, not the uploader (KB-2.a): ``confidence`` and
+    ``basis`` record how it was reached so low-confidence assignments can be
+    surfaced, and ``pinned`` marks a human override that re-classification
+    must never silently revert (KB-2.b).
+    """
+
+    item_id: str
+    class_id: str
+    confidence: float = 0.0
+    basis: str | None = None
+    pinned: bool = False
+
+
+class Hit(BaseModel):
+    """One retrieval result, carrying the provenance a citation needs."""
+
+    item_id: str
+    title: str
+    excerpt: str
+    source: SourceRef
+    score: float
+    semantic: float = 0.0
+    keyword: float = 0.0
+
 
 # ---------------------------------------------------------------------------
-# Understand layer — generic graph + resolution + norms result types.
-# The core produces these; verticals supply the rules that drive them.
+# Graph — relationships between items, and the vectors used to find them.
 # ---------------------------------------------------------------------------
 
 
-class ResolvedEntity(BaseModel):
-    """One link discovered by core.resolve() between two events/nodes."""
+class Link(StrEnum):
+    """The relationship types the KB models. Deliberately few."""
 
-    source_event_id: str
-    target_node_id: str
-    node_type: str
-    method: str  # "id" | "embedding" | "keyword"
-    edge_type: str  # "SAME_AS" | "MENTIONS" | "CLOSES" | "AUTHORED"
-    confidence: float
+    SUPERSEDES = "SUPERSEDES"  # version lineage
+    DERIVES_FROM = "DERIVES_FROM"  # a report built from other items
+    REFERENCES = "REFERENCES"  # one item cites another
+
+
+class Connection(BaseModel):
+    """A configured link to an external source, as shown to an operator.
+
+    The token itself never appears here — it stays sealed in the credential
+    store and is only unsealed at the moment of a fetch.
+    """
+
+    tenant_id: str
+    source: str
+    connected: bool = True
+    config: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime | None = None
 
 
 class GraphNode(BaseModel):
     id: str
-    company_id: str = "default"
-    type: str  # Incident | PullRequest | Ticket | Feature | Person | Message
-    key: str
-    label: str
+    tenant_id: str
+    brand_id: str | None = None
+    title: str
+    status: str = Lifecycle.ACTIVE
     source: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class GraphEdge(BaseModel):
-    company_id: str = "default"
     src_id: str
     dst_id: str
-    type: str  # AUTHORED | CLOSES | MENTIONS | SAME_AS | CAUSED_BY
-    weight: float = 1.0
+    type: str
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -76,367 +172,3 @@ class GraphResult(BaseModel):
     center: str
     nodes: list[GraphNode] = Field(default_factory=list)
     edges: list[GraphEdge] = Field(default_factory=list)
-
-
-class NormBaseline(BaseModel):
-    company_id: str
-    metric: str
-    unit: str
-    n: int  # sample count BEFORE outlier trimming — what maturity gates on
-    median: float  # of the outlier-trimmed observations
-    mean: float  # trend-adjusted "right now" estimate, not a flat historical average
-    std: float  # of the outlier-trimmed observations
-    trend_per_period: float = 0.0  # slope: metric units per observation, oldest -> newest
-    maturity: str = "insufficient"  # insufficient | learning | stable | unmeasurable, gated on n
-    window_days: int
-    computed_at: datetime
-    scope: str = "business"  # "business" (customer rhythms) | "system" (self-monitoring)
-
-
-# ---------------------------------------------------------------------------
-# Alert layer — situations, briefs, delivery.
-# ---------------------------------------------------------------------------
-
-
-class Evidence(BaseModel):
-    """One cited fact backing a situation."""
-
-    event_id: str
-    source: str
-    timestamp: datetime
-    excerpt: str
-    url: str | None = None
-
-
-class Choice(BaseModel):
-    """One option on a clarification situation — a genuine fork, not a nudge.
-
-    ``effect`` is a small closed vocabulary the core dispatches generically
-    (like a move's `kind`): "reset_norm" | "disable_source" | "snooze" | "none".
-    ``effect_args`` carries whatever that effect needs (e.g. {"metric": ...}).
-    """
-
-    id: str
-    label: str
-    effect: str = "none"
-    effect_args: dict[str, Any] = Field(default_factory=dict)
-
-
-class Situation(BaseModel):
-    id: str
-    company_id: str
-    rule: str
-    severity: str  # low | medium | high | critical
-    title: str
-    summary: str = ""
-    recommended_action: str | None = None
-    evidence: list[Evidence] = Field(default_factory=list)
-    status: str = "open"  # open | delivered | acknowledged | resolved
-    created_at: datetime
-    resolved_at: datetime | None = None
-    kind: str = "business"  # business | system (hidden by default) | clarification
-    choices: list[Choice] | None = None  # only set for kind="clarification"
-    resolved_choice: str | None = None  # the Choice.id the user picked
-    resolved_by: str | None = None
-    snoozed_until: datetime | None = None  # a "remind me later" choice sets this
-    # Line-anchored review findings (all None on an ordinary thing-level
-    # situation). When a reviewer concern pins a defect to a spot in a diff,
-    # these carry it, so act() can post an INLINE review comment rather than a
-    # top-level one, and the feed can show the exact location. `confidence` is
-    # the reviewer's own certainty, which the autonomy gate reads; `category`
-    # is the concern's free-text label ("injection", "missing-test").
-    file_path: str | None = None
-    line_start: int | None = None
-    line_end: int | None = None
-    confidence: float | None = None
-    category: str | None = None
-
-
-class ActionLink(BaseModel):
-    """A one-click button rendered into a delivered brief (e.g. an email)."""
-
-    label: str
-    url: str
-    primary: bool = False
-
-
-class Brief(BaseModel):
-    situation_id: str
-    title: str
-    severity: str
-    summary: str
-    recommended_action: str | None = None
-    evidence: list[Evidence] = Field(default_factory=list)
-    citations: list[str] = Field(default_factory=list)
-    assigned_to: str | None = None
-    action_links: list[ActionLink] = Field(default_factory=list)
-    note: str = ""  # extra context rendered above the buttons
-    # A stable "company:situation" tag stamped into the subject so a REPLY to
-    # this email can be correlated back (the reply echoes the subject). This is
-    # what lets a lead answer "give it to Bob instead" and have the system act.
-    reply_ref: str = ""
-
-
-class AssigneeDecision(BaseModel):
-    """Who the agent picked to own the work, and how sure it is."""
-
-    assignee: str  # a candidate id, or "none"
-    confidence: float = 0.0
-    rationale: str = ""
-
-
-class DeliveryReceipt(BaseModel):
-    situation_id: str
-    channel: str
-    recipient: str
-    status: str
-    delivered_at: datetime
-
-
-# ---------------------------------------------------------------------------
-# Review layer — grounded specialist fan-out over a Thing's content.
-# A reviewer reads one Thing (a PR diff, a receiving report) through several
-# concerns at once and returns structured Findings. All DATA-driven: what the
-# concerns are, and their prompts, come from the profile/connector — core names
-# no concern. Findings become line-anchored Situations (see Situation above).
-# ---------------------------------------------------------------------------
-
-
-class ReviewerConcern(BaseModel):
-    """One specialist pass — the blog's "security / quality / tests / docs",
-    but named by DATA, never by core. ``prompt`` is the instruction handed to
-    the model alongside the grounded context; ``severity_ceiling`` caps how
-    loud this concern is allowed to be (a docs nit can't claim `critical`)."""
-
-    key: str
-    prompt: str = ""
-    severity_ceiling: str = "critical"  # critical | high | medium | low | info
-
-
-class Reviewer(BaseModel):
-    """A grounded reviewer, expressed as profile/connector data.
-
-    ``select`` picks the Things to review (same selector grammar watchers use:
-    ``thing_type`` + ``where``). ``ground`` says how to build context —
-    ``attach`` names connector fields to fold in (changed_paths, commits,
-    thread) and ``retrieve`` tunes the hybrid search neighbours. ``concerns``
-    is the fan-out. ``post`` names the move to act through and the autonomy
-    gate — which, until we've proven review quality, stays closed so nothing
-    reaches a real repo without a human.
-    """
-
-    key: str
-    select: dict[str, Any] = Field(default_factory=dict)
-    ground: dict[str, Any] = Field(default_factory=dict)
-    concerns: list[ReviewerConcern] = Field(default_factory=list)
-    post: dict[str, Any] = Field(default_factory=dict)
-
-
-class Finding(BaseModel):
-    """The fixed output contract of every concern — deciding this shape up
-    front is what lets dedup, gating and posting stay deterministic.
-
-    A finding WITH file/line anchors becomes an inline review comment; without
-    them it is a thing-level situation. ``confidence`` drives the autonomy
-    gate; ``rationale`` is the cited evidence the model must supply so a
-    finding can be traced, not just asserted.
-    """
-
-    reviewer_key: str
-    concern: str
-    thing_id: str
-    source: str = ""
-    severity: str = "low"  # critical | high | medium | low | info
-    category: str = ""
-    title: str = ""
-    file_path: str | None = None
-    line_start: int | None = None
-    line_end: int | None = None
-    confidence: float = 0.0
-    rationale: str = ""
-    suggestion: str = ""
-
-
-# ---------------------------------------------------------------------------
-# Act layer — actions with human-approval gating.
-# ---------------------------------------------------------------------------
-
-
-class ActionRequest(BaseModel):
-    company_id: str
-    action: str
-    params: dict[str, Any] = Field(default_factory=dict)
-    situation_id: str | None = None
-    requested_by: str = "system"
-
-
-class ActionDecision(BaseModel):
-    """What the agent decided to do about a situation, and how sure it is."""
-
-    action: str  # a registered action name, or "escalate"
-    argument: str = ""  # opaque payload the vertical maps into action params
-    confidence: float = 0.0  # 0..1
-    rationale: str = ""
-
-
-class ActionResult(BaseModel):
-    id: int | None = None
-    action: str
-    # pending_approval | executed | recorded | dry_run | rejected | failed
-    #   executed = a real external system was contacted
-    #   recorded = a `log` move: intent captured, nothing left the building
-    status: str
-    detail: str = ""
-    result: dict[str, Any] = Field(default_factory=dict)
-
-
-class Connection(BaseModel):
-    company_id: str
-    source: str
-    connected: bool
-    config: dict[str, Any] = Field(default_factory=dict)
-    created_at: datetime | None = None
-
-
-class Ticket(BaseModel):
-    """A concrete piece of work someone owns."""
-
-    id: int | None = None
-    company_id: str = "default"
-    situation_id: str | None = None
-    title: str
-    description: str = ""
-    assignee: str
-    status: str = "open"  # open | done
-    source_event_id: str | None = None
-    external_url: str | None = None
-    created_at: datetime | None = None
-    closed_at: datetime | None = None
-
-
-class Message(BaseModel):
-    """One turn in a conversation. ``artifacts`` carries structured inline
-    blocks — a clarification, an evidence block, an approval request — the
-    same pattern regardless of which situation produced them."""
-
-    id: int | None = None
-    conversation_id: int
-    role: str  # user | agent | system
-    content: str = ""
-    artifacts: list[dict[str, Any]] = Field(default_factory=list)
-    created_at: datetime | None = None
-
-
-class Conversation(BaseModel):
-    id: int | None = None
-    company_id: str
-    title: str | None = None
-    created_at: datetime | None = None
-    updated_at: datetime | None = None
-
-
-class TeamMember(BaseModel):
-    """A person the system can notify or assign work to."""
-
-    id: str  # the source login used to assign (e.g. GitHub username)
-    name: str
-    email: str
-    roles: list[str] = Field(default_factory=list)
-    skills: list[str] = Field(default_factory=list)
-    max_open_issues: int = 3
-    assignable: bool = True
-
-
-# --------------------------------------------------------------------------
-# Workflows — saved agentic plans (Phase 2).
-# --------------------------------------------------------------------------
-
-
-class WorkflowStep(BaseModel):
-    """One step of a compiled plan. ``tool``/``args`` map onto a tool the agent
-    already has, so a plan can never propose something the engine can't do.
-    ``acts_live`` marks a step that performs a REAL outward action on a
-    connected tool (a comment, a label, a merge) when the workflow runs — as
-    opposed to a read step. A saved workflow runs autonomously and for real
-    (see apps.common.workflows_flow), so this is what the review UI uses to
-    show, before anyone enables it, which steps will actually touch GitHub.
-
-    ``select`` makes a run_action step DYNAMIC: instead of a fixed
-    ``args.situation_id`` captured when the plan was written, the step targets
-    every currently-open situation matching the selector, resolved fresh at run
-    time. This is what lets a saved/scheduled workflow ("label all unassigned
-    bugs each morning") act on today's items, not the ones that happened to be
-    open the day it was planned. Selector keys are generic: ``rule`` (a
-    watcher/profile rule name) and/or ``severity``."""
-
-    tool: str
-    args: dict[str, Any] = Field(default_factory=dict)
-    description: str = ""  # plain-language "what this step does", for the review UI
-    acts_live: bool = False  # performs a real outward action when the workflow runs
-    select: dict[str, Any] | None = None  # run-action fan-out target, resolved at run time
-    enabled: bool = True  # a disabled node is kept in the graph but skipped at run time
-
-
-class WorkflowTrigger(BaseModel):
-    """What starts a workflow — the n8n 'trigger node'. Three kinds:
-      manual   — a human hits Run. config: {}
-      schedule — a cron cadence.     config: {"cron": "0 9 * * *", "label": "every morning"}
-      event    — a raised situation matches. config: {"rule"?: str, "severity"?: str}
-    All three fire: manual from the UI, schedule from a once-a-minute cron scan,
-    event from a detection pass (apps.common.triggers). Unattended runs take the
-    same gated path a manual one does — dry-run brake plus allowlist."""
-
-    type: str = "manual"  # manual | schedule | event
-    config: dict[str, Any] = Field(default_factory=dict)
-
-
-class Workflow(BaseModel):
-    id: int | None = None
-    company_id: str
-    name: str
-    goal: str  # the natural-language intent the plan was compiled from
-    steps: list[WorkflowStep] = Field(default_factory=list)
-    trigger: WorkflowTrigger = Field(default_factory=WorkflowTrigger)
-    enabled: bool = True
-    created_by: str = "ui"
-    created_at: datetime | None = None
-    updated_at: datetime | None = None
-    last_run_at: datetime | None = None
-
-
-class WorkflowStepResult(BaseModel):
-    """What actually happened when a step ran — the honest receipt, distinct
-    from the plan's intent. ``status`` mirrors act()'s vocabulary for action
-    steps (executed | dry_run | pending_approval | recorded | failed) and is
-    "done"/"failed" for read/control steps."""
-
-    tool: str
-    args: dict[str, Any] = Field(default_factory=dict)
-    status: str
-    detail: str = ""
-    result: dict[str, Any] = Field(default_factory=dict)
-
-
-class WorkflowRun(BaseModel):
-    id: int | None = None
-    workflow_id: int
-    company_id: str
-    status: str = "running"  # planning | running | needs_approval | done | failed
-    trigger: str = "manual"  # what caused THIS run: manual | scheduled | event
-    step_results: list[WorkflowStepResult] = Field(default_factory=list)
-    summary: str = ""
-    started_at: datetime | None = None
-    finished_at: datetime | None = None
-
-
-class WorkflowPlan(BaseModel):
-    """The planner's output before anything is saved or run: the proposed
-    trigger + steps plus any questions that must be answered first. A plan with
-    open ``clarifications`` is not runnable — it asks at creation time, when the
-    person has the context, rather than guessing (the question-budget rule)."""
-
-    goal: str
-    name: str  # a short suggested name for the workflow
-    trigger: WorkflowTrigger = Field(default_factory=WorkflowTrigger)
-    steps: list[WorkflowStep] = Field(default_factory=list)
-    clarifications: list[str] = Field(default_factory=list)
