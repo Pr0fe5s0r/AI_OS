@@ -88,7 +88,7 @@ def title_from(body: str, filename: str) -> str:
 class TextParser:
     """Markdown and plain text — already canonical, only tidied."""
 
-    extensions = (".md", ".markdown", ".txt", ".text")
+    extensions: tuple[str, ...] = (".md", ".markdown", ".txt", ".text")
 
     def parse(self, data: bytes, filename: str) -> Normalised:
         body = tidy(data.decode("utf-8", errors="replace"))
@@ -102,7 +102,7 @@ class PdfParser:
     a page number is the most useful anchor a PDF can offer for that.
     """
 
-    extensions = (".pdf",)
+    extensions: tuple[str, ...] = (".pdf",)
 
     def parse(self, data: bytes, filename: str) -> Normalised:
         try:
@@ -134,7 +134,130 @@ class PdfParser:
         )
 
 
-_REGISTRY: list[Parser] = [TextParser(), PdfParser()]
+class DocxParser:
+    """Word documents, in document order.
+
+    A .docx is a zip of XML, so this needs no dependency: the standard library
+    can open both. Only the parts that survive conversion to Markdown are read
+    — headings, paragraphs, list items and tables. Fonts, colours, comments and
+    tracked changes are dropped, because none of them is content a query could
+    ever match on.
+
+    Order matters more than it looks: paragraphs and tables interleave in the
+    body, so the children of <w:body> are walked in sequence rather than
+    collecting all paragraphs and then all tables, which would silently
+    rearrange a document whose tables carry the substance.
+    """
+
+    extensions: tuple[str, ...] = (".docx",)
+
+    _NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    _CORE = "{http://purl.org/dc/elements/1.1/}"
+
+    def _text_of(self, node: Any) -> str:
+        """The visible text of a paragraph or cell.
+
+        Tabs and line breaks are elements, not characters, so they are turned
+        back into whitespace — otherwise two columns of a tabbed layout fuse
+        into one unreadable word.
+        """
+        out: list[str] = []
+        for el in node.iter():
+            tag = el.tag
+            if tag == f"{self._NS}t":
+                out.append(el.text or "")
+            elif tag in (f"{self._NS}tab", f"{self._NS}br"):
+                out.append(" ")
+        return "".join(out).strip()
+
+    def _paragraph(self, node: Any) -> str:
+        text = self._text_of(node)
+        if not text:
+            return ""
+
+        props = node.find(f"{self._NS}pPr")
+        style = ""
+        if props is not None:
+            named = props.find(f"{self._NS}pStyle")
+            if named is not None:
+                style = (named.get(f"{self._NS}val") or "").lower()
+            if props.find(f"{self._NS}numPr") is not None:
+                return f"- {text}"
+
+        if style.startswith("heading"):
+            # "Heading2" -> "##". Depth is clamped so a document using
+            # Heading9 does not emit markup no renderer honours.
+            digits = "".join(c for c in style if c.isdigit())
+            level = min(int(digits), 6) if digits else 1
+            return f"{'#' * level} {text}"
+        if style in ("title", "subtitle"):
+            return f"# {text}"
+        return text
+
+    def _table(self, node: Any) -> str:
+        """A table as pipe rows, with a header separator after the first row.
+
+        Retrieval reads the flattened text, but a person reading the stored
+        Markdown should still be able to tell which value sat in which column.
+        """
+        rows: list[str] = []
+        for tr in node.findall(f"{self._NS}tr"):
+            cells = [
+                self._text_of(tc).replace("|", "\\|").replace("\n", " ")
+                for tc in tr.findall(f"{self._NS}tc")
+            ]
+            if not any(cells):
+                continue
+            rows.append("| " + " | ".join(cells) + " |")
+            if len(rows) == 1:
+                rows.append("| " + " | ".join("---" for _ in cells) + " |")
+        return "\n".join(rows)
+
+    def parse(self, data: bytes, filename: str) -> Normalised:
+        import io
+        import zipfile
+        from xml.etree import ElementTree
+
+        try:
+            archive = zipfile.ZipFile(io.BytesIO(data))
+            document = archive.read("word/document.xml")
+        except (zipfile.BadZipFile, KeyError) as exc:
+            # A .doc renamed to .docx, or a corrupt file. Saying so is more
+            # use than a stack trace about a missing zip entry.
+            raise UnsupportedFormat(
+                f"{filename} is not a readable Word document "
+                "(the legacy .doc format is not supported — re-save it as .docx)"
+            ) from exc
+
+        root = ElementTree.fromstring(document)
+        body = root.find(f"{self._NS}body")
+        blocks: list[str] = []
+        for child in list(body) if body is not None else []:
+            if child.tag == f"{self._NS}p":
+                blocks.append(self._paragraph(child))
+            elif child.tag == f"{self._NS}tbl":
+                blocks.append(self._table(child))
+
+        text = tidy("\n\n".join(b for b in blocks if b))
+        if not text:
+            raise UnsupportedFormat(f"no extractable text in {filename}")
+
+        declared = ""
+        try:
+            core = ElementTree.fromstring(archive.read("docProps/core.xml"))
+            found = core.find(f"{self._CORE}title")
+            declared = (found.text or "").strip() if found is not None else ""
+        except (KeyError, ElementTree.ParseError):
+            declared = ""
+
+        return Normalised(
+            title=declared[:200] or title_from(text, filename),
+            body=text,
+            metadata={"format": "docx"},
+        )
+
+
+_REGISTRY: list[Parser] = [TextParser(), PdfParser(), DocxParser()]
 
 
 def register(parser: Parser) -> None:
@@ -156,6 +279,16 @@ def _parser_for(filename: str) -> Parser:
     )
 
 
+def can_parse(filename: str) -> bool:
+    """Is there a parser for this name?
+
+    Exists so the API can refuse an unreadable file while the caller is still
+    listening, instead of accepting it and failing in a worker whose reason
+    nobody ever sees.
+    """
+    return filename.lower().endswith(supported())
+
+
 def normalise(data: bytes, filename: str) -> Normalised:
     """Bytes -> Markdown. The single entry point for file content."""
     return _parser_for(filename).parse(data, filename)
@@ -173,9 +306,13 @@ def normalise_text(body: str, title: str | None = None, source_name: str = "text
 
 
 __all__ = [
+    "DocxParser",
     "Normalised",
     "Parser",
+    "PdfParser",
+    "TextParser",
     "UnsupportedFormat",
+    "can_parse",
     "normalise",
     "normalise_text",
     "register",

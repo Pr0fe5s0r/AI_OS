@@ -8,6 +8,7 @@ from packages.core.store import (
     list_items,
     mark_failed,
     put_item,
+    record_failure,
 )
 from packages.shared.schema import Item, Lifecycle, SourceRef
 from tests.conftest import COLL_A, COLL_B, OTHER, SCOPE
@@ -177,3 +178,34 @@ async def test_a_failure_is_recorded_not_swallowed(db):
     failed = await list_items(db, SCOPE, status=Lifecycle.FAILED)
     assert len(failed) == 1
     assert failed[0].metadata["failure"] == "no text layer"
+
+
+async def test_a_first_failure_leaves_a_row_to_look_at(db):
+    """A file that never parsed had no row at all, so the only record of why
+    was the job's return value — which nothing reads."""
+    source = SourceRef(source="upload", locator="broken.docx")
+    await record_failure(db, SCOPE, source, "broken.docx", "not a readable Word document")
+    await db.commit()
+
+    failed = await list_items(db, SCOPE, status=Lifecycle.FAILED)
+    assert len(failed) == 1
+    assert failed[0].metadata["failure"] == "not a readable Word document"
+    assert failed[0].body == ""  # nothing was extracted, so nothing is claimed
+
+
+async def test_a_bad_re_upload_does_not_delete_a_good_document(db):
+    """A document that indexed cleanly must not vanish from search because
+    someone re-uploaded a corrupt copy of it."""
+    good = await put_item(db, item("real content", locator="report.pdf"))
+    await db.commit()
+
+    await record_failure(
+        db, SCOPE, SourceRef(source="upload", locator="report.pdf"), "report.pdf", "no text layer"
+    )
+    await db.commit()
+
+    still_there = await get_item(db, SCOPE, good.item.id)
+    assert still_there is not None
+    assert still_there.body == "real content"
+    assert still_there.metadata["failure"] == "no text layer"  # said, not silent
+    assert await list_items(db, SCOPE, status=Lifecycle.FAILED) == []

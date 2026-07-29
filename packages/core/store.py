@@ -324,6 +324,65 @@ async def mark_failed(
     )
 
 
+async def record_failure(
+    session: AsyncSession, scope: Scope, source: SourceRef, title: str, reason: str
+) -> str:
+    """An ingest that could not produce content, written down where it shows.
+
+    Two rules, and the second is the one that matters:
+
+    A first attempt leaves a row at status `failed`, so the collection's failed
+    count moves and the reason is readable. Without it the only record was the
+    job's return value, which nothing reads — the console could say the file
+    was "not searchable yet" and never why.
+
+    A repeat attempt does NOT touch the version already held. A document that
+    indexed cleanly last week must not vanish from search because someone
+    re-uploaded a corrupt copy of it today; the failure is stamped on the
+    active row instead, and the content survives.
+    """
+    item_id = stable_item_id(scope, source)
+    current = (
+        await session.execute(
+            _CURRENT,
+            {"workspace": scope.workspace_id, "item_id": item_id, "active": Lifecycle.ACTIVE},
+        )
+    ).first()
+
+    if current is not None:
+        await session.execute(
+            text(
+                """
+                UPDATE kb_items
+                SET metadata = metadata || jsonb_build_object('failure', CAST(:reason AS text)),
+                    updated_at = now()
+                WHERE workspace_id = :workspace AND item_id = :item_id AND version = :version
+                """
+            ),
+            {
+                "reason": reason, "workspace": scope.workspace_id,
+                "item_id": item_id, "version": current.version,
+            },
+        )
+        return item_id
+
+    await session.execute(
+        _INSERT,
+        {
+            "item_id": item_id, "version": 1,
+            "workspace": scope.workspace_id, "collection": scope.collection_id,
+            "title": title, "body": "", "source": source.source,
+            "locator": source.locator, "url": source.url,
+            # No content means no hash worth keeping: a later, readable upload
+            # of the same file must not be mistaken for unchanged.
+            "hash": "", "supersedes": None, "status": Lifecycle.FAILED,
+            "created_at": datetime.now(UTC), "period_start": None, "period_end": None,
+            "metadata": json.dumps({"failure": reason}),
+        },
+    )
+    return item_id
+
+
 __all__ = [
     "PutResult",
     "content_hash",
@@ -333,5 +392,6 @@ __all__ = [
     "list_items",
     "mark_failed",
     "put_item",
+    "record_failure",
     "stable_item_id",
 ]

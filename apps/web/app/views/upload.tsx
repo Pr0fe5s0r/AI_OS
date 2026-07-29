@@ -51,6 +51,20 @@ export function Upload({
       await new Promise((r) => setTimeout(r, 1200));
       const docs = await api.documents(collectionId, 200).catch(() => []);
       const found = docs.find((d) => d.locator === locator);
+
+      if (!found) {
+        // Not there yet — but it may never be. Parsing happens in a worker, so
+        // the reason a file was unreadable arrives after the upload returned;
+        // without this the row just span until it timed out saying nothing.
+        const failed = (await api.failures(collectionId).catch(() => [])).find(
+          (f) => f.locator === locator
+        );
+        if (failed) {
+          mark(name, "failed", failed.reason);
+          return false;
+        }
+      }
+
       if (found) {
         // Filing runs after the write, so wait a beat longer for categories
         // rather than showing every new document as uncategorised forever.
@@ -60,7 +74,7 @@ export function Upload({
         }
       }
     }
-    mark(name, "failed", "accepted, but not searchable yet — check the collection");
+    mark(name, "failed", "still indexing after 20s — it may yet appear in the collection");
     return false;
   }
 
@@ -152,6 +166,9 @@ export function Upload({
         ref={fileRef}
         type="file"
         multiple
+        // The picker greys out what the store cannot read, so an unreadable
+        // file is refused before it is chosen rather than after it is sent.
+        accept={formats.join(",")}
         className="sr-only"
         onChange={(e) => send(e.target.files)}
       />

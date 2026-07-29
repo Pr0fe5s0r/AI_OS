@@ -276,6 +276,25 @@ export async function documents(
   return payload.items.map(toDoc);
 }
 
+/** Ingests that produced no content, and the reason each gave.
+ *
+ *  Kept separate from `documents` because a failure is not a document: it must
+ *  never appear in the library or be retrievable. It exists so the person who
+ *  uploaded the file can be told what went wrong instead of watching a spinner
+ *  time out. */
+export async function failures(
+  collectionId: string | undefined
+): Promise<{ locator: string; reason: string }[]> {
+  const payload = await call<{ items: (RawDoc & { metadata?: { failure?: string } })[] }>(
+    "/api/items?status=failed&limit=50",
+    { collection: collectionId }
+  );
+  return payload.items.map((i) => ({
+    locator: i.source?.locator || "",
+    reason: i.metadata?.failure || "could not be read",
+  }));
+}
+
 export type SearchOutcome = {
   matches: Point[];
   traceId: string;

@@ -29,6 +29,7 @@ export function Collections({
 }) {
   const [detail, setDetail] = useState<CollectionDetail | null>(null);
   const [docs, setDocs] = useState<Document[] | null>(null);
+  const [failed, setFailed] = useState<{ locator: string; reason: string }[]>([]);
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState("");
   const [view, setView] = useState<"graph" | "map" | "table">("graph");
@@ -44,14 +45,17 @@ export function Collections({
     }
     setDetail(null);
     setDocs(null);
+    setFailed([]);
     (async () => {
-      const [d, items] = await Promise.all([
+      const [d, items, bad] = await Promise.all([
         api.collection(selected),
         api.documents(selected, 100),
+        api.failures(selected).catch(() => []),
       ]);
       if (!live) return;
       setDetail(d);
       setDocs(items);
+      setFailed(bad);
     })();
     return () => {
       live = false;
@@ -163,6 +167,29 @@ export function Collections({
                 tone={detail.stats.failed ? "text-danger" : undefined}
               />
             </Card>
+
+            {/* A count with no reason is the same defect as no count at all:
+                the person who uploaded the file still cannot tell what to fix. */}
+            {failed.length > 0 && (
+              <Card className="mb-5 border-danger/30 bg-danger/5 p-4">
+                <Label className="mb-2 block text-danger">
+                  {failed.length} file{failed.length > 1 ? "s" : ""} could not be read
+                </Label>
+                <div className="space-y-1.5">
+                  {failed.map((f) => (
+                    <div key={f.locator} className="flex flex-wrap items-baseline gap-x-2">
+                      <Mono className="text-xs text-ink">{f.locator}</Mono>
+                      <span className="text-2xs text-muted">{f.reason}</span>
+                    </div>
+                  ))}
+                </div>
+                <p className="mt-2.5 text-2xs text-subtle">
+                  Nothing was indexed from these, so they cannot be retrieved. Fix the file
+                  and upload it again — it will land on the same record rather than adding
+                  a second one.
+                </p>
+              </Card>
+            )}
 
             <div className="mb-2 flex items-center justify-between">
               <Label>

@@ -11,7 +11,7 @@ from packages.core import graph
 from packages.core.db import Session
 from packages.core.llm import embed
 from packages.core.normalise import Normalised, UnsupportedFormat, normalise, normalise_text
-from packages.core.store import get_item, mark_failed, put_item, stable_item_id
+from packages.core.store import get_item, put_item, record_failure, stable_item_id
 from packages.shared.schema import Item, Scope, SourceRef
 
 # ---------------------------------------------------------------------------
@@ -103,12 +103,9 @@ async def ingest_file(
     except UnsupportedFormat as exc:
         # Visible and re-runnable, never silent. The item id is deterministic,
         # so a later retry lands on the same row rather than orphaning this one.
-        item_id = stable_item_id(scope, ref)
         async with Session() as session:
-            existing = await get_item(session, scope, item_id)
-            if existing is not None:
-                await mark_failed(session, scope, item_id, existing.version, str(exc))
-                await session.commit()
+            item_id = await record_failure(session, scope, ref, filename, str(exc))
+            await session.commit()
         return {"item_id": item_id, "outcome": "failed", "reason": str(exc)}
 
     return await _store(ctx, scope, ref, parsed, period_start, period_end, metadata, suggested)

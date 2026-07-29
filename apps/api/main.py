@@ -33,7 +33,7 @@ from packages.core.collections import (
 from packages.core.db import Session
 from packages.core.keys import create_key, list_keys, revoke_key
 from packages.core.neighbours import collection_graph
-from packages.core.normalise import supported
+from packages.core.normalise import can_parse, supported
 from packages.core.pipeline import redis_settings
 from packages.core.search import RetrievalConfig, search_traced
 from packages.core.snippets import build as build_snippets
@@ -145,6 +145,15 @@ async def ingest_file_item(
     data = await file.read()
     if not data:
         raise HTTPException(400, "Empty file.")
+
+    # Refuse here rather than in the worker. Accepting a file we have no parser
+    # for produced the worst of both: the upload reported success, indexing
+    # failed in a job whose reason nobody reads, and the console could only say
+    # the document was "not searchable yet" — which sounds like a delay.
+    if not can_parse(filename):
+        raise HTTPException(
+            415, f"Cannot read {filename}. Supported formats: {', '.join(supported())}"
+        )
 
     job = await app.state.queue.enqueue_job(
         "ingest_file",
