@@ -37,6 +37,11 @@ _TABLES: tuple[tuple[str, str], ...] = (
     ("kb_item_classes", "workspace_id"),
     ("kb_classes", "workspace_id"),
     ("kb_items", "workspace_id"),
+    # A trace holds the query someone typed, which is frequently more
+    # revealing than the documents it searched. Leaving these behind meant a
+    # workspace could be reported fully erased while the questions it asked
+    # were still readable in the table.
+    ("query_traces", "workspace_id"),
     ("collections", "workspace_id"),
     ("clusters", "workspace_id"),
     ("api_keys", "workspace_id"),
@@ -210,6 +215,17 @@ async def _anonymize_audit_log(session: AsyncSession, company_id: str) -> int:
 
 async def _delete_postgres(session: AsyncSession, company_id: str, audit_policy: str) -> dict[str, int]:
     counts: dict[str, int] = {}
+
+    # Read before the company row goes: deleting it cascades the memberships,
+    # and after that there is no way to tell which accounts belonged to it.
+    members = list(
+        (
+            await session.execute(
+                text("SELECT user_id FROM memberships WHERE company_id = :c"), {"c": company_id}
+            )
+        ).scalars()
+    )
+
     for table, column in _TABLES:
         result = await session.execute(
             text(f"DELETE FROM {table} WHERE {column} = :c"),  # noqa: S608 (table and column come from the fixed _TABLES tuple, never user input)
@@ -225,6 +241,29 @@ async def _delete_postgres(session: AsyncSession, company_id: str, audit_policy:
 
     result = await session.execute(text("DELETE FROM companies WHERE id = :c"), {"c": company_id})
     counts["companies"] = int(cast(CursorResult, result).rowcount or 0)
+
+    # Memberships go with the company by cascade, which can leave an account
+    # belonging to nothing — still holding an email address, still able to
+    # sign in, with no workspace to sign in to.
+    #
+    # Restricted to this company's own members on purpose. Deleting every
+    # account with no membership would reach outside the workspace being
+    # erased and take an unrelated one with it — a half-finished
+    # registration, say, whose membership has not been written yet. Someone
+    # who also belongs to another workspace keeps their account.
+    counts["orphaned_users"] = 0
+    if members:
+        result = await session.execute(
+            text(
+                """
+                DELETE FROM users
+                WHERE id = ANY(:ids)
+                  AND NOT EXISTS (SELECT 1 FROM memberships m WHERE m.user_id = users.id)
+                """
+            ),
+            {"ids": members},
+        )
+        counts["orphaned_users"] = int(cast(CursorResult, result).rowcount or 0)
     return counts
 
 
