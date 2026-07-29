@@ -30,6 +30,25 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * Told when the store stops recognising us.
+ *
+ * A session can end long after the page loaded — it expires, a key is revoked,
+ * the workspace is deleted. The shell only checked identity once on mount, so
+ * when that happened the console carried on rendering against dead
+ * credentials and every action failed with "Not signed in" while the sidebar
+ * still showed a workspace. One 401 anywhere is the answer to "are we still
+ * signed in?", so it is handled here rather than at each of the callers.
+ */
+let onLost: (() => void) | null = null;
+export const onUnauthorized = (fn: (() => void) | null) => {
+  onLost = fn;
+};
+
+// Signing in is allowed to fail with a 401 — wrong password is not a lost
+// session, and treating it as one would wipe the message explaining itself.
+const IS_AUTH = (path: string) => path.startsWith("/api/auth/");
+
 async function call<T>(path: string, init?: RequestInit & { collection?: string }): Promise<T> {
   const { collection, ...rest } = init || {};
   const headers: Record<string, string> = {};
@@ -51,6 +70,7 @@ async function call<T>(path: string, init?: RequestInit & { collection?: string 
     } catch {
       /* not a JSON error body */
     }
+    if (res.status === 401 && !IS_AUTH(path)) onLost?.();
     throw new ApiError(res.status, detail);
   }
   return res.status === 204 ? (undefined as T) : ((await res.json()) as T);

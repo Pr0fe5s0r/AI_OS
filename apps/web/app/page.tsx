@@ -56,6 +56,19 @@ export default function Page() {
     check();
   }, [check]);
 
+  // A session can end while the page is open. Without this the console kept
+  // rendering a workspace it could no longer read, and every action failed
+  // with "Not signed in" beside a sidebar still showing who you were.
+  useEffect(() => {
+    api.onUnauthorized(() => {
+      setMe(null);
+      setClusters(null);
+      setClusterId(null);
+      setCollectionId(null);
+    });
+    return () => api.onUnauthorized(null);
+  }, []);
+
   if (me === undefined) {
     return (
       <main className="flex h-screen items-center justify-center bg-canvas">
