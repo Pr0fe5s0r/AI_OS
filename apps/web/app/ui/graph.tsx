@@ -39,6 +39,12 @@ export type GraphNode = {
   itemId?: string;
   ordinal?: number;
   document?: string;
+  /** "summary" means the text was written by a model from other passages, not
+   *  lifted from a document. Drawn differently because it is a different kind
+   *  of claim. */
+  nodeType?: string;
+  /** 1 raw · 2 connected · 3 working-memory hub · 4 long-term. */
+  stage?: number;
   /** Position in embedding space, 0..1, from the projection. Unlike the force
    *  layout these coordinates carry meaning, so distance can be read. */
   px?: number | null;
@@ -178,6 +184,8 @@ function layout(nodes: GraphNode[], edges: GraphEdge[]): Placed[] {
     itemId: p.itemId,
     ordinal: p.ordinal,
     document: p.document,
+    nodeType: p.nodeType,
+    stage: p.stage,
     // Rounded, because these become SVG attributes and a server/client float
     // disagreement in the last digit is a hydration mismatch per node.
     x: round(p.x * scale + offsetX),
@@ -352,6 +360,19 @@ export function CollectionGraph({
                     stroke="#070809"
                     strokeWidth="1.2"
                   />
+                  {/* A summary is text a model wrote. It gets a ring so it is
+                      never mistaken for a passage from a document. */}
+                  {p.nodeType === "summary" && (
+                    <circle
+                      cx={p.x}
+                      cy={p.y}
+                      r={p.r + 3.5}
+                      fill="none"
+                      stroke="#f5c451"
+                      strokeWidth="1.4"
+                      opacity={0.9}
+                    />
+                  )}
                 </g>
               );
             })}
@@ -409,6 +430,15 @@ export function CollectionGraph({
             </svg>
             same document
           </span>
+          {nodes.some((n) => n.nodeType === "summary") && (
+            <span className="flex items-center gap-1.5 font-mono text-2xs text-subtle">
+              <svg width="12" height="12">
+                <circle cx="6" cy="6" r="3" fill="#5b6673" />
+                <circle cx="6" cy="6" r="5" fill="none" stroke="#f5c451" strokeWidth="1.2" />
+              </svg>
+              written by the store
+            </span>
+          )}
         </span>
       </div>
     </div>

@@ -90,7 +90,8 @@ async def for_item(session: AsyncSession, scope: Scope, item_id: str) -> list[St
             text(
                 """
                 SELECT chunk_id, item_id, ordinal, heading, text FROM kb_chunks
-                WHERE workspace_id = :w AND item_id = :i ORDER BY ordinal
+                WHERE workspace_id = :w AND item_id = :i AND archived_at IS NULL
+                ORDER BY ordinal
                 """
             ),
             {"w": scope.workspace_id, "i": item_id},
@@ -142,6 +143,10 @@ async def keyword_search(
                        ) AS excerpt
                 FROM kb_chunks
                 WHERE workspace_id = :w {collection_clause}
+                  -- Archived nodes are out of retrieval. Consolidation has
+                  -- already decided they are superseded or decaying, and
+                  -- answering from them would contradict that.
+                  AND archived_at IS NULL
                   AND content_tsv @@ websearch_to_tsquery('english', :q)
                 ORDER BY score DESC
                 LIMIT :limit
@@ -165,7 +170,8 @@ async def count_for(session: AsyncSession, scope: Scope) -> int:
         (
             await session.execute(
                 text(
-                    f"SELECT count(*) FROM kb_chunks WHERE workspace_id = :w {clause}"  # noqa: S608
+                    "SELECT count(*) FROM kb_chunks WHERE workspace_id = :w "  # noqa: S608
+                    f"AND archived_at IS NULL {clause}"
                 ),
                 {"w": scope.workspace_id, "c": scope.collection_id},
             )

@@ -122,7 +122,7 @@ async def collection_graph(
     connected they are, and computing that in the browser would mean shipping
     the edge list twice.
     """
-    points = await graph.collection_chunk_vectors(scope, limit=limit)
+    points = await graph.collection_chunk_vectors(scope, limit=limit, live_only=True)
     if not points:
         return {
             "nodes": [], "edges": [], "truncated": False, "k": k, "floor": 0.0,
@@ -165,6 +165,11 @@ async def collection_graph(
             "id": p["id"],
             "itemId": p["item_id"],
             "ordinal": p["ordinal"],
+            # fact | summary, and 1..4 for how far consolidation has carried
+            # it. A summary is text a model wrote, so the view has to be able
+            # to say so rather than drawing it like any other passage.
+            "nodeType": p.get("node_type", "fact"),
+            "stage": p.get("stage", 1),
             # What the passage is: its heading path, falling back to the
             # document title for a passage above the first heading.
             "title": p["heading"] or p["title"] or "",

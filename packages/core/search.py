@@ -385,6 +385,14 @@ async def search_traced(
         )
     trace.timings_ms["hydrate"] = elapsed(mark)
 
+    # What gets used survives; what is never used decays. Retrieval is the only
+    # evidence the store has about which passages matter, so it is recorded
+    # here — after fusion, so a passage that was fetched and then filtered out
+    # does not count as used.
+    from packages.core.consolidate import touch
+
+    await touch(session, scope, [p.chunk_id for h, _ in scored if h for p in h.passages])
+
     scored.sort(key=lambda pair: pair[1]["score"], reverse=True)
     trace.fused = [d for _, d in scored[:_MAX_RECORDED]]
 

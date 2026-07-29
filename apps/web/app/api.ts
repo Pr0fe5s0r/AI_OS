@@ -181,6 +181,8 @@ export type CollectionShape = {
     itemId?: string;
     ordinal?: number;
     document?: string;
+    nodeType?: string;
+    stage?: number;
     px?: number | null;
     py?: number | null;
   }[];

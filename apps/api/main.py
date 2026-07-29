@@ -13,7 +13,10 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.auth_routes import router as auth_router
+from apps.common.consolidation import enabled as consolidation_enabled
+from apps.common.consolidation import interval_seconds as consolidation_interval
 from packages.core import graph
+from packages.core.chunks import by_ids as chunks_by_ids
 from packages.core.classify import (
     bulk_override,
     classes_for,
@@ -30,7 +33,10 @@ from packages.core.collections import (
     get_collection,
     list_clusters,
 )
+from packages.core.consolidate import recent_runs
+from packages.core.consolidate import run_once as run_consolidation
 from packages.core.db import Session
+from packages.core.graph import chunk_lineage as graph_lineage
 from packages.core.keys import create_key, list_keys, revoke_key
 from packages.core.neighbours import collection_graph
 from packages.core.normalise import can_parse, supported
@@ -620,6 +626,74 @@ async def collection_shape(
     """
     scope = Scope(workspace_id=str(principal["company_id"]), collection_id=collection_id)
     return await collection_graph(session, scope, k=k, limit=limit)
+
+
+@app.get("/api/collections/{collection_id}/consolidation")
+async def consolidation_history(
+    collection_id: str,
+    limit: int = Query(20, ge=1, le=100),
+    principal: dict[str, Any] = Depends(resolve_caller),
+    session: AsyncSession = Depends(db),
+) -> dict[str, Any]:
+    """What the self-organising pass has been doing to this collection.
+
+    Counts per run, not a status light: merging replaces passages with
+    model-written text, so "it ran" is not enough — how much it changed, and
+    whether it failed, is the part worth seeing.
+    """
+    scope = Scope(workspace_id=str(principal["company_id"]), collection_id=collection_id)
+    return {
+        "enabled": consolidation_enabled(),
+        "interval_seconds": consolidation_interval(),
+        "runs": await recent_runs(session, scope, limit=limit),
+    }
+
+
+@app.post("/api/collections/{collection_id}/consolidate")
+async def consolidate_now(
+    collection_id: str,
+    principal: dict[str, Any] = Depends(resolve_caller),
+    session: AsyncSession = Depends(db),
+) -> dict[str, Any]:
+    """Run one consolidation pass immediately.
+
+    Available whether or not the cron is enabled, so the behaviour can be
+    tried on a collection deliberately before being left to run unattended.
+    """
+    require_write(principal)
+    scope = Scope(workspace_id=str(principal["company_id"]), collection_id=collection_id)
+    outcome = await run_consolidation(session, scope)
+    return outcome.as_dict()
+
+
+@app.get("/api/chunks/{chunk_id}/lineage")
+async def chunk_sources(
+    chunk_id: str,
+    principal: dict[str, Any] = Depends(resolve_caller),
+    session: AsyncSession = Depends(db),
+) -> dict[str, Any]:
+    """What a summary node was built from.
+
+    A summary is text a model wrote, so this is the difference between a
+    memory and an assertion: it names the passages behind the claim, and they
+    remain resolvable after they are archived.
+    """
+    scope = Scope(workspace_id=str(principal["company_id"]))
+    sources = await graph_lineage(scope, chunk_id)
+    hydrated = await chunks_by_ids(session, scope, [s["chunk_id"] for s in sources])
+    return {
+        "chunk_id": chunk_id,
+        "sources": [
+            {
+                "chunk_id": s["chunk_id"],
+                "heading": s["heading"],
+                "item_id": s["item_id"],
+                "archived": s["archived"] is not None,
+                "text": (hydrated[s["chunk_id"]].text if s["chunk_id"] in hydrated else None),
+            }
+            for s in sources
+        ],
+    }
 
 
 @app.delete("/api/collections/{collection_id}")

@@ -311,18 +311,124 @@ async def replace_chunks(scope: Scope, item_id: str, chunks: list[dict]) -> int:
     return rows[0]["n"] if rows else 0
 
 
-async def collection_chunk_vectors(scope: Scope, limit: int = 400) -> list[dict]:
-    """Every passage in a collection with its vector, for the graph view."""
+async def collection_chunk_vectors(
+    scope: Scope, limit: int = 400, live_only: bool = False
+) -> list[dict]:
+    """Every passage in a collection with its vector, for the graph view.
+
+    ``live_only`` excludes archived nodes — consolidation must never fold an
+    archived node back into a fresh summary, which would resurrect content the
+    store has already decided is gone.
+    """
     clause, params = _scope_clause("c", scope)
+    if live_only:
+        clause += " AND c.archived IS NULL"
     return await _run(
         f"""
         MATCH (c:Chunk) WHERE {clause} AND c.embedding IS NOT NULL
         RETURN c.chunk_id AS id, c.item_id AS item_id, c.ordinal AS ordinal,
-               c.heading AS heading, c.title AS title, c.embedding AS embedding
+               c.heading AS heading, c.title AS title, c.embedding AS embedding,
+               coalesce(c.node_type, 'fact') AS node_type,
+               coalesce(c.stage, 1) AS stage
         ORDER BY c.item_id, c.ordinal
         LIMIT $limit
         """,
         limit=limit,
+        **params,
+    )
+
+
+async def upsert_summary(
+    scope: Scope,
+    chunk_id: str,
+    heading: str,
+    embedding: list[float],
+    sources: list[str],
+) -> None:
+    """A node the store wrote, standing for the passages it replaced.
+
+    DERIVED_FROM edges to its members are kept even though the members are
+    archived: provenance has to outlive the thing it explains, or a summary
+    becomes an assertion nobody can check.
+    """
+    await _run(
+        """
+        MERGE (c:Chunk {chunk_id: $chunk_id})
+        SET c.workspace_id  = $workspace,
+            c.collection_id = $collection,
+            c.heading       = $heading,
+            c.title         = $heading,
+            c.node_type     = 'summary',
+            c.status        = $status,
+            c.ordinal       = 0,
+            c.archived      = NULL
+        """,
+        chunk_id=chunk_id,
+        workspace=scope.workspace_id,
+        collection=scope.collection_id,
+        heading=heading,
+        status=str(Lifecycle.ACTIVE),
+    )
+    await _run(
+        """
+        MATCH (c:Chunk {chunk_id: $chunk_id})
+        CALL db.create.setNodeVectorProperty(c, 'embedding', $embedding)
+        """,
+        chunk_id=chunk_id,
+        embedding=embedding,
+    )
+    await _run(
+        """
+        MATCH (c:Chunk {chunk_id: $chunk_id})
+        UNWIND $sources AS source_id
+        MATCH (s:Chunk {chunk_id: source_id})
+        MERGE (c)-[:DERIVED_FROM]->(s)
+        """,
+        chunk_id=chunk_id,
+        sources=sources,
+    )
+
+
+async def archive_chunk(scope: Scope, chunk_id: str) -> None:
+    """Take a node out of retrieval without destroying it.
+
+    The vector is removed but the node stays, so DERIVED_FROM still resolves
+    and a summary can name what it came from. Removing the embedding is what
+    takes it out of recall — the index has no other filter.
+    """
+    clause, params = _scope_clause("c", scope)
+    await _run(
+        f"""
+        MATCH (c:Chunk {{chunk_id: $chunk_id}}) WHERE {clause}
+        SET c.archived = timestamp(), c.status = 'archived'
+        REMOVE c.embedding
+        """,
+        chunk_id=chunk_id,
+        **params,
+    )
+
+
+async def delete_chunk(scope: Scope, chunk_id: str) -> None:
+    """Fully decayed: the node goes, and its edges with it."""
+    clause, params = _scope_clause("c", scope)
+    await _run(
+        f"MATCH (c:Chunk {{chunk_id: $chunk_id}}) WHERE {clause} DETACH DELETE c",
+        chunk_id=chunk_id,
+        **params,
+    )
+
+
+async def chunk_lineage(scope: Scope, chunk_id: str) -> list[dict]:
+    """What a summary was built from — the evidence behind a written claim."""
+    clause, params = _scope_clause("c", scope)
+    return await _run(
+        f"""
+        MATCH (c:Chunk {{chunk_id: $chunk_id}})-[:DERIVED_FROM]->(s:Chunk)
+        WHERE {clause}
+        RETURN s.chunk_id AS chunk_id, s.heading AS heading,
+               s.item_id AS item_id, s.archived AS archived
+        """,
+        chunk_id=chunk_id,
         **params,
     )
 
