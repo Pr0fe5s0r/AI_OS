@@ -25,7 +25,7 @@ from packages.shared.schema import Scope
 # would be showing something that is not true of the data.
 # ---------------------------------------------------------------------------
 
-MAX_NODES = 200
+MAX_NODES = 400  # passages, not documents — a single file is now many nodes
 DEFAULT_K = 3
 
 # How much weaker than the typical nearest-neighbour an edge may be before it
@@ -113,30 +113,47 @@ async def collection_graph(
 ) -> dict[str, Any]:
     """The collection as nodes and edges, ready to draw.
 
+    A node is a PASSAGE, not a document. One node per file showed a collection
+    of a dozen documents as a dozen unconnected dots — nothing to look at, and
+    nothing true either, since a document is not one idea. Passages are what
+    was embedded, so they are what the graph can honestly draw.
+
     Node degree is returned with the node because the view sizes points by how
     connected they are, and computing that in the browser would mean shipping
     the edge list twice.
     """
-    points = await graph.collection_vectors(scope, limit=limit)
+    points = await graph.collection_chunk_vectors(scope, limit=limit)
     if not points:
-        return {"nodes": [], "edges": [], "truncated": False}
+        return {
+            "nodes": [], "edges": [], "truncated": False, "k": k, "floor": 0.0,
+            "documents": 0,
+            "projection": {"method": "none", "explained_variance": 0.0},
+        }
 
-    ids = [p["id"] for p in points]
     edges, floor = knn_edges(points, k=k)
 
-    declared = await graph.links_between(scope, ids)
-    edges += [
-        {"src": d["src"], "dst": d["dst"], "similarity": 1.0, "kind": d["type"].lower()}
-        for d in declared
-    ]
+    # Passages of the same document are joined explicitly. Without it a long
+    # document reads as scattered unrelated points; with it the document is
+    # visible as a shape, and a passage sitting far from its own siblings is
+    # worth noticing — it usually means the file covers two subjects.
+    by_item: dict[str, list[dict[str, Any]]] = {}
+    for p in points:
+        by_item.setdefault(p["item_id"], []).append(p)
+    for siblings in by_item.values():
+        ordered = sorted(siblings, key=lambda s: s["ordinal"])
+        edges += [
+            {"src": a["id"], "dst": b["id"], "similarity": 1.0, "kind": "same_document"}
+            for a, b in zip(ordered, ordered[1:], strict=False)
+        ]
 
     # The same vectors, flattened to two dimensions. Done here rather than in
     # its own endpoint so a collection's 1536-float embeddings are read once.
     flattened = project(points)
 
-    # Categories give the cloud its colour: a well-organised collection shows
-    # its groups as clusters, and one that does not is telling you something.
-    tagged = await classes_for(session, scope, ids)
+    # Documents give the cloud its colour, so the passages of one file share a
+    # hue and the graph shows how they scatter.
+    item_ids = list(by_item)
+    tagged = await classes_for(session, scope, item_ids)
 
     degree: dict[str, int] = {}
     for e in edges:
@@ -146,11 +163,16 @@ async def collection_graph(
     nodes = [
         {
             "id": p["id"],
-            "title": p["title"],
-            "source": p["source"],
+            "itemId": p["item_id"],
+            "ordinal": p["ordinal"],
+            # What the passage is: its heading path, falling back to the
+            # document title for a passage above the first heading.
+            "title": p["heading"] or p["title"] or "",
+            "document": p["title"] or "",
+            "source": "",
             "degree": degree.get(p["id"], 0),
-            "category": (tagged.get(p["id"]) or [{}])[0].get("class_id"),
-            "categoryName": (tagged.get(p["id"]) or [{}])[0].get("name"),
+            "category": (tagged.get(p["item_id"]) or [{}])[0].get("class_id"),
+            "categoryName": (tagged.get(p["item_id"]) or [{}])[0].get("name"),
             # Position in embedding space, 0..1. Distinct from the force
             # layout: these coordinates mean something.
             "px": flattened["coords"].get(p["id"], {}).get("x"),
@@ -164,6 +186,7 @@ async def collection_graph(
         "edges": edges,
         "truncated": len(points) >= limit,
         "k": k,
+        "documents": len(by_item),
         # Shown in the view: a threshold nobody can see is one nobody can argue with.
         "floor": floor,
         "projection": {

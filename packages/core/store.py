@@ -177,6 +177,18 @@ async def put_item(session: AsyncSession, item: Item) -> PutResult:
         },
     )
 
+    # Passages are built here, in the same transaction as the document, rather
+    # than in the embedding job. Two reasons, and the second is the important
+    # one. Splitting text is pure string work with no network in it. And the
+    # keyword arm searches passages — so deferring this would leave a document
+    # unsearchable until an embedding provider answered, when the entire point
+    # of having a keyword arm is that it still works when that provider does
+    # not. Doing it here also makes "a document always has passages" an
+    # invariant of the store instead of something each caller must remember.
+    from packages.core import chunks
+
+    await chunks.rebuild(session, stored.scope, item_id, version, stored.title, stored.body)
+
     return PutResult("created" if current is None else "versioned", stored, embedded_needed=True)
 
 

@@ -37,6 +37,38 @@ def embed(text: str) -> list[float]:
     return vector
 
 
+def embed_many(texts: list[str], batch: int = 64) -> list[list[float]]:
+    """Embeddings for many texts, in input order.
+
+    Passage-level embedding turns one document into tens of vectors, so a call
+    per passage would make indexing a long file tens of round trips. Batched
+    here rather than at the caller so every ingest path gets it.
+
+    Order is the contract: the caller zips the result against its passages, so
+    a provider returning results out of order would attach the wrong vector to
+    the wrong text. The API guarantees index order, and it is re-sorted here
+    rather than trusted.
+    """
+    if not texts:
+        return []
+    client, cfg = _client()
+    out: list[list[float]] = []
+    for start in range(0, len(texts), batch):
+        window = texts[start : start + batch]
+        kwargs: dict[str, Any] = {"model": cfg.embedding_model, "input": window}
+        if cfg.supports_dimensions:
+            kwargs["dimensions"] = EMBED_DIM
+        data = sorted(client.embeddings.create(**kwargs).data, key=lambda d: d.index)
+        for entry in data:
+            if len(entry.embedding) != EMBED_DIM:
+                raise ValueError(
+                    f"Embedding model {cfg.embedding_model!r} returned "
+                    f"{len(entry.embedding)} dims; expected {EMBED_DIM}."
+                )
+            out.append(entry.embedding)
+    return out
+
+
 def chat(
     messages: list[dict[str, Any]],
     *,

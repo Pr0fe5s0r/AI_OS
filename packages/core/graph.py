@@ -105,15 +105,41 @@ async def migrate_legacy_properties() -> int:
     return rows[0]["n"] if rows else 0
 
 
+async def _move_vector_index_to_chunks() -> bool:
+    """Retarget the vector index from Item onto Chunk.
+
+    `CREATE VECTOR INDEX ... IF NOT EXISTS` matches on the NAME, so an index
+    already defined over (:Item) satisfies the new definition and the create is
+    silently skipped — leaving passages unindexed and semantic recall finding
+    nothing, with no error to read. The old one has to be dropped by name
+    first. Idempotent: once it is on Chunk there is nothing to do.
+    """
+    rows = await _run(
+        "SHOW VECTOR INDEXES YIELD name, labelsOrTypes WHERE name = $name "
+        "RETURN labelsOrTypes AS labels",
+        name=VECTOR_INDEX,
+    )
+    if not rows or "Item" not in (rows[0].get("labels") or []):
+        return False
+    await _run(f"DROP INDEX {VECTOR_INDEX} IF EXISTS")
+    return True
+
+
 async def bootstrap() -> None:
     """Constraints and indexes, created idempotently. Safe on every boot."""
+    await _move_vector_index_to_chunks()
     for stmt in [
         "CREATE CONSTRAINT item_id IF NOT EXISTS FOR (i:Item) REQUIRE i.item_id IS UNIQUE",
         "CREATE INDEX item_tenant IF NOT EXISTS FOR (i:Item) ON (i.workspace_id)",
         "CREATE INDEX item_scope IF NOT EXISTS FOR (i:Item) ON (i.workspace_id, i.collection_id)",
+        "CREATE CONSTRAINT chunk_id IF NOT EXISTS FOR (c:Chunk) REQUIRE c.chunk_id IS UNIQUE",
+        "CREATE INDEX chunk_scope IF NOT EXISTS FOR (c:Chunk) ON (c.workspace_id, c.collection_id)",
+        "CREATE INDEX chunk_item IF NOT EXISTS FOR (c:Chunk) ON (c.workspace_id, c.item_id)",
+        # The vector index lives on the passage, not the document. It is what
+        # makes recall land on a paragraph instead of a whole file.
         f"""
         CREATE VECTOR INDEX {VECTOR_INDEX} IF NOT EXISTS
-        FOR (i:Item) ON (i.embedding)
+        FOR (c:Chunk) ON (c.embedding)
         OPTIONS {{indexConfig: {{
             `vector.dimensions`: {EMBED_DIM},
             `vector.similarity_function`: 'cosine'
@@ -205,12 +231,16 @@ async def link_items(scope: Scope, src_id: str, dst_id: str, link: Link | str) -
 async def vector_search(
     scope: Scope, embedding: list[float], limit: int = 20, active_only: bool = True
 ) -> list[dict]:
-    """Nearest items by cosine similarity, scoped and filtered.
+    """Nearest passages by cosine similarity, scoped and filtered.
 
     The vector index itself is global, so this over-fetches and then applies
     tenancy before returning anything — the filter is never the caller's job.
     Superseded items are excluded by default so the agent cannot answer from
     content we already know has been replaced.
+
+    Returns passages. The caller decides whether to present them as passages
+    or roll them up into the documents they belong to; both need to know which
+    passage matched, because that is the citation.
     """
     clause, params = _scope_clause("node", scope)
     if active_only:
@@ -221,11 +251,77 @@ async def vector_search(
         CALL db.index.vector.queryNodes('{VECTOR_INDEX}', $k, $embedding)
         YIELD node, score
         WHERE {clause}
-        RETURN node.item_id AS item_id, score AS similarity
+        RETURN node.chunk_id AS chunk_id, node.item_id AS item_id,
+               node.ordinal AS ordinal, score AS similarity
         LIMIT $limit
         """,
-        k=limit * 4,
+        # Over-fetch harder than the item index did: several passages of one
+        # document can occupy the top of the list, so the raw neighbour count
+        # no longer approximates the number of distinct documents.
+        k=limit * 8,
         embedding=embedding,
+        limit=limit,
+        **params,
+    )
+
+
+# -------------------------------- passages --------------------------------
+
+
+async def replace_chunks(scope: Scope, item_id: str, chunks: list[dict]) -> int:
+    """Swap a document's passages for a new set, in one transaction.
+
+    Delete-then-write rather than merge: passage boundaries move when a
+    document is edited, so reconciling one by one would leave orphans behind
+    that still answer queries. Each dict carries chunk_id, ordinal, heading,
+    title and embedding.
+    """
+    clause, params = _scope_clause("c", scope)
+    await _run(
+        f"MATCH (c:Chunk {{item_id: $item_id}}) WHERE {clause} DETACH DELETE c",
+        item_id=item_id,
+        **params,
+    )
+    if not chunks:
+        return 0
+    rows = await _run(
+        """
+        UNWIND $chunks AS row
+        CREATE (c:Chunk {chunk_id: row.chunk_id})
+        SET c.workspace_id  = $workspace,
+            c.collection_id = $collection,
+            c.item_id       = $item_id,
+            c.ordinal       = row.ordinal,
+            c.heading       = row.heading,
+            c.title         = row.title,
+            c.status        = $status
+        WITH c, row
+        CALL db.create.setNodeVectorProperty(c, 'embedding', row.embedding)
+        WITH c
+        MATCH (i:Item {item_id: $item_id})
+        MERGE (c)-[:PART_OF]->(i)
+        RETURN count(c) AS n
+        """,
+        chunks=chunks,
+        item_id=item_id,
+        workspace=scope.workspace_id,
+        collection=scope.collection_id,
+        status=str(Lifecycle.ACTIVE),
+    )
+    return rows[0]["n"] if rows else 0
+
+
+async def collection_chunk_vectors(scope: Scope, limit: int = 400) -> list[dict]:
+    """Every passage in a collection with its vector, for the graph view."""
+    clause, params = _scope_clause("c", scope)
+    return await _run(
+        f"""
+        MATCH (c:Chunk) WHERE {clause} AND c.embedding IS NOT NULL
+        RETURN c.chunk_id AS id, c.item_id AS item_id, c.ordinal AS ordinal,
+               c.heading AS heading, c.title AS title, c.embedding AS embedding
+        ORDER BY c.item_id, c.ordinal
+        LIMIT $limit
+        """,
         limit=limit,
         **params,
     )

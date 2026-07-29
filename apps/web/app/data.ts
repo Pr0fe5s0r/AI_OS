@@ -117,6 +117,21 @@ export type Point = {
   locator: string;
   url?: string | null;
   categories: Category[];
+  /** Where in the document the excerpt came from. */
+  heading?: string;
+  /** Every passage of this document that matched, best first — the evidence
+   *  behind the document-level score. */
+  passages?: MatchedPassage[];
+};
+
+export type MatchedPassage = {
+  chunk_id: string;
+  ordinal: number;
+  heading: string;
+  text: string;
+  score: number;
+  semantic: number;
+  keyword: number;
 };
 
 export type Document = {

@@ -178,6 +178,9 @@ export type CollectionShape = {
     degree: number;
     category: string | null;
     categoryName: string | null;
+    itemId?: string;
+    ordinal?: number;
+    document?: string;
     px?: number | null;
     py?: number | null;
   }[];
@@ -185,10 +188,13 @@ export type CollectionShape = {
   truncated: boolean;
   k: number;
   floor: number;
+  /** How many documents the passages came from. */
+  documents: number;
   projection: { method: string; explained_variance: number };
 };
 
-/** The collection as a neighbour graph, built from the embeddings themselves. */
+/** The collection as a neighbour graph over PASSAGES, built from the
+ *  embeddings themselves. A node is a passage, not a file. */
 export const collectionGraph = (id: string, k = 3) =>
   call<CollectionShape>(`/api/collections/${id}/graph?k=${k}`);
 
@@ -338,6 +344,16 @@ export async function search(
       score: number;
       semantic: number;
       keyword: number;
+      heading?: string;
+      passages?: {
+        chunk_id: string;
+        ordinal: number;
+        heading: string;
+        text: string;
+        score: number;
+        semantic: number;
+        keyword: number;
+      }[];
       source: { source: string; locator: string; url?: string | null };
       classes?: Category[];
     }[];
@@ -361,6 +377,11 @@ export async function search(
       locator: r.source?.locator || "",
       url: r.source?.url,
       categories: r.classes || [],
+      heading: r.heading || "",
+      passages: (r.passages || []).map((p) => ({
+        ...p,
+        text: p.text.replace(/\[\[|\]\]/g, ""),
+      })),
     })),
   };
 }

@@ -81,6 +81,7 @@ export function Collections({
             truncated: false,
             k,
             floor: 0,
+            documents: 0,
             projection: { method: "none", explained_variance: 0 },
           })
       );
@@ -198,6 +199,12 @@ export function Collections({
                   : view === "map"
                     ? "embedding map"
                     : "documents"}
+                {view !== "table" && shape && shape.nodes.length > 0 && (
+                  <span className="ml-2 normal-case tracking-normal text-subtle">
+                    {shape.nodes.length} passages · {shape.documents} document
+                    {shape.documents === 1 ? "" : "s"}
+                  </span>
+                )}
               </Label>
               <div className="flex items-center gap-3">
                 {view !== "table" && (
@@ -242,10 +249,10 @@ export function Collections({
                   <p className="mt-2 text-2xs leading-relaxed text-subtle">
                     {view === "map" ? (
                       <>
-                        Every document placed by its actual position in embedding space, so
+                        Every passage placed by its actual position in embedding space, so
                         distance on screen is distance in the vectors — two points near each
-                        other really are alike. Flattening {shape.nodes[0] ? "1536" : "many"}{" "}
-                        dimensions to two loses something, and these axes keep{" "}
+                        other really are alike. Flattening 1536 dimensions to two loses
+                        something, and these axes keep{" "}
                         <span className="text-muted">
                           {(shape.projection.explained_variance * 100).toFixed(1)}%
                         </span>{" "}
@@ -253,15 +260,16 @@ export function Collections({
                       </>
                     ) : (
                       <>
-                        Each point is a document, joined to its {shape.k} nearest neighbours by
-                        cosine similarity, computed from the vectors — so this is the shape of
-                        the data rather than a diagram of it. Dashed orange edges are
-                        relationships the store recorded. Positions come from a force layout and
-                        carry no meaning; switch to the map to read distance. Edges below{" "}
+                        Each point is a <span className="text-muted">passage</span>, not a
+                        document — passages are what was embedded, so they are what can honestly
+                        be drawn. Coloured edges join a passage to its {shape.k} nearest
+                        neighbours by cosine similarity; faint dotted edges join consecutive
+                        passages of the same file. Positions come from a force layout and carry
+                        no meaning; switch to the map to read distance. Edges below{" "}
                         <span className="text-muted">{shape.floor}</span> similarity are dropped.
                       </>
                     )}
-                    {shape.truncated && " Showing the first 200 documents."}
+                    {shape.truncated && " Showing the first 400 passages."}
                   </p>
                 </>
               )

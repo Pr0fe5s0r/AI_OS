@@ -126,9 +126,44 @@ export function Query({ collections }: { collections: Collection[] }) {
                             <div className="truncate text-xs font-medium text-ink">
                               {m.title}
                             </div>
+                            {m.heading && (
+                              <div className="mt-0.5 truncate font-mono text-2xs text-accentSoft">
+                                {m.heading}
+                              </div>
+                            )}
                             <p className="mt-1 text-xs leading-relaxed text-muted">
                               …{m.excerpt}…
                             </p>
+
+                            {/* The document is the result; the passages are the
+                                evidence. A file matching in six places is a
+                                different answer from one matching in a single
+                                line, and the score alone cannot say which. */}
+                            {(m.passages?.length ?? 0) > 1 && (
+                              <details className="mt-2 group">
+                                <summary className="cursor-pointer list-none font-mono text-2xs text-subtle transition hover:text-muted">
+                                  matched in {m.passages!.length} passages ▸
+                                </summary>
+                                <div className="mt-1.5 space-y-1.5 border-l border-edge pl-3">
+                                  {m.passages!.map((p) => (
+                                    <div key={p.chunk_id}>
+                                      <div className="flex items-baseline gap-2">
+                                        <Mono className="text-2xs text-accentSoft">
+                                          {p.score.toFixed(3)}
+                                        </Mono>
+                                        <span className="min-w-0 flex-1 truncate font-mono text-2xs text-subtle">
+                                          {p.heading || `passage ${p.ordinal + 1}`}
+                                        </span>
+                                      </div>
+                                      <p className="mt-0.5 line-clamp-2 text-2xs leading-relaxed text-muted">
+                                        {p.text}
+                                      </p>
+                                    </div>
+                                  ))}
+                                </div>
+                              </details>
+                            )}
+
                             <div className="mt-2 flex flex-wrap items-center gap-1.5">
                               <Chip>{m.source}</Chip>
                               <Mono className="text-2xs text-subtle">{m.locator}</Mono>

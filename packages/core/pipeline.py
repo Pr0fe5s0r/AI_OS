@@ -7,9 +7,10 @@ from typing import Any
 
 from arq.connections import RedisSettings
 
-from packages.core import graph
+from packages.core import chunk as chunk_module
+from packages.core import chunks, graph
 from packages.core.db import Session
-from packages.core.llm import embed
+from packages.core.llm import embed_many
 from packages.core.normalise import Normalised, UnsupportedFormat, normalise, normalise_text
 from packages.core.store import get_item, put_item, record_failure, stable_item_id
 from packages.shared.schema import Item, Scope, SourceRef
@@ -147,16 +148,49 @@ async def embed_item(
     if item is None:
         return {"item_id": item_id, "outcome": "missing"}
 
-    vector = await asyncio.to_thread(embed, f"{item.title}\n\n{item.body}")
+    # The document node carries identity and lineage; it holds no vector of
+    # its own. Embedding a whole document produced the average of everything
+    # it said, which matched nothing it said.
     await graph.upsert_item(
         scope,
         item_id=item.id,
         title=item.title,
         source=item.source.source,
         status=str(item.status),
-        embedding=vector,
     )
-    return {"item_id": item.id, "outcome": "embedded"}
+
+    # The passages already exist — the store wrote them with the document, so
+    # keyword search has been working since the write. This job only gives them
+    # vectors, which is the part that needs a provider.
+    async with Session() as session:
+        passages = await chunks.for_item(session, scope, item.id)
+
+    if not passages:
+        return {"item_id": item.id, "outcome": "empty", "chunks": 0}
+
+    # One call for the lot. Passage-level embedding multiplies the number of
+    # vectors per document by an order of magnitude, so doing them one at a
+    # time would turn a 28-passage document into 28 round trips.
+    vectors = await asyncio.to_thread(
+        embed_many,
+        [chunk_module.embedding_text(p.heading, p.text, item.title) for p in passages],
+    )
+
+    written = await graph.replace_chunks(
+        scope,
+        item.id,
+        [
+            {
+                "chunk_id": p.chunk_id,
+                "ordinal": p.ordinal,
+                "heading": p.heading,
+                "title": item.title,
+                "embedding": vector,
+            }
+            for p, vector in zip(passages, vectors, strict=True)
+        ],
+    )
+    return {"item_id": item.id, "outcome": "embedded", "chunks": written}
 
 
 async def classify_new_item(

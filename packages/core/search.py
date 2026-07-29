@@ -5,20 +5,27 @@ import secrets
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import lru_cache
 from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core import graph
+from packages.core import chunks, graph
 from packages.core.llm import embed
-from packages.shared.schema import Hit, Lifecycle, Scope, SourceRef
+from packages.shared.schema import Hit, Lifecycle, Passage, Scope, SourceRef
 
 # ---------------------------------------------------------------------------
 # HYBRID SEARCH — semantic recall and keyword recall, fused.
 #
-#   semantic : Neo4j native vector index, cosine over item embeddings
-#   keyword  : Postgres tsvector over the same items
+#   semantic : Neo4j native vector index, cosine over passage embeddings
+#   keyword  : Postgres tsvector over the same passages
+#
+# Both arms retrieve PASSAGES and roll up to documents, scoring each document
+# by its best passage. A specification answering the question in one paragraph
+# should outrank one vaguely on topic throughout, and averaging over a
+# document's passages inverts exactly that. The passage that won is carried
+# through to the result, because that is what a citation is.
 #
 # Both are needed and neither is sufficient. Semantic finds a document about
 # "quarterly performance dip" when the query says "why did results fall";
@@ -97,27 +104,29 @@ def new_trace_id() -> str:
     return secrets.token_hex(12)
 
 
-_KEYWORD = """
-    SELECT item_id,
-           ts_rank(body_tsv, plainto_tsquery('english', :q)) AS rank
-    FROM kb_items
-    WHERE {where}
-      AND body_tsv @@ plainto_tsquery('english', :q)
-    ORDER BY rank DESC
-    LIMIT :limit
-"""
+# Embedding the QUERY dominates a search: a trace showed 13,198ms of a 13,333ms
+# call, so the store answered in 130ms and spent thirteen seconds asking a
+# provider what the question meant. Repeat questions are the common case — a
+# console refresh, a dashboard, two agents asking the same thing — so the
+# result is kept. Bounded, and keyed on the exact string: an embedding is a
+# pure function of its input and the model, and the model cannot change without
+# a restart.
+_QUERY_CACHE_SIZE = 512
+
+
+@lru_cache(maxsize=_QUERY_CACHE_SIZE)
+def _embed_query_cached(query: str) -> tuple[float, ...]:
+    # A tuple, not a list: lru_cache hands every caller the same object, and a
+    # caller that mutated a cached list would corrupt every later search.
+    return tuple(embed(query))
+
+
+def embed_query(query: str) -> list[float]:
+    return list(_embed_query_cached(query))
+
 
 _HYDRATE = """
     SELECT item_id, title, source, locator, url, created_at,
-           -- Custom delimiters, not the default <b></b>: the excerpt is data
-           -- travelling to an API and then to a browser, and HTML in it either
-           -- renders as literal tags or has to be trusted as markup. Neither is
-           -- acceptable, so the marks are inert tokens the client can style.
-           ts_headline(
-               'english', body, plainto_tsquery('english', :q),
-               'MaxWords=40, MinWords=15, ShortWord=3, MaxFragments=1,'
-               'StartSel="[[", StopSel="]]"'
-           ) AS excerpt,
            left(body, 320) AS head,
            -- Age is floored at zero before the decay is applied. A document
            -- describing a period that has not finished yet — a plan for the
@@ -211,7 +220,7 @@ async def search_traced(
     mark = time.perf_counter()
     semantic: list[dict[str, Any]] = []
     try:
-        vector = await asyncio.to_thread(embed, query)
+        vector = await asyncio.to_thread(embed_query, query)
         trace.timings_ms["embed"] = elapsed(mark)
         mark = time.perf_counter()
         semantic = await graph.vector_search(
@@ -222,22 +231,61 @@ async def search_traced(
         trace.degraded = f"semantic arm unavailable: {type(exc).__name__}"
         trace.timings_ms["semantic"] = elapsed(mark)
 
-    sim_by_id = {r["item_id"]: float(r["similarity"]) for r in semantic}
+    # Both arms now return PASSAGES. A document's score is its best passage:
+    # a specification that answers the question in one paragraph should rank
+    # above one that is vaguely on topic throughout, and averaging over
+    # passages would invert exactly that.
+    sim_by_id: dict[str, float] = {}
+    best_chunk: dict[str, str] = {}
+    # Per-passage scores, kept so the result can show every place a document
+    # matched rather than only the strongest.
+    chunk_semantic: dict[str, float] = {}
+    chunk_owner: dict[str, str] = {}
+    for candidate in semantic:
+        item_id, similarity = candidate["item_id"], float(candidate["similarity"])
+        chunk_semantic[candidate["chunk_id"]] = similarity
+        chunk_owner[candidate["chunk_id"]] = item_id
+        if similarity > sim_by_id.get(item_id, -1.0):
+            sim_by_id[item_id] = similarity
+            best_chunk[item_id] = candidate["chunk_id"]
     trace.semantic = [
-        {"item_id": r["item_id"], "similarity": round(float(r["similarity"]), 4)}
+        {
+            "item_id": r["item_id"],
+            "chunk_id": r["chunk_id"],
+            "ordinal": r["ordinal"],
+            "similarity": round(float(r["similarity"]), 4),
+        }
         for r in semantic[:_MAX_RECORDED]
     ]
 
     # --- keyword arm ----------------------------------------------------
     mark = time.perf_counter()
-    rows = await session.execute(
-        text(_KEYWORD.format(where=where)), {**params, "q": query, "limit": k}
-    )
-    rank_by_id = {r.item_id: float(r.rank) for r in rows}
+    passages = await chunks.keyword_search(session, scope, query, limit=k)
+    rank_by_id: dict[str, float] = {}
+    excerpt_by_id: dict[str, str] = {}
+    best_keyword_chunk: dict[str, str] = {}
+    chunk_keyword: dict[str, float] = {}
+    for hit_row in passages:
+        item_id, rank = hit_row["item_id"], hit_row["score"]
+        chunk_keyword[hit_row["chunk_id"]] = rank
+        chunk_owner[hit_row["chunk_id"]] = item_id
+        if rank > rank_by_id.get(item_id, -1.0):
+            rank_by_id[item_id] = rank
+            # The keyword arm can produce a highlighted excerpt directly, which
+            # is better than one computed over the whole document: it points at
+            # the passage that actually matched.
+            excerpt_by_id[item_id] = hit_row["excerpt"]
+            best_keyword_chunk[item_id] = hit_row["chunk_id"]
+            best_chunk.setdefault(item_id, hit_row["chunk_id"])
     trace.timings_ms["keyword"] = elapsed(mark)
     trace.keyword = [
-        {"item_id": i, "rank": round(v, 4)}
-        for i, v in list(rank_by_id.items())[:_MAX_RECORDED]
+        {
+            "item_id": r["item_id"],
+            "chunk_id": r["chunk_id"],
+            "heading": r["heading"],
+            "rank": round(r["score"], 4),
+        }
+        for r in passages[:_MAX_RECORDED]
     ]
 
     ids = list(sim_by_id | rank_by_id)
@@ -254,6 +302,32 @@ async def search_traced(
     hydrated = await session.execute(
         text(_HYDRATE.format(where=where)), {**params, "q": query, "ids": ids}
     )
+    # Every passage either arm proposed, fetched in one go rather than per row.
+    # The winning one becomes the excerpt; the rest become the evidence.
+    winning = await chunks.by_ids(session, scope, list(chunk_owner))
+
+    # Passages grouped by the document they belong to, best first. A document
+    # matching in six places is a materially different answer from one matching
+    # in a single line, and a document-level score cannot say which it is.
+    per_item: dict[str, list[Passage]] = {}
+    for cid, owner in chunk_owner.items():
+        stored = winning.get(cid)
+        if stored is None:
+            continue
+        sem, kw = chunk_semantic.get(cid, 0.0), chunk_keyword.get(cid, 0.0)
+        per_item.setdefault(owner, []).append(
+            Passage(
+                chunk_id=cid,
+                ordinal=stored.ordinal,
+                heading=stored.heading,
+                text=stored.text[:600],
+                score=round(max(sem, min(kw * 2.0, 0.6)), 4),
+                semantic=round(sem, 4),
+                keyword=round(kw, 4),
+            )
+        )
+    for group in per_item.values():
+        group.sort(key=lambda p: p.score, reverse=True)
 
     scored: list[tuple[Hit, dict[str, Any]]] = []
     for row in hydrated:
@@ -264,8 +338,18 @@ async def search_traced(
         relevance = max(similarity, min(keyword * 2.0, 0.6))
         recency = float(row.recency)
         score = cfg.semantic_weight * relevance + (1 - cfg.semantic_weight) * recency
+        # ONE winning passage, and both the heading and the excerpt come from
+        # it. Taking the heading from the vector arm's best and the excerpt
+        # from the keyword arm's best let them disagree: a result was cited as
+        # "7. Deliverables" while quoting text from the connectors section,
+        # which is a citation pointing at the wrong place — worse than no
+        # citation, because it looks checkable and is not.
+        ranked_passages = per_item.get(row.item_id, [])
+        winner = ranked_passages[0] if ranked_passages else None
         detail = {
             "item_id": row.item_id,
+            "chunk_id": winner.chunk_id if winner else None,
+            "heading": winner.heading if winner else None,
             "score": round(score, 4),
             "semantic": round(similarity, 4),
             "keyword": round(keyword, 4),
@@ -275,16 +359,26 @@ async def search_traced(
         if score < cfg.min_score:
             scored.append((None, detail))  # type: ignore[arg-type]
             continue
+        # The keyword arm's highlighted version is preferred, but only when it
+        # is the SAME passage that won — otherwise the winner's own text.
+        highlighted = excerpt_by_id.get(row.item_id)
+        excerpt = (
+            highlighted
+            if winner and highlighted and best_keyword_chunk.get(row.item_id) == winner.chunk_id
+            else (winner.text if winner else "") or row.head
+        )
         scored.append(
             (
                 Hit(
                     item_id=row.item_id,
                     title=row.title,
-                    excerpt=(row.excerpt or row.head or "").strip(),
+                    excerpt=(excerpt or "").strip()[:600],
                     source=SourceRef(source=row.source, locator=row.locator, url=row.url),
                     score=round(score, 4),
                     semantic=round(similarity, 4),
                     keyword=round(keyword, 4),
+                    heading=winner.heading if winner else "",
+                    passages=ranked_passages[:5],
                 ),
                 detail,
             )

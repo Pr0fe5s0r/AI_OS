@@ -6,24 +6,39 @@ import { HEAT_HEX, cx, simBand } from "../data";
 /**
  * The collection as a neighbour graph.
  *
- * Nodes are documents; an edge means one document is among another's nearest
- * neighbours in embedding space, coloured by how near. The layout is a small
- * force simulation — repulsion between every pair, springs along the edges,
- * and a pull toward the centre — run to a fixed number of steps so the same
- * data always settles into the same picture.
+ * A node is a PASSAGE, not a document. One node per file drew a collection of
+ * a dozen documents as a dozen unconnected dots — nothing to look at, and
+ * nothing true either, because a document is not one idea. Passages are what
+ * was embedded, so passages are what can honestly be drawn.
+ *
+ * Two kinds of edge, kept visually distinct because they mean different
+ * things: a similarity edge is an OBSERVATION about the vectors, while a
+ * same-document edge is a FACT the store recorded. Drawing them alike would
+ * assert something untrue about the data.
+ *
+ * The layout is a small force simulation — repulsion between every pair,
+ * springs along the edges, a pull toward the centre — run to a fixed number of
+ * steps so the same data always settles into the same picture.
  *
  * No layout library: the whole simulation is thirty lines, and a dependency
- * that ships a renderer, a physics engine and its own event system to draw two
- * hundred circles is a poor trade.
+ * that ships a renderer, a physics engine and its own event system to draw a
+ * few hundred circles is a poor trade.
  */
 
 export type GraphNode = {
   id: string;
+  /** The passage's heading path — what this point actually is. */
   title: string;
   source: string;
   degree: number;
   category: string | null;
   categoryName: string | null;
+  /** Which document the passage belongs to. Colour keys off this, so the
+   *  passages of one file read as a group and a passage sitting far from its
+   *  own siblings is visible — usually meaning the file covers two subjects. */
+  itemId?: string;
+  ordinal?: number;
+  document?: string;
   /** Position in embedding space, 0..1, from the projection. Unlike the force
    *  layout these coordinates carry meaning, so distance can be read. */
   px?: number | null;
@@ -42,8 +57,12 @@ type Placed = GraphNode & { x: number; y: number; r: number };
 const W = 900;
 const H = 520;
 
-/** A stable colour per category, so clusters read as groups. */
+/** A stable colour per group, so a document's passages read as one shape. */
 const CATEGORY_HUES = ["#7c8cff", "#4fd6c9", "#c6f45f", "#ff9d5c", "#f5c451", "#ff7a7a", "#9aa6ff"];
+
+/** Passages are grouped by their document; a node with neither falls back to
+ *  its category, which is what a document-level graph used to key on. */
+const groupKey = (n: GraphNode): string | null => n.itemId ?? n.category;
 
 function categoryColour(category: string | null, index: Map<string, number>): string {
   if (!category) return "#5b6673";
@@ -156,6 +175,9 @@ function layout(nodes: GraphNode[], edges: GraphEdge[]): Placed[] {
     degree: p.degree,
     category: p.category,
     categoryName: p.categoryName,
+    itemId: p.itemId,
+    ordinal: p.ordinal,
+    document: p.document,
     // Rounded, because these become SVG attributes and a server/client float
     // disagreement in the last digit is a hydration mismatch per node.
     x: round(p.x * scale + offsetX),
@@ -210,7 +232,8 @@ export function CollectionGraph({
   const categoryIndex = useMemo(() => {
     const index = new Map<string, number>();
     nodes.forEach((n) => {
-      if (n.category && !index.has(n.category)) index.set(n.category, index.size);
+      const key = groupKey(n);
+      if (key && !index.has(key)) index.set(key, index.size);
     });
     return index;
   }, [nodes]);
@@ -224,11 +247,13 @@ export function CollectionGraph({
   const legend = useMemo(() => {
     const seen = new Map<string, string>();
     nodes.forEach((n) => {
-      if (n.category && n.categoryName && !seen.has(n.category)) {
-        seen.set(n.category, n.categoryName);
-      }
+      const key = groupKey(n);
+      const label = n.document || n.categoryName;
+      if (key && label && !seen.has(key)) seen.set(key, label);
     });
-    return [...seen.entries()];
+    // A legend naming forty documents is not a legend. Past a handful the
+    // colours still group, but the list stops being readable.
+    return [...seen.entries()].slice(0, 8);
   }, [nodes]);
 
   const focused = hover ? byId.get(hover) : null;
@@ -246,7 +271,7 @@ export function CollectionGraph({
     return (
       <div className="flex h-64 items-center justify-center rounded-xl border border-dashed border-edge">
         <p className="text-xs text-subtle">
-          Nothing embedded yet — add documents and the shape appears here.
+          Nothing embedded yet — add documents and their passages appear here.
         </p>
       </div>
     );
@@ -273,7 +298,12 @@ export function CollectionGraph({
               const a = byId.get(e.src);
               const b = byId.get(e.dst);
               if (!a || !b) return null;
-              const declared = e.kind !== "similarity";
+              // Three cases, drawn differently because they claim different
+              // things: consecutive passages of one file (a fact the store
+              // recorded), a link the store declared between documents, and a
+              // similarity the vectors imply (an observation).
+              const sibling = e.kind === "same_document";
+              const declared = !sibling && e.kind !== "similarity";
               const dim = hover && !(connected.has(e.src) && connected.has(e.dst));
               return (
                 <line
@@ -282,15 +312,17 @@ export function CollectionGraph({
                   y1={a.y}
                   x2={b.x}
                   y2={b.y}
-                  stroke={declared ? "#ff9d5c" : HEAT_HEX[simBand(e.similarity)]}
-                  strokeWidth={declared ? 1.6 : 0.5 + e.similarity * 1.4}
-                  strokeDasharray={declared ? "4 3" : undefined}
+                  stroke={sibling ? "#3a4250" : declared ? "#ff9d5c" : HEAT_HEX[simBand(e.similarity)]}
+                  strokeWidth={sibling ? 1 : declared ? 1.6 : 0.5 + e.similarity * 1.4}
+                  strokeDasharray={declared ? "4 3" : sibling ? "2 3" : undefined}
                   opacity={
                     dim
                       ? 0.06
-                      : declared
-                        ? 0.9
-                        : (mode === "map" ? 0.1 : 0.22) + e.similarity * (mode === "map" ? 0.18 : 0.4)
+                      : sibling
+                        ? 0.5
+                        : declared
+                          ? 0.9
+                          : (mode === "map" ? 0.1 : 0.22) + e.similarity * (mode === "map" ? 0.18 : 0.4)
                   }
                 />
               );
@@ -300,7 +332,7 @@ export function CollectionGraph({
           <g>
             {placed.map((p) => {
               const dim = hover ? !connected.has(p.id) : false;
-              const colour = categoryColour(p.category, categoryIndex);
+              const colour = categoryColour(groupKey(p), categoryIndex);
               return (
                 <g
                   key={p.id}
@@ -330,9 +362,17 @@ export function CollectionGraph({
       {/* what the eye is looking at */}
       {focused && (
         <div className="pointer-events-none absolute left-3 top-3 max-w-[22rem] rounded-lg border border-edgeStrong bg-raised/95 px-3 py-2 backdrop-blur">
-          <div className="truncate text-xs text-ink">{focused.title}</div>
+          <div className="truncate text-xs text-ink">
+            {focused.title || "(opening passage)"}
+          </div>
+          {focused.document && (
+            <div className="mt-0.5 truncate font-mono text-2xs text-muted">
+              {focused.document}
+            </div>
+          )}
           <div className="mt-0.5 font-mono text-2xs text-subtle">
-            {focused.source} · {focused.degree} neighbour{focused.degree === 1 ? "" : "s"}
+            {focused.ordinal != null ? `passage ${focused.ordinal + 1} · ` : ""}
+            {focused.degree} neighbour{focused.degree === 1 ? "" : "s"}
             {focused.categoryName ? ` · ${focused.categoryName}` : ""}
           </div>
         </div>
@@ -362,12 +402,12 @@ export function CollectionGraph({
                 y1="3"
                 x2="18"
                 y2="3"
-                stroke="#ff9d5c"
-                strokeWidth="1.6"
-                strokeDasharray="4 3"
+                stroke="#3a4250"
+                strokeWidth="1"
+                strokeDasharray="2 3"
               />
             </svg>
-            recorded link
+            same document
           </span>
         </span>
       </div>

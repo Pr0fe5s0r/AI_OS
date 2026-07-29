@@ -112,6 +112,18 @@ class Classification(BaseModel):
     pinned: bool = False
 
 
+class Passage(BaseModel):
+    """One matching passage of a document — the unit that was actually scored."""
+
+    chunk_id: str
+    ordinal: int
+    heading: str
+    text: str
+    score: float
+    semantic: float = 0.0
+    keyword: float = 0.0
+
+
 class Hit(BaseModel):
     """One retrieval result, carrying the provenance a citation needs."""
 
@@ -122,6 +134,16 @@ class Hit(BaseModel):
     score: float
     semantic: float = 0.0
     keyword: float = 0.0
+    # Where in the document the excerpt came from, e.g.
+    # "4. Functional Requirements > KB-3. Ingestion". This is the difference
+    # between citing a file and citing a passage: it lets a reader check the
+    # claim without opening the document and searching it themselves.
+    heading: str = ""
+    # Every passage of this document that matched, best first. The document is
+    # the result, but the passages are the evidence — and a long document
+    # matching in six places is a materially different answer from one
+    # matching in a single line, which a document-level score cannot express.
+    passages: list[Passage] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
