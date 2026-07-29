@@ -31,7 +31,7 @@ export function Collections({
   const [docs, setDocs] = useState<Document[] | null>(null);
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState("");
-  const [view, setView] = useState<"graph" | "table">("graph");
+  const [view, setView] = useState<"graph" | "map" | "table">("graph");
   const [k, setK] = useState(3);
   const [shape, setShape] = useState<api.CollectionShape | null>(null);
 
@@ -64,11 +64,22 @@ export function Collections({
   useEffect(() => {
     let live = true;
     setShape(null);
-    if (!selected || view !== "graph") return;
+    if (!selected || view === "table") return;
     api
       .collectionGraph(selected, k)
       .then((s) => live && setShape(s))
-      .catch(() => live && setShape({ nodes: [], edges: [], truncated: false, k }));
+      .catch(
+        () =>
+          live &&
+          setShape({
+            nodes: [],
+            edges: [],
+            truncated: false,
+            k,
+            floor: 0,
+            projection: { method: "none", explained_variance: 0 },
+          })
+      );
     return () => {
       live = false;
     };
@@ -154,9 +165,15 @@ export function Collections({
             </Card>
 
             <div className="mb-2 flex items-center justify-between">
-              <Label>{view === "graph" ? "neighbour graph" : "documents"}</Label>
+              <Label>
+                {view === "graph"
+                  ? "neighbour graph"
+                  : view === "map"
+                    ? "embedding map"
+                    : "documents"}
+              </Label>
               <div className="flex items-center gap-3">
-                {view === "graph" && (
+                {view !== "table" && (
                   <div className="flex items-center gap-1.5">
                     <Label>k</Label>
                     {[2, 3, 5].map((n) => (
@@ -167,7 +184,7 @@ export function Collections({
                   </div>
                 )}
                 <div className="flex gap-1 rounded-lg border border-edge bg-elevated p-0.5">
-                  {(["graph", "table"] as const).map((v) => (
+                  {(["graph", "map", "table"] as const).map((v) => (
                     <button
                       key={v}
                       onClick={() => setView(v)}
@@ -183,19 +200,40 @@ export function Collections({
               </div>
             </div>
 
-            {view === "graph" ? (
+            {view !== "table" ? (
               shape === null ? (
                 <div className="flex h-64 items-center justify-center rounded-xl border border-edge font-mono text-2xs text-subtle">
                   building the neighbour graph…
                 </div>
               ) : (
                 <>
-                  <CollectionGraph nodes={shape.nodes} edges={shape.edges} />
+                  <CollectionGraph
+                    nodes={shape.nodes}
+                    edges={shape.edges}
+                    mode={view === "map" ? "map" : "graph"}
+                  />
                   <p className="mt-2 text-2xs leading-relaxed text-subtle">
-                    Each point is a document, joined to its {shape.k} nearest neighbours by
-                    cosine similarity — the edges are computed from the vectors, so this is
-                    the shape of the data rather than a diagram of it. Dashed orange edges are
-                    relationships the store recorded, such as one version superseding another.
+                    {view === "map" ? (
+                      <>
+                        Every document placed by its actual position in embedding space, so
+                        distance on screen is distance in the vectors — two points near each
+                        other really are alike. Flattening {shape.nodes[0] ? "1536" : "many"}{" "}
+                        dimensions to two loses something, and these axes keep{" "}
+                        <span className="text-muted">
+                          {(shape.projection.explained_variance * 100).toFixed(1)}%
+                        </span>{" "}
+                        of the variance.
+                      </>
+                    ) : (
+                      <>
+                        Each point is a document, joined to its {shape.k} nearest neighbours by
+                        cosine similarity, computed from the vectors — so this is the shape of
+                        the data rather than a diagram of it. Dashed orange edges are
+                        relationships the store recorded. Positions come from a force layout and
+                        carry no meaning; switch to the map to read distance. Edges below{" "}
+                        <span className="text-muted">{shape.floor}</span> similarity are dropped.
+                      </>
+                    )}
                     {shape.truncated && " Showing the first 200 documents."}
                   </p>
                 </>

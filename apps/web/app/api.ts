@@ -158,10 +158,14 @@ export type CollectionShape = {
     degree: number;
     category: string | null;
     categoryName: string | null;
+    px?: number | null;
+    py?: number | null;
   }[];
   edges: { src: string; dst: string; similarity: number; kind: string }[];
   truncated: boolean;
   k: number;
+  floor: number;
+  projection: { method: string; explained_variance: number };
 };
 
 /** The collection as a neighbour graph, built from the embeddings themselves. */

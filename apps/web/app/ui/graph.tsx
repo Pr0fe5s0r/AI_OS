@@ -24,6 +24,10 @@ export type GraphNode = {
   degree: number;
   category: string | null;
   categoryName: string | null;
+  /** Position in embedding space, 0..1, from the projection. Unlike the force
+   *  layout these coordinates carry meaning, so distance can be read. */
+  px?: number | null;
+  py?: number | null;
 };
 
 export type GraphEdge = {
@@ -160,13 +164,36 @@ function layout(nodes: GraphNode[], edges: GraphEdge[]): Placed[] {
   }));
 }
 
+/** The projection laid out in the same coordinate space as the force layout,
+ *  so the two views are interchangeable to everything downstream. */
+function placeByProjection(nodes: GraphNode[]): Placed[] {
+  const pad = 46;
+  const maxDegree = Math.max(1, ...nodes.map((n) => n.degree));
+  const round = (n: number) => Math.round(n * 100) / 100;
+  return nodes
+    .filter((n) => n.px != null && n.py != null)
+    .map((n) => ({
+      ...n,
+      x: round(pad + (n.px as number) * (W - pad * 2)),
+      // SVG y grows downward; the projection's does not, so it is flipped to
+      // keep the picture the same way up as the numbers.
+      y: round(pad + (1 - (n.py as number)) * (H - pad * 2)),
+      r: round(5 + (n.degree / maxDegree) * 7),
+    }));
+}
+
 export function CollectionGraph({
   nodes,
   edges,
+  mode = "graph",
   onOpen,
 }: {
   nodes: GraphNode[];
   edges: GraphEdge[];
+  /** `graph` runs the force layout; `map` uses the projection's real
+   *  coordinates. The distinction matters: only one of them lets you read
+   *  distance. */
+  mode?: "graph" | "map";
   onOpen?: (id: string) => void;
 }) {
   const [hover, setHover] = useState<string | null>(null);
@@ -178,7 +205,7 @@ export function CollectionGraph({
     setReady(false);
     const id = requestAnimationFrame(() => setReady(true));
     return () => cancelAnimationFrame(id);
-  }, [nodes, edges]);
+  }, [nodes, edges, mode]);
 
   const categoryIndex = useMemo(() => {
     const index = new Map<string, number>();
@@ -188,7 +215,10 @@ export function CollectionGraph({
     return index;
   }, [nodes]);
 
-  const placed = useMemo(() => (ready ? layout(nodes, edges) : []), [nodes, edges, ready]);
+  const placed = useMemo(
+    () => (!ready ? [] : mode === "map" ? placeByProjection(nodes) : layout(nodes, edges)),
+    [nodes, edges, ready, mode]
+  );
   const byId = useMemo(() => new Map(placed.map((p) => [p.id, p])), [placed]);
 
   const legend = useMemo(() => {
@@ -255,7 +285,13 @@ export function CollectionGraph({
                   stroke={declared ? "#ff9d5c" : HEAT_HEX[simBand(e.similarity)]}
                   strokeWidth={declared ? 1.6 : 0.5 + e.similarity * 1.4}
                   strokeDasharray={declared ? "4 3" : undefined}
-                  opacity={dim ? 0.06 : declared ? 0.9 : 0.22 + e.similarity * 0.4}
+                  opacity={
+                    dim
+                      ? 0.06
+                      : declared
+                        ? 0.9
+                        : (mode === "map" ? 0.1 : 0.22) + e.similarity * (mode === "map" ? 0.18 : 0.4)
+                  }
                 />
               );
             })}

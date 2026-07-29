@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core import graph
 from packages.core.classify import classes_for
+from packages.core.projection import project
 from packages.shared.schema import Scope
 
 # ---------------------------------------------------------------------------
@@ -129,6 +130,10 @@ async def collection_graph(
         for d in declared
     ]
 
+    # The same vectors, flattened to two dimensions. Done here rather than in
+    # its own endpoint so a collection's 1536-float embeddings are read once.
+    flattened = project(points)
+
     # Categories give the cloud its colour: a well-organised collection shows
     # its groups as clusters, and one that does not is telling you something.
     tagged = await classes_for(session, scope, ids)
@@ -146,6 +151,10 @@ async def collection_graph(
             "degree": degree.get(p["id"], 0),
             "category": (tagged.get(p["id"]) or [{}])[0].get("class_id"),
             "categoryName": (tagged.get(p["id"]) or [{}])[0].get("name"),
+            # Position in embedding space, 0..1. Distinct from the force
+            # layout: these coordinates mean something.
+            "px": flattened["coords"].get(p["id"], {}).get("x"),
+            "py": flattened["coords"].get(p["id"], {}).get("y"),
         }
         for p in points
     ]
@@ -157,6 +166,10 @@ async def collection_graph(
         "k": k,
         # Shown in the view: a threshold nobody can see is one nobody can argue with.
         "floor": floor,
+        "projection": {
+            "method": flattened["method"],
+            "explained_variance": flattened["explained_variance"],
+        },
     }
 
 
