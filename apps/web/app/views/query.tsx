@@ -7,17 +7,66 @@ import { Card, Chip, HeatLegend, Label, Mono, ScoreBar, VectorField } from "../u
 
 /** Query & chat.
  *
- *  This asks the store a question and shows what came back, with the passage
- *  that matched and a link to the trace. It deliberately does NOT compose a
- *  written answer: nothing here generates prose, so every line on screen is a
- *  passage that exists in the store, attributable to a document. */
+ *  Asks the store a question, writes an answer from what it found, and shows
+ *  the passages underneath.
+ *
+ *  An earlier version showed passages ONLY, on the principle that every line
+ *  on screen should be real text from a real document. That principle is kept
+ *  rather than dropped: the answer must cite the passages it used, the
+ *  citations are clickable and land on the passage, and an answer that cites
+ *  nothing is marked as unsupported instead of being presented as fact. Prose
+ *  you cannot trace is the thing worth refusing, not prose. */
 type Turn = {
   question: string;
+  answer: string;
+  citations: api.Citation[];
+  grounded: boolean;
   matches: Point[];
   tookMs: number;
   traceId: string;
   degraded: string | null;
 };
+
+/** Turn the [n] markers in an answer into buttons that open the passage.
+ *
+ *  Split rather than replaced into HTML: the answer is model output, and
+ *  putting model output through anything that interprets markup is how a
+ *  store starts rendering whatever a document happened to contain. */
+function renderAnswer(
+  text: string,
+  citations: api.Citation[],
+  onOpen: (c: api.Citation) => void
+): React.ReactNode[] {
+  const byMarker = new Map(citations.map((c) => [c.marker, c]));
+  const out: React.ReactNode[] = [];
+  const pattern = /\[(\d+)\]/g;
+  let last = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = pattern.exec(text)) !== null) {
+    if (match.index > last) out.push(text.slice(last, match.index));
+    const cited = byMarker.get(Number(match[1]));
+    out.push(
+      cited ? (
+        <button
+          key={`${match.index}-${match[1]}`}
+          onClick={() => onOpen(cited)}
+          title={cited.heading || cited.title}
+          className="mx-0.5 rounded bg-accent/20 px-1 align-super font-mono text-[0.6rem] text-accentSoft transition hover:bg-accent/40"
+        >
+          {match[1]}
+        </button>
+      ) : (
+        // A marker the answer invented. It points at nothing, so it is not
+        // shown as though it were checkable.
+        <span key={`${match.index}-x`} />
+      )
+    );
+    last = match.index + match[0].length;
+  }
+  if (last < text.length) out.push(text.slice(last));
+  return out;
+}
 
 export function Query({ collections }: { collections: Collection[] }) {
   const [collectionId, setCollectionId] = useState<string | undefined>(collections[0]?.id);
@@ -25,6 +74,7 @@ export function Query({ collections }: { collections: Collection[] }) {
   const [turns, setTurns] = useState<Turn[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [focus, setFocus] = useState<api.Citation | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -38,11 +88,14 @@ export function Query({ collections }: { collections: Collection[] }) {
     setError(null);
     setQuestion("");
     try {
-      const out = await api.search(collectionId, q, 8);
+      const out = await api.ask(collectionId, q, 8);
       setTurns((t) => [
         ...t,
         {
           question: q,
+          answer: out.answer,
+          citations: out.citations,
+          grounded: out.grounded,
           matches: out.matches,
           tookMs: out.tookMs,
           traceId: out.traceId,
@@ -59,7 +112,7 @@ export function Query({ collections }: { collections: Collection[] }) {
   const latest = turns[turns.length - 1];
 
   return (
-    <div className="flex h-full min-h-0">
+    <div className="relative flex h-full min-h-0">
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="flex shrink-0 items-center gap-3 border-b border-edge px-6 py-3">
           <h1 className="text-sm font-semibold text-ink">Query &amp; chat</h1>
@@ -85,9 +138,10 @@ export function Query({ collections }: { collections: Collection[] }) {
             <div className="mx-auto max-w-lg py-16 text-center">
               <h2 className="text-sm text-ink">Ask your data a question</h2>
               <p className="mt-2 text-xs leading-relaxed text-subtle">
-                Your question is embedded and matched against the collection by meaning and
-                by exact wording together. Every passage shown is one that exists in a
-                document — nothing here is written for you.
+                Your question is matched against the collection by meaning and by exact
+                wording together, and the answer is written from what comes back. Every
+                claim carries a number you can click to see the passage behind it — and
+                an answer with nothing behind it is labelled as such.
               </p>
             </div>
           )}
@@ -101,6 +155,48 @@ export function Query({ collections }: { collections: Collection[] }) {
                   </span>
                   <p className="text-sm text-ink">{t.question}</p>
                 </div>
+
+                {/* The answer. Its citations are the whole point: a claim you
+                    cannot follow back to a passage is one this store has no
+                    business making. */}
+                {t.answer && (
+                  <div className="mb-3 pl-8">
+                    <div
+                      className={cx(
+                        "rounded-xl border p-4",
+                        t.grounded
+                          ? "border-edge bg-elevated/50"
+                          : "border-hot/30 bg-hot/5"
+                      )}
+                    >
+                      <p className="whitespace-pre-wrap text-sm leading-relaxed text-ink">
+                        {renderAnswer(t.answer, t.citations, setFocus)}
+                      </p>
+
+                      {!t.grounded && (
+                        <p className="mt-2.5 border-t border-hot/20 pt-2 font-mono text-2xs text-hot">
+                          not supported by the collection — nothing below was cited
+                        </p>
+                      )}
+
+                      {t.citations.length > 0 && (
+                        <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-edge pt-2.5">
+                          <Label>from</Label>
+                          {t.citations.map((c) => (
+                            <button
+                              key={c.chunk_id}
+                              onClick={() => setFocus(c)}
+                              title={c.text.slice(0, 300)}
+                              className="max-w-[15rem] truncate rounded-md border border-accent/30 bg-accent/10 px-2 py-0.5 font-mono text-2xs text-accentSoft transition hover:border-accent/60"
+                            >
+                              [{c.marker}] {c.heading || c.title}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
 
                 <div className="mb-2 flex flex-wrap items-center gap-2 pl-8">
                   <Mono className="text-2xs text-subtle">
@@ -231,6 +327,35 @@ export function Query({ collections }: { collections: Collection[] }) {
             </button>
           </form>
         </div>
+
+        {/* The passage behind a citation, in full. The point of a citation is
+            that it can be checked, which means the actual text has to be
+            reachable without leaving the answer. */}
+        {focus && (
+          <div className="absolute inset-x-0 bottom-0 z-10 border-t border-edgeStrong bg-raised/97 backdrop-blur">
+            <div className="mx-auto max-w-2xl px-6 py-4">
+              <div className="mb-2 flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="truncate text-xs font-medium text-ink">{focus.title}</div>
+                  {focus.heading && (
+                    <div className="truncate font-mono text-2xs text-accentSoft">
+                      {focus.heading}
+                    </div>
+                  )}
+                </div>
+                <button
+                  onClick={() => setFocus(null)}
+                  className="shrink-0 rounded-md border border-edge px-2 py-0.5 font-mono text-2xs text-subtle transition hover:text-ink"
+                >
+                  close
+                </button>
+              </div>
+              <p className="max-h-56 overflow-y-auto whitespace-pre-wrap text-xs leading-relaxed text-muted">
+                {focus.text}
+              </p>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* the retrieval space */}

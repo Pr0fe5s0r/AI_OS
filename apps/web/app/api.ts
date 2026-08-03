@@ -330,6 +330,47 @@ export type SearchOutcome = {
   degraded: string | null;
 };
 
+/** One result as the API sends it. Shared by search and answer, which return
+ *  the same result shape — answer simply adds written prose above it. */
+type RawResult = {
+  item_id: string;
+  title: string;
+  excerpt: string;
+  score: number;
+  semantic: number;
+  keyword: number;
+  heading?: string;
+  passages?: {
+    chunk_id: string;
+    ordinal: number;
+    heading: string;
+    text: string;
+    score: number;
+    semantic: number;
+    keyword: number;
+  }[];
+  source: { source: string; locator: string; url?: string | null };
+  classes?: Category[];
+};
+
+// Highlight markers are the server's business, not the reader's.
+const unmark = (text: string) => (text || "").replace(/\[\[|\]\]/g, "");
+
+const toPoint = (r: RawResult): Point => ({
+  id: r.item_id,
+  title: r.title,
+  excerpt: unmark(r.excerpt),
+  score: r.score,
+  semantic: r.semantic,
+  keyword: r.keyword,
+  source: r.source?.source || "",
+  locator: r.source?.locator || "",
+  url: r.source?.url,
+  categories: r.classes || [],
+  heading: r.heading || "",
+  passages: (r.passages || []).map((p) => ({ ...p, text: unmark(p.text) })),
+});
+
 export async function search(
   collectionId: string | undefined,
   query: string,
@@ -339,26 +380,7 @@ export async function search(
     trace_id: string;
     took_ms: number;
     degraded: string | null;
-    results: {
-      item_id: string;
-      title: string;
-      excerpt: string;
-      score: number;
-      semantic: number;
-      keyword: number;
-      heading?: string;
-      passages?: {
-        chunk_id: string;
-        ordinal: number;
-        heading: string;
-        text: string;
-        score: number;
-        semantic: number;
-        keyword: number;
-      }[];
-      source: { source: string; locator: string; url?: string | null };
-      classes?: Category[];
-    }[];
+    results: RawResult[];
   }>(`/api/search?q=${encodeURIComponent(query)}&limit=${limit}`, {
     collection: collectionId,
   });
@@ -367,24 +389,56 @@ export async function search(
     traceId: payload.trace_id,
     tookMs: payload.took_ms,
     degraded: payload.degraded,
-    matches: payload.results.map((r) => ({
-      id: r.item_id,
-      title: r.title,
-      // Highlight markers are the server's business, not the reader's.
-      excerpt: (r.excerpt || "").replace(/\[\[|\]\]/g, ""),
-      score: r.score,
-      semantic: r.semantic,
-      keyword: r.keyword,
-      source: r.source?.source || "",
-      locator: r.source?.locator || "",
-      url: r.source?.url,
-      categories: r.classes || [],
-      heading: r.heading || "",
-      passages: (r.passages || []).map((p) => ({
-        ...p,
-        text: p.text.replace(/\[\[|\]\]/g, ""),
-      })),
-    })),
+    matches: payload.results.map(toPoint),
+  };
+}
+
+export type Citation = {
+  marker: number;
+  chunk_id: string;
+  item_id: string;
+  title: string;
+  heading: string;
+  text: string;
+  score: number;
+};
+
+export type AnswerOutcome = SearchOutcome & {
+  answer: string;
+  citations: Citation[];
+  /** False when the store had nothing to answer from, when the model said the
+   *  passages did not cover the question, or when it wrote prose citing
+   *  nothing. The difference between an answer and a guess. */
+  grounded: boolean;
+};
+
+/** Retrieval plus a written answer built only from what was retrieved.
+ *  Separate from `search`, which never returns generated text. */
+export async function ask(
+  collectionId: string | undefined,
+  question: string,
+  limit = 8
+): Promise<AnswerOutcome> {
+  const payload = await call<{
+    answer: string;
+    grounded: boolean;
+    citations: Citation[];
+    trace_id: string;
+    took_ms: number;
+    degraded: string | null;
+    results: RawResult[];
+  }>(`/api/answer?q=${encodeURIComponent(question)}&limit=${limit}`, {
+    collection: collectionId,
+  });
+
+  return {
+    answer: payload.answer,
+    grounded: payload.grounded,
+    citations: payload.citations || [],
+    traceId: payload.trace_id,
+    tookMs: payload.took_ms,
+    degraded: payload.degraded,
+    matches: (payload.results || []).map(toPoint),
   };
 }
 

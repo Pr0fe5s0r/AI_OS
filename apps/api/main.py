@@ -16,6 +16,7 @@ from apps.api.auth_routes import router as auth_router
 from apps.common.consolidation import enabled as consolidation_enabled
 from apps.common.consolidation import interval_seconds as consolidation_interval
 from packages.core import graph
+from packages.core.answer import answer
 from packages.core.chunks import by_ids as chunks_by_ids
 from packages.core.classify import (
     bulk_override,
@@ -234,6 +235,51 @@ async def retrieve(
         "took_ms": trace.duration_ms,
         "results": [
             {**h.model_dump(), "classes": tagged.get(h.item_id, [])} for h in hits
+        ],
+    }
+
+
+@app.get("/api/answer")
+async def answer_question(
+    q: str = Query(min_length=1),
+    limit: int = Query(8, ge=1, le=20),
+    sources: list[str] | None = Query(None),
+    scope: Scope = Depends(workspace_scope),
+    principal: dict[str, Any] = Depends(resolve_caller),
+    session: AsyncSession = Depends(db),
+) -> dict[str, Any]:
+    """Retrieval, then a written answer built only from what was retrieved.
+
+    Separate from /api/search on purpose. Search is the contract other software
+    builds on and returns only what the store holds; this adds a written layer
+    on top of it. A caller that must never see generated prose keeps using
+    search and is unaffected by anything here.
+
+    The answer carries `grounded`, which is false when the store had nothing to
+    answer from, when the model said the passages did not cover the question,
+    or when it produced prose citing nothing. That flag is the difference
+    between an answer and a guess, so it travels with the text rather than
+    being left for the reader to infer.
+    """
+    cfg = RetrievalConfig(limit=limit, sources=tuple(sources or ()))
+    result, trace = await answer(session, scope, q, cfg)
+
+    # Recorded once, under the retrieval that produced it: an answer whose
+    # retrieval cannot be inspected is not one anybody can argue with.
+    await record(
+        session,
+        scope,
+        trace,
+        via=str(principal.get("via", "session")),
+        actor=str(principal.get("email") or ""),
+    )
+    await session.commit()
+
+    tagged = await classes_for(session, scope, [h.item_id for h in result.hits])
+    return {
+        **result.as_dict(),
+        "results": [
+            {**h.model_dump(), "classes": tagged.get(h.item_id, [])} for h in result.hits
         ],
     }
 

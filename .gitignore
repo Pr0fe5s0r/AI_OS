@@ -7,3 +7,6 @@ node_modules/
 
 # TS build artifact
 apps/web/tsconfig.tsbuildinfo
+
+# A separately cloned repository, not part of this project.
+PageIndex/
