@@ -32,6 +32,8 @@ export function Collections({
   const [failed, setFailed] = useState<{ locator: string; reason: string }[]>([]);
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState("");
+  const [renaming, setRenaming] = useState(false);
+  const [newName, setNewName] = useState("");
   const [view, setView] = useState<"graph" | "map" | "table">("graph");
   const [k, setK] = useState(3);
   const [shape, setShape] = useState<api.CollectionShape | null>(null);
@@ -123,6 +125,24 @@ export function Collections({
     }
   }
 
+  async function rename() {
+    if (!detail) return;
+    const next = newName.trim();
+    if (!next || next === detail.name) {
+      setRenaming(false);
+      return;
+    }
+    try {
+      await api.renameCollection(detail.id, next);
+      setDetail({ ...detail, name: next });
+      setRenaming(false);
+      await onChanged();
+      toast("Collection renamed");
+    } catch (e) {
+      toast((e as Error).message);
+    }
+  }
+
   async function drop(c: Collection) {
     if (
       !confirm(
@@ -154,7 +174,40 @@ export function Collections({
           <>
             <div className="mb-5 flex flex-wrap items-start justify-between gap-4">
               <div>
-                <h1 className="font-mono text-base font-semibold text-ink">{detail.name}</h1>
+                {renaming ? (
+                  <div className="flex items-center gap-2">
+                    <input
+                      autoFocus
+                      value={newName}
+                      onChange={(e) => setNewName(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") rename();
+                        if (e.key === "Escape") setRenaming(false);
+                      }}
+                      className="rounded-lg border border-edge bg-canvas px-2.5 py-1 font-mono text-base font-semibold text-ink outline-none focus:border-accent/60"
+                    />
+                    <Button variant="primary" onClick={rename} disabled={!newName.trim()}>
+                      Save
+                    </Button>
+                    <Button onClick={() => setRenaming(false)}>Cancel</Button>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-2">
+                    <h1 className="font-mono text-base font-semibold text-ink">
+                      {detail.name}
+                    </h1>
+                    <button
+                      onClick={() => {
+                        setNewName(detail.name);
+                        setRenaming(true);
+                      }}
+                      title="Rename this collection"
+                      className="font-mono text-2xs text-subtle transition hover:text-ink"
+                    >
+                      rename
+                    </button>
+                  </div>
+                )}
                 <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
                   <Chip>{detail.id}</Chip>
                   <Chip tone="text-heat-2 border-heat-2/30 bg-heat-2/10">cosine</Chip>

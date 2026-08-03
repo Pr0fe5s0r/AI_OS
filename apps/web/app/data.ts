@@ -54,6 +54,8 @@ export type ApiKey = {
    *  never retrievable — so there is no "reveal" to offer. */
   prefix: string;
   scopes: string[];
+  /** The collection this key is locked to, or null for a workspace-wide key. */
+  collectionId: string | null;
   createdBy: string | null;
   createdAt: string;
   lastUsed: string | null;
@@ -61,7 +63,13 @@ export type ApiKey = {
 };
 
 /** A key at the moment it is minted — the only time the secret exists. */
-export type MintedKey = { id: string; name: string; key: string; scopes: string[] };
+export type MintedKey = {
+  id: string;
+  name: string;
+  key: string;
+  scopes: string[];
+  collectionId: string | null;
+};
 
 export type TraceStatus = "ok" | "slow" | "degraded" | "empty";
 
@@ -144,6 +152,9 @@ export type Document = {
   status: string;
   createdAt: string | null;
   categories: Category[];
+  /** The file as uploaded, when the store kept it. null for text pasted
+   *  directly, older uploads, or files over the size cap. */
+  original: { filename: string; contentType: string; size: number } | null;
 };
 
 // -------------------------------- scales ---------------------------------

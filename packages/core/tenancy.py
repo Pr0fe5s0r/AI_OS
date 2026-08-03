@@ -62,6 +62,10 @@ async def resolve_caller(
             "email": f"key:{holder['name']}",
             "key_id": holder["key_id"],
             "scopes": holder["scopes"],
+            # None means the key is workspace-wide; a value locks every call it
+            # makes to that one collection. Read by workspace_scope and
+            # enforce_binding, never trusted from the request.
+            "collection_id": holder.get("collection_id"),
             "via": "api_key",
         }
 
@@ -72,13 +76,34 @@ async def resolve_caller(
         raise HTTPException(
             401, "Not signed in. Provide a session cookie or an API key."
         )
-    return {**principal, "via": "session", "scopes": ["read", "write"]}
+    # A signed-in person is never collection-bound: the console reads across
+    # collections, and binding is a property of a key, not of a session.
+    return {
+        **principal,
+        "via": "session",
+        "scopes": ["read", "write"],
+        "collection_id": None,
+    }
 
 
 def require_write(principal: dict[str, Any]) -> None:
     """A read-only key must not be able to write. Checked at the edge, once."""
     if "write" not in principal.get("scopes", ["write"]):
         raise HTTPException(403, "This key is read-only.")
+
+
+def enforce_binding(principal: dict[str, Any], collection_id: str) -> None:
+    """A collection-bound key may only touch the collection it names.
+
+    `workspace_scope` already closes the header path, but several endpoints read
+    the collection straight from the URL — `/api/collections/{id}/...` — and
+    build their own Scope, so the binding has to be checked there too. Without
+    this, a key bound to collection A could read or delete collection B just by
+    putting B in the path, which is exactly the isolation the binding promises.
+    """
+    bound = principal.get("collection_id")
+    if bound is not None and bound != collection_id:
+        raise HTTPException(403, f"This key is limited to collection {bound!r}.")
 
 
 async def company_scope(principal: dict[str, Any] = Depends(current_principal)) -> str:
@@ -101,8 +126,20 @@ async def workspace_scope(
 
     Omitting the header scopes to the entire workspace, which is the right
     default for a console looking across collections.
+
+    A collection-bound key overrides all of this: it is confined to its one
+    collection whatever the header says. A missing header resolves to the bound
+    collection rather than to the whole workspace; a header naming a different
+    collection is refused. The binding is already known to exist (it was
+    validated when the key was minted), so no second lookup is needed.
     """
     workspace_id = str(principal["company_id"])
+    bound = principal.get("collection_id")
+    if bound is not None:
+        if x_collection is not None and x_collection != bound:
+            raise HTTPException(403, f"This key is limited to collection {bound!r}.")
+        return Scope(workspace_id=workspace_id, collection_id=bound)
+
     if x_collection is None:
         return Scope(workspace_id=workspace_id)
 

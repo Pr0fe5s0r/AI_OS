@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useState } from "react";
 import * as api from "../api";
 import {
-  Collection,
   HEAT_HEX,
   Trace,
   TraceDetail,
@@ -24,8 +23,8 @@ import { Card, Chip, Empty, Label, Mono, Stat } from "../ui/kit";
  *  A trace holds each arm's candidates and scores, what survived the filters,
  *  and where the time went — so a bad result is a thing you read, not a thing
  *  you guess at. */
-export function Traces({ collections }: { collections: Collection[] }) {
-  const [collectionId, setCollectionId] = useState<string | undefined>(undefined);
+export function Traces({ active }: { active: string | null }) {
+  const collectionId = active ?? undefined;
   const [filter, setFilter] = useState<"all" | "empty" | "degraded">("all");
   const [rows, setRows] = useState<Trace[] | null>(null);
   const [stats, setStats] = useState<api.TraceStats | null>(null);
@@ -33,15 +32,15 @@ export function Traces({ collections }: { collections: Collection[] }) {
 
   const load = useCallback(async () => {
     const [list, summary] = await Promise.all([
-      api.traces(collectionId, {
+      api.traces(active ?? undefined, {
         onlyEmpty: filter === "empty",
         onlyDegraded: filter === "degraded",
       }),
-      api.traceStats(collectionId).catch(() => null),
+      api.traceStats(active ?? undefined).catch(() => null),
     ]);
     setRows(list);
     setStats(summary);
-  }, [collectionId, filter]);
+  }, [active, filter]);
 
   useEffect(() => {
     setRows(null);
@@ -115,19 +114,10 @@ export function Traces({ collections }: { collections: Collection[] }) {
       )}
 
       <div className="mb-3 flex flex-wrap items-center gap-2">
-        <Label>collection</Label>
-        <Chip active={!collectionId} onClick={() => setCollectionId(undefined)}>
-          all
+        <Label>scope</Label>
+        <Chip tone={collectionId ? "text-accentSoft border-accent/40 bg-accent/10" : undefined}>
+          {collectionId || "all collections"}
         </Chip>
-        {collections.map((c) => (
-          <Chip
-            key={c.id}
-            active={collectionId === c.id}
-            onClick={() => setCollectionId(c.id)}
-          >
-            {c.id}
-          </Chip>
-        ))}
         <span className="mx-2 h-4 w-px bg-edge" />
         <Label>show</Label>
         {(["all", "empty", "degraded"] as const).map((f) => (

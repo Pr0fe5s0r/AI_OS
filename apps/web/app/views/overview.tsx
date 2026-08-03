@@ -5,7 +5,15 @@ import * as api from "../api";
 import { Cluster, Collection, Trace, ago, cx, ms, num, statusTone, traceStatus } from "../data";
 import { Button, Card, Chip, HeatLegend, Label, Mono, Stat, VectorField } from "../ui/kit";
 
-type Section = "overview" | "collections" | "upload" | "query" | "keys" | "sdk" | "traces";
+type Section =
+  | "overview"
+  | "collections"
+  | "upload"
+  | "query"
+  | "keys"
+  | "sdk"
+  | "playground"
+  | "traces";
 
 /** The cluster at a glance.
  *

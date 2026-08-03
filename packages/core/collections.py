@@ -248,6 +248,29 @@ async def get_collection(
     }
 
 
+async def rename_collection(
+    session: AsyncSession, workspace_id: str, collection_id: str, name: str
+) -> dict[str, Any] | None:
+    """Change a collection's display name. Only the name.
+
+    The id is the collection's stable handle — it is in every URL, every SDK
+    snippet, and the Scope stamped on every vector beneath it — so it is fixed
+    at creation and cannot be edited here. Returns the renamed collection, or
+    None when nothing matched, which the caller turns into a 404 rather than a
+    silent success against a collection that does not exist.
+    """
+    result = await session.execute(
+        text(
+            "UPDATE collections SET name = :name "
+            "WHERE workspace_id = :ws AND collection_id = :cid"
+        ),
+        {"ws": workspace_id, "cid": collection_id, "name": name},
+    )
+    if not result.rowcount:
+        return None
+    return {"collection_id": collection_id, "name": name}
+
+
 async def delete_collection(
     session: AsyncSession, workspace_id: str, collection_id: str
 ) -> int:
@@ -283,6 +306,7 @@ __all__ = [
     "ensure_default_cluster",
     "get_collection",
     "list_clusters",
+    "rename_collection",
     "scope_for",
     "slugify",
     "valid_id",

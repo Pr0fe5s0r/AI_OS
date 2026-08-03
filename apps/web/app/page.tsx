@@ -8,12 +8,21 @@ import { Collections } from "./views/collections";
 import { Gate } from "./views/gate";
 import { Keys } from "./views/keys";
 import { Overview } from "./views/overview";
+import { Playground } from "./views/playground";
 import { Query } from "./views/query";
 import { Sdk } from "./views/sdk";
 import { Traces } from "./views/traces";
 import { Upload } from "./views/upload";
 
-type Section = "overview" | "collections" | "upload" | "query" | "keys" | "sdk" | "traces";
+type Section =
+  | "overview"
+  | "collections"
+  | "upload"
+  | "query"
+  | "keys"
+  | "sdk"
+  | "playground"
+  | "traces";
 
 const NAV: { id: Section; label: string; icon: string; group: string }[] = [
   { id: "overview", label: "Overview", icon: "M3 3h7v7H3zM14 3h7v4h-7zM14 10h7v11h-7zM3 14h7v7H3z", group: "Cluster" },
@@ -21,11 +30,12 @@ const NAV: { id: Section; label: string; icon: string; group: string }[] = [
   { id: "upload", label: "Upload data", icon: "M12 15V4m0 0L8 8m4-4l4 4M4 17v2a1 1 0 001 1h14a1 1 0 001-1v-2", group: "Data" },
   { id: "query", label: "Query & chat", icon: "M21 12a9 9 0 01-9 9 9 9 0 01-4-1l-4 1 1-4a9 9 0 1116-5z", group: "Data" },
   { id: "traces", label: "Traces", icon: "M3 12h4l3 8 4-16 3 8h4", group: "Data" },
-  { id: "keys", label: "API keys", icon: "M15 7a4 4 0 11-3.8 5.3L7 16.5 5 15l1.5-2L4 11l2-2 3.2 3.2A4 4 0 0115 7z", group: "Develop" },
-  { id: "sdk", label: "SDK & docs", icon: "M8 9l-4 3 4 3m8-6l4 3-4 3M13 5l-2 14", group: "Develop" },
+  { id: "sdk", label: "SDK & docs", icon: "M8 9l-4 3 4 3m8-6l4 3-4 3M13 5l-2 14", group: "Developer" },
+  { id: "keys", label: "API keys", icon: "M15 7a4 4 0 11-3.8 5.3L7 16.5 5 15l1.5-2L4 11l2-2 3.2 3.2A4 4 0 0115 7z", group: "Developer" },
+  { id: "playground", label: "Playground", icon: "M8 3H5a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-3M7 8l4 4-4 4M13 16h5", group: "Developer" },
 ];
 
-const GROUPS = ["Cluster", "Data", "Develop"];
+const GROUPS = ["Cluster", "Data", "Developer"];
 
 export default function Page() {
   const [me, setMe] = useState<api.Me | null | undefined>(undefined);
@@ -33,7 +43,12 @@ export default function Page() {
   const [section, setSection] = useState<Section>("overview");
   const [clusterId, setClusterId] = useState<string | null>(null);
   const [collectionId, setCollectionId] = useState<string | null>(null);
+  // The active collection every data/developer view runs inside. null = the
+  // whole workspace ("All collections"). Distinct from collectionId, which is
+  // only which collection the Collections manager has open.
+  const [active, setActive] = useState<string | null>(null);
   const [switcher, setSwitcher] = useState(false);
+  const [collOpen, setCollOpen] = useState(false);
   const { toast, node } = useToast();
 
   const load = useCallback(async () => {
@@ -65,6 +80,7 @@ export default function Page() {
       setClusters(null);
       setClusterId(null);
       setCollectionId(null);
+      setActive(null);
     });
     return () => api.onUnauthorized(null);
   }, []);
@@ -96,6 +112,62 @@ export default function Page() {
       <aside className="flex w-56 shrink-0 flex-col border-r border-edge bg-panel">
         <div className="flex h-14 items-center border-b border-edge px-4">
           <Logo />
+        </div>
+
+        {/* Active collection — the scope every data & developer view runs in.
+            Chosen once here rather than re-picked on each screen. */}
+        <div className="relative border-b border-edge px-3 py-3">
+          <Label className="px-1">Collection</Label>
+          <button
+            onClick={() => setCollOpen((o) => !o)}
+            disabled={!cluster}
+            className="mt-1.5 flex w-full items-center gap-2 rounded-lg border border-edge bg-elevated px-2.5 py-2 transition hover:border-edgeStrong disabled:opacity-50"
+          >
+            <span
+              className={cx(
+                "h-2 w-2 shrink-0 rounded-full",
+                active ? "bg-accent" : "bg-subtle"
+              )}
+            />
+            <Mono className="min-w-0 flex-1 truncate text-left text-xs text-ink">
+              {active || "All collections"}
+            </Mono>
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-subtle">
+              <path d="M6 9l6 6 6-6" />
+            </svg>
+          </button>
+
+          {collOpen && cluster && (
+            <>
+              <div className="fixed inset-0 z-20" onClick={() => setCollOpen(false)} />
+              <div className="card-in absolute inset-x-3 top-full z-30 mt-1 max-h-72 overflow-y-auto rounded-xl border border-edgeStrong bg-raised p-1.5 shadow-2xl shadow-black/50">
+                {[null, ...collections.map((c) => c.id)].map((id) => (
+                  <button
+                    key={id ?? "__all__"}
+                    onClick={() => {
+                      setActive(id);
+                      setCollOpen(false);
+                    }}
+                    className={cx(
+                      "flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left transition",
+                      id === active ? "bg-accent/10" : "hover:bg-elevated"
+                    )}
+                  >
+                    <span
+                      className={cx(
+                        "h-2 w-2 shrink-0 rounded-full",
+                        id ? "bg-accent" : "bg-subtle"
+                      )}
+                    />
+                    <Mono className="min-w-0 flex-1 truncate text-xs text-ink">
+                      {id || "All collections"}
+                    </Mono>
+                    {id === active && <span className="h-1.5 w-1.5 rounded-full bg-accent" />}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
         </div>
 
         <nav className="flex-1 space-y-5 overflow-y-auto px-3 py-4">
@@ -189,6 +261,7 @@ export default function Page() {
                     onClick={() => {
                       setClusterId(c.id);
                       setCollectionId(null);
+                      setActive(null);
                       setSwitcher(false);
                     }}
                     className={cx(
@@ -257,12 +330,18 @@ export default function Page() {
                 />
               )}
               {section === "upload" && (
-                <Upload collections={collections} toast={toast} onIngested={load} />
+                <Upload
+                  collections={collections}
+                  active={active}
+                  toast={toast}
+                  onIngested={load}
+                />
               )}
-              {section === "query" && <Query collections={collections} />}
-              {section === "keys" && <Keys toast={toast} />}
-              {section === "sdk" && <Sdk collections={collections} />}
-              {section === "traces" && <Traces collections={collections} />}
+              {section === "query" && <Query active={active} />}
+              {section === "keys" && <Keys collections={collections} toast={toast} />}
+              {section === "sdk" && <Sdk collections={collections} active={active} />}
+              {section === "playground" && <Playground active={active} />}
+              {section === "traces" && <Traces active={active} />}
             </>
           )}
         </div>

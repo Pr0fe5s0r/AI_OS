@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import * as api from "../api";
-import { Collection, Point, cx, ms } from "../data";
+import { Point, cx, ms } from "../data";
 import { Card, Chip, HeatLegend, Label, Mono, ScoreBar, VectorField } from "../ui/kit";
 
 /** Query & chat.
@@ -69,8 +69,8 @@ function renderAnswer(
   return out;
 }
 
-export function Query({ collections }: { collections: Collection[] }) {
-  const [collectionId, setCollectionId] = useState<string | undefined>(collections[0]?.id);
+export function Query({ active }: { active: string | null }) {
+  const collectionId = active ?? undefined;
   const [question, setQuestion] = useState("");
   const [turns, setTurns] = useState<Turn[]>([]);
   const [busy, setBusy] = useState(false);
@@ -157,19 +157,10 @@ export function Query({ collections }: { collections: Collection[] }) {
                 ))}
               </div>
             </div>
-            <Label>collection</Label>
-            <select
-              value={collectionId || ""}
-              onChange={(e) => setCollectionId(e.target.value || undefined)}
-              className="rounded-lg border border-edge bg-canvas px-2.5 py-1.5 font-mono text-2xs text-ink outline-none focus:border-accent/60"
-            >
-              <option value="">all collections</option>
-              {collections.map((c) => (
-                <option key={c.id} value={c.id}>
-                  {c.id}
-                </option>
-              ))}
-            </select>
+            <Label>scope</Label>
+            <Chip tone={collectionId ? "text-accentSoft border-accent/40 bg-accent/10" : undefined}>
+              {collectionId || "all collections"}
+            </Chip>
           </div>
         </header>
 

@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import mimetypes
 import os
 from datetime import datetime
 from typing import Any
 
 from arq.connections import RedisSettings
 
+from packages.core import blobs, chunks, graph
 from packages.core import chunk as chunk_module
-from packages.core import chunks, graph
 from packages.core.db import Session
 from packages.core.llm import embed_many
 from packages.core.normalise import Normalised, UnsupportedFormat, normalise, normalise_text
@@ -31,8 +33,33 @@ from packages.shared.schema import Item, Scope, SourceRef
 # ---------------------------------------------------------------------------
 
 
+log = logging.getLogger(__name__)
+
+
 def redis_settings() -> RedisSettings:
     return RedisSettings.from_dsn(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+
+
+async def _keep_original(
+    scope: Scope, ref: SourceRef, filename: str, data: bytes
+) -> dict[str, Any] | None:
+    """Store the uploaded bytes so the file can be shown as it arrived.
+
+    Best-effort: a failure to keep the original must never fail the ingest — the
+    document is still indexed and retrievable, it just cannot be previewed as a
+    PDF/image. Returns the metadata to record on the item, or None when nothing
+    was kept (no store configured, or the file is over the size cap).
+    """
+    if not blobs.enabled() or len(data) > blobs.max_original_bytes():
+        return None
+    content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    item_id = stable_item_id(scope, ref)
+    try:
+        await blobs.put(blobs.key_for(scope.workspace_id, item_id), data, content_type)
+    except Exception:  # noqa: BLE001 - keeping the original is best-effort
+        log.exception("could not store original for %s", filename)
+        return None
+    return {"filename": filename, "content_type": content_type, "size": len(data)}
 
 
 def _scope(workspace_id: str, collection_id: str | None) -> Scope:
@@ -94,8 +121,10 @@ async def ingest_file(
 ) -> dict[str, Any]:
     """A file — uploaded or pulled from a source — becomes an item.
 
-    The bytes are read, converted, and dropped. What survives is Markdown plus
-    the link back (KB-7): the KB is not a file store.
+    The bytes are converted to Markdown for indexing, and the original is also
+    kept in object storage so the file can be shown as it arrived (a PDF as a
+    PDF). A file that fails to parse keeps no original either — there is nothing
+    a person could usefully preview.
     """
     scope = _scope(workspace_id, collection_id)
     ref = SourceRef(source=source, locator=locator, url=url, fetched_at=datetime.now())
@@ -109,7 +138,9 @@ async def ingest_file(
             await session.commit()
         return {"item_id": item_id, "outcome": "failed", "reason": str(exc)}
 
-    return await _store(ctx, scope, ref, parsed, period_start, period_end, metadata, suggested)
+    original = await _keep_original(scope, ref, filename, data)
+    merged = {**(metadata or {}), "original": original} if original else metadata
+    return await _store(ctx, scope, ref, parsed, period_start, period_end, merged, suggested)
 
 
 async def ingest_text(
@@ -229,6 +260,7 @@ class WorkerSettings:
     @staticmethod
     async def on_startup(ctx: dict[str, Any]) -> None:
         await graph.bootstrap()
+        await blobs.ensure_bucket()
 
     @staticmethod
     async def on_shutdown(ctx: dict[str, Any]) -> None:
