@@ -64,6 +64,34 @@ def tidy(text: str) -> str:
     return text.strip()
 
 
+def despace(text: str) -> str:
+    """Rejoin text a PDF extractor split into individual characters.
+
+    Some PDFs position every glyph separately, and the extractor renders that
+    as "L i c e n s i n g  N o t i c e" — letters one space apart, words two.
+    Left alone the stored document is unreadable, keyword search matches single
+    letters, and the embedding describes an alphabet rather than a subject. A
+    real 103 kB guide came through with EVERY line in that state.
+
+    This must run BEFORE tidy(), which collapses runs of spaces and destroys
+    the double space that marks where one word ends — the only thing that makes
+    the original recoverable.
+
+    Applied per line and only where the evidence is overwhelming, so ordinary
+    prose containing "a" and "I" is never touched.
+    """
+    out: list[str] = []
+    for line in text.splitlines():
+        tokens = [t for t in line.split(" ") if t]
+        singles = sum(1 for t in tokens if len(t) == 1)
+        if len(tokens) >= 6 and singles >= len(tokens) * 0.7:
+            words = [w.replace(" ", "") for w in re.split(r" {2,}", line.strip())]
+            out.append(" ".join(w for w in words if w))
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
 def title_from(body: str, filename: str) -> str:
     """First real line of content, else the filename.
 
@@ -115,7 +143,9 @@ class PdfParser:
         reader = PdfReader(io.BytesIO(data))
         pages: list[str] = []
         for number, page in enumerate(reader.pages, start=1):
-            text = tidy(page.extract_text() or "")
+            # despace BEFORE tidy: tidy collapses the double space that
+            # marks a word boundary in character-positioned text.
+            text = tidy(despace(page.extract_text() or ""))
             if text:
                 pages.append(f"<!-- page {number} -->\n{text}")
 
@@ -313,6 +343,7 @@ __all__ = [
     "TextParser",
     "UnsupportedFormat",
     "can_parse",
+    "despace",
     "normalise",
     "normalise_text",
     "register",

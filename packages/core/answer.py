@@ -281,6 +281,31 @@ async def answer(
             attributed = _attribute(result.text, passages)
             if attributed is not None:
                 result.citations = [attributed]
+
+        # Still nothing, but the agent DID read sections and reported that it
+        # answered from them. Here that is not an inference: the loop records
+        # what it opened, and an answer written after reading exactly those
+        # sections came from exactly those sections. A synthesis across a
+        # section shares no verbatim run with it and writes no marker, so both
+        # earlier checks miss — and the result was a correct, sourced answer
+        # stamped "not supported by the collection".
+        #
+        # This holds only for the navigator, whose evidence is structural.
+        # Hybrid hands the model a pile of candidate passages and cannot know
+        # which it leaned on, so it keeps the stricter rule.
+        if not result.citations and walk.found:
+            result.citations = [
+                Citation(
+                    marker=index,
+                    chunk_id=passage.chunk_id,
+                    item_id=hit.item_id,
+                    title=hit.title,
+                    heading=passage.heading,
+                    text=passage.text,
+                    score=passage.score,
+                )
+                for index, (passage, hit) in enumerate(passages, start=1)
+            ]
         result.grounded = bool(result.citations) and walk.found
         result.took_ms = int((time.perf_counter() - started) * 1000)
         return result, trace

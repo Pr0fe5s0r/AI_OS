@@ -242,7 +242,22 @@ export function Query({ collections }: { collections: Collection[] }) {
 
                 <div className="mb-2 flex flex-wrap items-center gap-2 pl-8">
                   <Mono className="text-2xs text-subtle">
-                    {t.matches.length} passage{t.matches.length === 1 ? "" : "s"} · {ms(t.tookMs)}
+                    {/* matches are DOCUMENTS; the passages sit inside them. It
+                        read eight pages of one PDF and the line said "1
+                        passage", which is the wrong number AND the wrong
+                        noun. */}
+                    {(() => {
+                      const docs = t.matches.length;
+                      const passages = t.matches.reduce(
+                        (n, m) => n + (m.passages?.length ?? 0),
+                        0
+                      );
+                      const docLabel = `${docs} document${docs === 1 ? "" : "s"}`;
+                      return passages > 0
+                        ? `${docLabel} · ${passages} passage${passages === 1 ? "" : "s"}`
+                        : docLabel;
+                    })()}{" "}
+                    · {ms(t.tookMs)}
                   </Mono>
                   <Chip title="which retrieval found the evidence">{t.mode}</Chip>
                   <Chip title="the derivation of this answer">trace {t.traceId.slice(0, 8)}</Chip>

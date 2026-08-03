@@ -5,6 +5,7 @@ import pytest
 from packages.core.normalise import (
     UnsupportedFormat,
     can_parse,
+    despace,
     normalise,
     normalise_text,
     supported,
@@ -145,3 +146,43 @@ def test_a_legacy_doc_renamed_to_docx_says_so():
     with pytest.raises(UnsupportedFormat) as exc:
         normalise(b"\xd0\xcf\x11\xe0not a zip", "old.docx")
     assert ".doc" in str(exc.value)
+
+
+# ------------------------- character-positioned PDFs -------------------------
+
+
+def test_letter_spaced_extraction_is_rejoined():
+    """Some PDFs position every glyph separately, and the extractor renders
+    that as "L i c e n s i n g  N o t i c e" — letters one space apart, words
+    two. A real 103 kB guide came through with EVERY line in that state:
+    unreadable on screen, and a keyword index full of single letters."""
+    raw = "L i c e n s i n g  N o t i c e  a n d  t e r m s"
+    assert despace(raw) == "Licensing Notice and terms"
+
+
+def test_ordinary_prose_is_never_rejoined():
+    """"I a m" is three words in a sentence and one word in a mangled PDF. The
+    threshold has to be high enough that real English survives it."""
+    normal = "I am a developer and I write a lot of code every day"
+    assert despace(normal) == normal
+
+
+def test_a_short_spaced_line_is_left_alone():
+    """Too little evidence to be sure — an initialled signature, a table cell."""
+    assert despace("A B C") == "A B C"
+
+
+def test_despacing_must_happen_before_tidying():
+    """tidy() collapses runs of spaces, which destroys the double space that
+    marks where one word ends — the only thing that makes the original
+    recoverable. Getting this order wrong is silent and irreversible."""
+    raw = "T h i s  r e p o r t  i s  a v a i l a b l e  u n d e r  t e r m s"
+    assert despace(tidy(raw)) != "This report is available under terms"
+    assert tidy(despace(raw)) == "This report is available under terms"
+
+
+def test_a_mixed_document_only_repairs_the_broken_lines():
+    doc = "A normal line of ordinary prose here.\nB r o k e n  l i n e  o f  t e x t  h e r e"
+    out = despace(doc).splitlines()
+    assert out[0] == "A normal line of ordinary prose here."
+    assert out[1] == "Broken line of text here"

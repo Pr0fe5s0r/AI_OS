@@ -235,3 +235,50 @@ async def test_every_step_is_recorded_in_the_trace(db, monkeypatch):
     _, trace = await navigate(db, SCOPE, "leave")
     actions = [entry["action"] for entry in trace.semantic]
     assert "read" in actions and "answered" in actions
+
+
+async def test_a_synthesis_is_credited_to_the_sections_actually_read(db, monkeypatch):
+    """A synthesis across a section shares no verbatim run with it and often
+    carries no marker, so neither the marker check nor the verbatim check
+    fires. In the navigator that is not an inference: the loop RECORDS what it
+    opened, and an answer written after reading exactly those sections came
+    from exactly those sections. Without this a correct, sourced answer was
+    stamped "not supported by the collection"."""
+    from packages.core.answer import answer as compose
+
+    await put_item(db, _doc())
+    await db.commit()
+    item_id = (await navigator._documents(db, SCOPE))[0]["item_id"]
+
+    monkeypatch.setattr(
+        "packages.core.llm.chat_with_tools",
+        _scripted(
+            _read(item_id, "n002"),
+            _submit("Staff build up time off across the year and may retain some of it.", True),
+        ),
+    )
+    result, _ = await compose(db, SCOPE, "how does leave work?", mode="vectorless")
+    assert result.grounded is True
+    assert result.citations, "the sections read are the evidence"
+    assert result.citations[0].chunk_id.endswith(":n002")
+
+
+async def test_a_synthesis_is_not_credited_when_the_agent_says_it_found_nothing(db, monkeypatch):
+    """The model's own judgement still governs. Reading a section and then
+    reporting that it does not answer must not be dressed up as an answer."""
+    from packages.core.answer import answer as compose
+
+    await put_item(db, _doc())
+    await db.commit()
+    item_id = (await navigator._documents(db, SCOPE))[0]["item_id"]
+
+    monkeypatch.setattr(
+        "packages.core.llm.chat_with_tools",
+        _scripted(
+            _read(item_id, "n002"),
+            _submit("Nothing here covers parental leave.", False),
+        ),
+    )
+    result, _ = await compose(db, SCOPE, "parental leave?", mode="vectorless")
+    assert result.grounded is False
+    assert result.citations == []
