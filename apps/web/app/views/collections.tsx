@@ -321,16 +321,25 @@ export function Collections({
                   )}
                   <p className="mt-2 text-2xs leading-relaxed text-subtle">
                     {view === "map" ? (
-                      <>
-                        Every passage placed by its actual position in embedding space, so
-                        distance on screen is distance in the vectors — two points near each
-                        other really are alike. Flattening 1536 dimensions to two loses
-                        something, and these axes keep{" "}
-                        <span className="text-muted">
-                          {(shape.projection.explained_variance * 100).toFixed(1)}%
-                        </span>{" "}
-                        of the variance.
-                      </>
+                      shape.projection.method === "none" ? (
+                        <>
+                          Too few passages to place meaningfully — two points always sit on a
+                          line, whatever the vectors say, so no projection was run and these
+                          positions carry no meaning. Add more content and the map becomes
+                          readable.
+                        </>
+                      ) : (
+                        <>
+                          Every passage placed by its actual position in embedding space, so
+                          distance on screen is distance in the vectors — two points near each
+                          other really are alike. Flattening 1536 dimensions to two loses
+                          something, and these axes keep{" "}
+                          <span className="text-muted">
+                            {(shape.projection.explained_variance * 100).toFixed(1)}%
+                          </span>{" "}
+                          of the variance.
+                        </>
+                      )
                     ) : (
                       <>
                         Each point is a <span className="text-muted">passage</span>, not a

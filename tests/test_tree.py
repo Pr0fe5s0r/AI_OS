@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from packages.core import tree
-from packages.core.vectorless import _parse, _resolve
 
 # The tree index is the whole of "vectorless": if the structure is wrong, the
 # model is reasoning over a map of a document that does not exist. Building it
@@ -48,12 +47,40 @@ def test_text_before_the_first_heading_is_kept():
     assert "Preamble prose" in opening.text
 
 
-def test_a_document_with_no_headings_becomes_one_section():
-    """Inventing sections the author did not write would be worse than having
-    none: the model would reason over a structure that is not real."""
-    root = tree.build("Just a wall of text with no structure at all.")
-    assert root.children == []
-    assert "wall of text" in root.text
+def test_a_pdf_with_no_headings_is_sectioned_by_its_pages():
+    """This was the bug that made vectorless look like an empty store. A PDF
+    converted to text has page markers, not headings, so it produced ZERO
+    sections — and a retrieval that works by choosing sections cannot see a
+    document that has none. Pages are real structure, and "page 2" is a
+    citation someone can check against the original file."""
+    pdf = "\n\n---\n\n".join(
+        [
+            "<!-- page 1 -->\nOpening remarks about the subject.",
+            "<!-- page 2 -->\nThe substance is on the second page.",
+            "<!-- page 3 -->\nClosing remarks.",
+        ]
+    )
+    root = tree.build(pdf, "Scanned Report")
+    assert [n.title for n in root.children] == ["Page 1", "Page 2", "Page 3"]
+    page_two = next(n for n in root.walk() if n.title == "Page 2")
+    assert "substance is on the second page" in page_two.text
+
+
+def test_flat_text_with_neither_headings_nor_pages_is_still_readable():
+    """A document nothing can open is a document nothing can answer from."""
+    flat = "Sentence of ordinary prose with no structure at all. " * 200
+    root = tree.build(flat, "Notes")
+    assert root.children, "must expose something readable"
+    assert all(c.title.startswith("Part ") for c in root.children)
+    # Every word survives somewhere — sectioning must not lose content.
+    joined = " ".join(c.text for c in root.children)
+    assert len(joined) >= len(flat.strip()) * 0.95
+
+
+def test_a_short_unstructured_note_is_one_whole_section():
+    root = tree.build("Just a short note with no structure at all.", "Note")
+    assert [n.title for n in root.children] == ["(whole document)"]
+    assert "short note" in root.children[0].text
 
 
 def test_headings_inside_code_blocks_are_not_sections():
@@ -114,43 +141,3 @@ def test_building_is_deterministic():
     makes a retrieval over it reproducible."""
     first, second = tree.build(_DOC, "H"), tree.build(_DOC, "H")
     assert tree.outline_json(first) == tree.outline_json(second)
-
-
-# ------------------------- reading the model's choice -------------------------
-
-
-def test_every_reply_shape_the_model_actually_produces_is_accepted():
-    """All three of these came back from the same model on the same prompt at
-    temperature zero. Only the ids are a contract; the container is not, and a
-    parser accepting one shape reported 'nothing answers that' while the model
-    was naming the right section."""
-    documented = '{"sections": [{"doc": "d1", "id": "n016", "why": "x"}]}'
-    bare_list = '{"sections": ["n016"]}'
-    single = '{"section": "n016", "title": "KB-4", "contains": "connectors"}'
-    for raw in (documented, bare_list, single):
-        parsed = _parse(raw)
-        assert [p.node_id for p in parsed] == ["n016"], raw
-
-
-def test_a_fenced_reply_is_unwrapped():
-    assert _parse('```json\n{"sections": ["n001"]}\n```')[0].node_id == "n001"
-
-
-def test_an_unreadable_reply_selects_nothing():
-    """Guessing at sections from a broken reply would be inventing a retrieval
-    nobody performed."""
-    assert _parse("I think section 4 looks good") == []
-    assert _parse("") == []
-
-
-def test_a_bare_id_is_attached_to_the_only_document_that_owns_it():
-    root = tree.build(_DOC, "Handbook")
-    resolved = _resolve(_parse('{"sections": ["n002"]}'), {"doc-a": root})
-    assert resolved and resolved[0].item_id == "doc-a"
-
-
-def test_an_ambiguous_bare_id_is_dropped_not_guessed():
-    """Section ids restart at n000 in every document. Attributing a passage to
-    the wrong document would put a citation under a title it never came from."""
-    both = {"doc-a": tree.build(_DOC, "A"), "doc-b": tree.build(_DOC, "B")}
-    assert _resolve(_parse('{"sections": ["n002"]}'), both) == []

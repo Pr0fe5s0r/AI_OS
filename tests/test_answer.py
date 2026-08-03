@@ -257,12 +257,12 @@ async def test_vectorless_is_the_default_retrieval(db, monkeypatch):
 
     async def spy(session, scope, question):
         seen.append("vectorless")
+        from packages.core.navigator import Outcome
         from packages.core.search import Trace, new_trace_id
-        from packages.core.vectorless import Outcome
 
         return Outcome(), Trace(trace_id=new_trace_id(), query=question, config={}, filters={})
 
-    monkeypatch.setattr("packages.core.vectorless.retrieve", spy)
+    monkeypatch.setattr("packages.core.navigator.navigate", spy)
     result, _ = await answer(db, SCOPE, "anything")
     assert seen == ["vectorless"]
     assert result.mode == "vectorless"
@@ -273,12 +273,61 @@ async def test_an_empty_vectorless_result_says_so_in_its_own_terms(db, monkeypat
     are different claims. The one shown should match the retrieval that ran."""
 
     async def nothing(session, scope, question):
+        from packages.core.navigator import Outcome
         from packages.core.search import Trace, new_trace_id
-        from packages.core.vectorless import Outcome
 
         return Outcome(), Trace(trace_id=new_trace_id(), query=question, config={}, filters={})
 
-    monkeypatch.setattr("packages.core.vectorless.retrieve", nothing)
+    monkeypatch.setattr("packages.core.navigator.navigate", nothing)
     result, _ = await answer(db, SCOPE, "anything", mode="vectorless")
     assert result.grounded is False
-    assert "section" in result.text
+    assert "answers that" in result.text or "section" in result.text
+
+
+async def test_a_verbatim_answer_without_a_marker_is_still_grounded(db, monkeypatch):
+    """The model answered "how long do I have to submit receipts" by quoting the
+    passage word for word and simply did not write [1]. Trusting the marker
+    labelled a correct, sourced answer "not supported by the collection" — and a
+    warning that fires on good answers is one people learn to ignore."""
+    await put_item(db, _doc(_HANDBOOK))
+    await db.commit()
+
+    monkeypatch.setattr(
+        "packages.core.llm.chat",
+        lambda *a, **k: "Receipts must be submitted within thirty days of the expense.",
+    )
+
+    result, _ = await answer(db, SCOPE, "receipts submitted within thirty days", mode="hybrid")
+    assert result.grounded is True
+    assert len(result.citations) == 1
+    assert "thirty days" in result.citations[0].text
+
+
+async def test_prose_matching_no_passage_stays_ungrounded(db, monkeypatch):
+    """The case attribution must never rescue: confident wording that appears
+    nowhere in the evidence."""
+    await put_item(db, _doc(_HANDBOOK))
+    await db.commit()
+
+    monkeypatch.setattr(
+        "packages.core.llm.chat",
+        lambda *a, **k: (
+            "Employees are entitled to sixteen weeks of fully paid parental leave "
+            "following a qualifying event, subject to annual review."
+        ),
+    )
+
+    result, _ = await answer(db, SCOPE, "receipts submitted within thirty days", mode="hybrid")
+    assert result.citations == []
+    assert result.grounded is False
+
+
+async def test_attribution_needs_a_real_run_of_words_not_a_stray_phrase(db, monkeypatch):
+    """Ordinary phrasing shared by chance must not count as a source."""
+    await put_item(db, _doc(_HANDBOOK))
+    await db.commit()
+
+    monkeypatch.setattr("packages.core.llm.chat", lambda *a, **k: "Receipts must be.")
+
+    result, _ = await answer(db, SCOPE, "receipts submitted within thirty days", mode="hybrid")
+    assert result.grounded is False

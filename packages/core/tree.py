@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -169,6 +170,49 @@ def _split_oversized(text: str, limit: int) -> list[str]:
     return parts
 
 
+# A page marker inserted by the PDF reader. The one piece of structure a PDF
+# reliably has, and the unit its own page numbers already refer to — so a
+# citation to "page 4" is checkable against the original.
+_PAGE = re.compile(r"^<!--\s*page\s+(\d+)\s*-->\s*$", re.MULTILINE)
+# Target size for a block when a document has neither headings nor pages.
+FALLBACK_CHARS = 2500
+
+
+def _fallback_sections(body: str) -> list[dict[str, str]]:
+    """Readable units for a document with no headings.
+
+    Pages first: a PDF has them, they are what its own numbering refers to, and
+    "page 4" is a citation someone can check against the original file. Failing
+    that, blocks of whole paragraphs, named by position so a reader at least
+    knows where in the document they are.
+    """
+    pages = list(_PAGE.finditer(body))
+    if pages:
+        sections: list[dict[str, str]] = []
+        for index, match in enumerate(pages):
+            start = match.end()
+            end = pages[index + 1].start() if index + 1 < len(pages) else len(body)
+            text = body[start:end].strip().strip("-").strip()
+            if text:
+                sections.append({"title": f"Page {match.group(1)}", "text": text})
+        if sections:
+            return sections
+
+    stripped = body.strip()
+    if not stripped:
+        return []
+    if len(stripped) <= FALLBACK_CHARS:
+        return [{"title": "(whole document)", "text": stripped}]
+
+    blocks = _split_oversized(stripped, FALLBACK_CHARS)
+    total = len(blocks)
+    return [
+        {"title": f"Part {number} of {total}", "text": block}
+        for number, block in enumerate(blocks, start=1)
+        if block.strip()
+    ]
+
+
 def build(markdown: str, title: str = "") -> Node:
     """A document as a tree of its own sections.
 
@@ -196,9 +240,30 @@ def build(markdown: str, title: str = "") -> Node:
     )
 
     if not headings:
-        # No structure to use. One node holding everything is honest — the
-        # alternative is inventing sections the author did not write.
-        root.text = body
+        # No Markdown headings. This is NOT the rare case it looks like: a PDF
+        # converted to text has page markers, not headings, so every PDF landed
+        # here — and a document with no sections is invisible to a retrieval
+        # that works by choosing sections. Asked what a document titled "Value
+        # Education" covered, the agent correctly reported that it had no
+        # sections listed, and the store looked empty when it was not.
+        #
+        # So the fallback uses whatever structure the document really does
+        # have. Pages for a PDF, blocks of paragraphs otherwise. Neither
+        # invents headings the author did not write; both give the reader
+        # something honestly nameable to open.
+        for section in _fallback_sections(body):
+            root.children.append(
+                Node(
+                    node_id=next_id(),
+                    title=section["title"],
+                    level=1,
+                    start_line=1,
+                    end_line=len(lines),
+                    text=section["text"],
+                )
+            )
+        if not root.children:
+            root.text = body
         return root
 
     # Text before the first heading. Usually a title block or an abstract, and
@@ -282,6 +347,7 @@ def count(root: Node) -> int:
 
 __all__ = [
     "CHARS_PER_TOKEN",
+    "FALLBACK_CHARS",
     "MAX_NODE_CHARS",
     "PREVIEW_CHARS",
     "Node",

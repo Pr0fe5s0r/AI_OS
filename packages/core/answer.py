@@ -175,6 +175,48 @@ def _resolve_citations(
     return cleaned, [used[m] for m in sorted(used)]
 
 
+# How many consecutive words of the answer must appear verbatim in a passage
+# before that passage is accepted as its source. Long enough that ordinary
+# phrasing ("must be submitted within") cannot match by chance; short enough to
+# survive the model changing a word or two.
+_SHINGLE = 7
+
+
+def _words(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+
+def _attribute(text: str, passages: list[tuple[Passage, Hit]]) -> Citation | None:
+    """Find the passage an uncited answer was actually drawn from.
+
+    Verbatim overlap only. A paraphrase that shares no run of wording is
+    indistinguishable here from an invention, and guessing between them is
+    exactly what this whole path exists to avoid — so it stays uncited and the
+    answer is reported ungrounded.
+    """
+    answer_words = _words(text)
+    if len(answer_words) < _SHINGLE:
+        return None
+    shingles = {
+        " ".join(answer_words[i : i + _SHINGLE])
+        for i in range(len(answer_words) - _SHINGLE + 1)
+    }
+
+    for index, (passage, hit) in enumerate(passages, start=1):
+        haystack = " ".join(_words(passage.text))
+        if any(shingle in haystack for shingle in shingles):
+            return Citation(
+                marker=index,
+                chunk_id=passage.chunk_id,
+                item_id=hit.item_id,
+                title=hit.title,
+                heading=passage.heading,
+                text=passage.text,
+                score=passage.score,
+            )
+    return None
+
+
 async def answer(
     session: AsyncSession,
     scope: Scope,
@@ -210,11 +252,38 @@ async def answer(
     started = time.perf_counter()
 
     if mode == "vectorless":
-        from packages.core.vectorless import retrieve
+        # The navigator answers as it reads, so there is no second pass here.
+        # Splitting "choose sections" from "write an answer" is what made the
+        # old version brittle: the choosing step had to commit before seeing
+        # any content, and when it chose nothing the store looked empty.
+        from packages.core.navigator import navigate
 
-        outcome, trace = await retrieve(session, scope, question)
-        hits = outcome.hits
-        degraded = outcome.degraded
+        walk, trace = await navigate(session, scope, question)
+        result = Answer(
+            question=question,
+            text=walk.answer,
+            hits=walk.hits,
+            trace_id=trace.trace_id,
+            degraded=walk.degraded,
+            mode=mode,
+        )
+        passages = _gather(walk.hits, limit=MAX_PASSAGES)
+        if not passages:
+            result.grounded = False
+            result.text = walk.answer or "Nothing in these documents answers that."
+            result.took_ms = int((time.perf_counter() - started) * 1000)
+            return result, trace
+
+        # The agent was handed [1], [2] … in the order it read them, so the
+        # markers resolve against exactly what it opened.
+        result.text, result.citations = _resolve_citations(walk.answer, passages)
+        if not result.citations:
+            attributed = _attribute(result.text, passages)
+            if attributed is not None:
+                result.citations = [attributed]
+        result.grounded = bool(result.citations) and walk.found
+        result.took_ms = int((time.perf_counter() - started) * 1000)
+        return result, trace
     else:
         hits, trace = await search_traced(session, scope, question, cfg)
         degraded = trace.degraded
@@ -284,8 +353,22 @@ async def answer(
         return result, trace
 
     result.text, result.citations = _resolve_citations(raw, passages)
-    # An answer that cites nothing is not grounded, whatever it claims. This is
-    # the case worth catching: confident prose with no evidence behind it.
+
+    # A missing marker is not the same as missing evidence. Asked "how long do
+    # I have to submit receipts", the model answered by quoting the passage
+    # word for word and simply did not write [1] — and a rule that trusted the
+    # marker labelled a correct, sourced answer "not supported by the
+    # collection". A warning that fires on good answers is a warning people
+    # learn to ignore.
+    #
+    # So an uncited answer is checked against the passages rather than assumed
+    # baseless: if its wording is actually present in one of them, that passage
+    # is the citation. Prose matching nothing stays ungrounded, which is the
+    # case this was always for.
+    if not result.citations:
+        found = _attribute(result.text, passages)
+        if found is not None:
+            result.citations = [found]
     result.grounded = bool(result.citations)
     result.took_ms = int((time.perf_counter() - started) * 1000)
     return result, trace

@@ -253,8 +253,13 @@ export function Query({ collections }: { collections: Collection[] }) {
 
                 {t.matches.length === 0 ? (
                   <p className="pl-8 text-xs text-subtle">
-                    Nothing in this collection matched. The trace records what each arm
-                    looked at.
+                    {/* "arms" is hybrid's vocabulary — vectorless has none, it
+                        reads a table of contents. Saying the wrong thing about
+                        how an answer was reached is a small lie in the one
+                        place this store claims to be honest. */}
+                    {t.mode === "vectorless"
+                      ? "No section of these documents looked relevant. The trace records the structure it considered."
+                      : "Nothing in this collection matched. The trace records what each arm looked at."}
                   </p>
                 ) : (
                   <div className="space-y-2 pl-8">

@@ -192,6 +192,8 @@ export type CollectionShape = {
   floor: number;
   /** How many documents the passages came from. */
   documents: number;
+  /** `method` is "none" when there were too few passages to project — in
+   *  that case the points are laid out plainly and carry no meaning. */
   projection: { method: string; explained_variance: number };
 };
 
