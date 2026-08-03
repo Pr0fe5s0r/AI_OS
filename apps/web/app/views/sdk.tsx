@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import * as api from "../api";
 import { Collection, cx } from "../data";
-import { Card, Code, Label, Mono } from "../ui/kit";
+import { Card, Chip, Code, Label, Mono } from "../ui/kit";
 
 type Lang = "python" | "javascript" | "curl";
 
@@ -19,8 +19,16 @@ const LANGS: { id: Lang; label: string }[] = [
  *  the two details a person always has to change — which collection and which
  *  host — are already correct. The key is never interpolated: a snippet gets
  *  pasted into chat and tickets, so it reads the key from the environment. */
-export function Sdk({ collections }: { collections: Collection[] }) {
-  const [collectionId, setCollectionId] = useState(collections[0]?.id || "default");
+export function Sdk({
+  collections,
+  active,
+}: {
+  collections: Collection[];
+  active: string | null;
+}) {
+  // Snippets are always pointed at one collection, so "All collections" falls
+  // back to the first real one rather than leaving the sample unrunnable.
+  const collectionId = active ?? collections[0]?.id ?? "default";
   const [lang, setLang] = useState<Lang>("python");
   const [payload, setPayload] = useState<api.Snippets | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -51,17 +59,7 @@ export function Sdk({ collections }: { collections: Collection[] }) {
       <div className="mb-4 flex flex-wrap items-center gap-3">
         <div className="flex items-center gap-2">
           <Label>collection</Label>
-          <select
-            value={collectionId}
-            onChange={(e) => setCollectionId(e.target.value)}
-            className="rounded-lg border border-edge bg-canvas px-2.5 py-1.5 font-mono text-2xs text-ink outline-none focus:border-accent/60"
-          >
-            {collections.map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.id}
-              </option>
-            ))}
-          </select>
+          <Chip tone="text-accentSoft border-accent/40 bg-accent/10">{collectionId}</Chip>
         </div>
         <div className="flex gap-1 rounded-lg border border-edge bg-elevated p-0.5">
           {LANGS.map((l) => (

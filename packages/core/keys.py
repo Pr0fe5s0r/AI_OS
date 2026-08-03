@@ -48,20 +48,44 @@ async def create_key(
     name: str,
     created_by: str | None = None,
     scopes: str = "read,write",
+    collection_id: str | None = None,
 ) -> dict[str, Any]:
-    """Issue a key. The plaintext comes back exactly once, here."""
+    """Issue a key. The plaintext comes back exactly once, here.
+
+    A `collection_id` binds the key to one collection: the request layer forces
+    every call it makes into that collection and refuses any other. Left None,
+    the key is workspace-wide, which is the console's own default. A binding is
+    validated against the workspace here, because a key that names a collection
+    the workspace does not have is a mistake worth catching at creation rather
+    than as a 404 on first use.
+    """
+    if collection_id is not None:
+        known = (
+            await session.execute(
+                text(
+                    "SELECT 1 FROM collections "
+                    "WHERE workspace_id = :ws AND collection_id = :cid"
+                ),
+                {"ws": workspace_id, "cid": collection_id},
+            )
+        ).first()
+        if known is None:
+            raise ValueError(f"No such collection: {collection_id!r}")
+
     full, key_id, prefix = mint()
     await session.execute(
         text(
             """
             INSERT INTO api_keys
-                (key_id, workspace_id, name, key_hash, prefix, scopes, created_by)
-            VALUES (:kid, :ws, :name, :hash, :prefix, :scopes, :by)
+                (key_id, workspace_id, name, key_hash, prefix, scopes, created_by,
+                 collection_id)
+            VALUES (:kid, :ws, :name, :hash, :prefix, :scopes, :by, :cid)
             """
         ),
         {
             "kid": key_id, "ws": workspace_id, "name": name,
             "hash": _hash(full), "prefix": prefix, "scopes": scopes, "by": created_by,
+            "cid": collection_id,
         },
     )
     return {
@@ -70,6 +94,7 @@ async def create_key(
         "key": full,  # the only time this value exists outside the caller
         "prefix": prefix,
         "scopes": scopes.split(","),
+        "collection_id": collection_id,
     }
 
 
@@ -83,7 +108,7 @@ async def resolve_key(session: AsyncSession, presented: str) -> dict[str, Any] |
         await session.execute(
             text(
                 """
-                SELECT key_id, workspace_id, name, scopes, revoked_at
+                SELECT key_id, workspace_id, name, scopes, collection_id, revoked_at
                 FROM api_keys WHERE key_hash = :hash
                 """
             ),
@@ -105,6 +130,7 @@ async def resolve_key(session: AsyncSession, presented: str) -> dict[str, Any] |
         "workspace_id": row.workspace_id,
         "name": row.name,
         "scopes": row.scopes.split(","),
+        "collection_id": row.collection_id,
     }
 
 
@@ -114,8 +140,8 @@ async def list_keys(session: AsyncSession, workspace_id: str) -> list[dict[str, 
         await session.execute(
             text(
                 """
-                SELECT key_id, name, prefix, scopes, created_by, created_at,
-                       last_used_at, revoked_at
+                SELECT key_id, name, prefix, scopes, collection_id, created_by,
+                       created_at, last_used_at, revoked_at
                 FROM api_keys WHERE workspace_id = :ws ORDER BY created_at DESC
                 """
             ),
@@ -128,6 +154,7 @@ async def list_keys(session: AsyncSession, workspace_id: str) -> list[dict[str, 
             "name": r.name,
             "prefix": r.prefix,
             "scopes": r.scopes.split(","),
+            "collection_id": r.collection_id,
             "created_by": r.created_by,
             "created_at": r.created_at.isoformat(),
             "last_used_at": r.last_used_at.isoformat() if r.last_used_at else None,

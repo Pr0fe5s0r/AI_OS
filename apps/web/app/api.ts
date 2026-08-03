@@ -170,6 +170,12 @@ export async function collection(id: string): Promise<CollectionDetail> {
 export const deleteCollection = (id: string) =>
   call<{ items_removed: number }>(`/api/collections/${id}`, { method: "DELETE" });
 
+export const renameCollection = (id: string, name: string) =>
+  call<{ collection_id: string; name: string }>(`/api/collections/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ name }),
+  });
+
 export type CollectionShape = {
   nodes: {
     id: string;
@@ -211,6 +217,7 @@ export async function keys(): Promise<ApiKey[]> {
       name: string;
       prefix: string;
       scopes: string[];
+      collection_id: string | null;
       created_by: string | null;
       created_at: string;
       last_used_at: string | null;
@@ -223,6 +230,7 @@ export async function keys(): Promise<ApiKey[]> {
     name: k.name,
     prefix: k.prefix,
     scopes: k.scopes,
+    collectionId: k.collection_id,
     createdBy: k.created_by,
     createdAt: k.created_at,
     lastUsed: k.last_used_at,
@@ -230,12 +238,28 @@ export async function keys(): Promise<ApiKey[]> {
   }));
 }
 
-export async function createKey(name: string, scopes: string): Promise<MintedKey> {
-  const k = await call<{ key_id: string; name: string; key: string; scopes: string[] }>(
-    "/api/keys",
-    { method: "POST", body: JSON.stringify({ name, scopes }) }
-  );
-  return { id: k.key_id, name: k.name, key: k.key, scopes: k.scopes };
+export async function createKey(
+  name: string,
+  scopes: string,
+  collectionId?: string | null
+): Promise<MintedKey> {
+  const k = await call<{
+    key_id: string;
+    name: string;
+    key: string;
+    scopes: string[];
+    collection_id: string | null;
+  }>("/api/keys", {
+    method: "POST",
+    body: JSON.stringify({ name, scopes, collection_id: collectionId || null }),
+  });
+  return {
+    id: k.key_id,
+    name: k.name,
+    key: k.key,
+    scopes: k.scopes,
+    collectionId: k.collection_id,
+  };
 }
 
 export const revokeKey = (id: string) => call(`/api/keys/${id}`, { method: "DELETE" });
@@ -273,6 +297,8 @@ export const formats = () => call<{ supported: string[] }>("/api/formats");
 
 // ---------------------------------- reading ----------------------------------
 
+type RawOriginal = { filename: string; content_type: string; size: number };
+
 type RawDoc = {
   id: string;
   title: string;
@@ -282,19 +308,24 @@ type RawDoc = {
   created_at: string | null;
   source: { source: string; locator: string; url?: string | null };
   classes?: Category[];
+  metadata?: { original?: RawOriginal | null } | null;
 };
 
-const toDoc = (d: RawDoc): Document => ({
-  id: d.id,
-  title: d.title,
-  body: d.body,
-  source: d.source?.source || "",
-  locator: d.source?.locator || "",
-  version: d.version,
-  status: d.status,
-  createdAt: d.created_at,
-  categories: d.classes || [],
-});
+const toDoc = (d: RawDoc): Document => {
+  const o = d.metadata?.original;
+  return {
+    id: d.id,
+    title: d.title,
+    body: d.body,
+    source: d.source?.source || "",
+    locator: d.source?.locator || "",
+    version: d.version,
+    status: d.status,
+    createdAt: d.created_at,
+    categories: d.classes || [],
+    original: o ? { filename: o.filename, contentType: o.content_type, size: o.size } : null,
+  };
+};
 
 export async function documents(
   collectionId: string | undefined,
@@ -304,6 +335,44 @@ export async function documents(
     collection: collectionId,
   });
   return payload.items.map(toDoc);
+}
+
+/** The passages a document was split into — the unit of retrieval, in order. */
+export type DocChunk = { chunk_id: string; ordinal: number; heading: string; text: string };
+
+export async function documentChunks(
+  itemId: string,
+  collectionId?: string
+): Promise<DocChunk[]> {
+  const payload = await call<{ chunks: DocChunk[] }>(
+    `/api/items/${encodeURIComponent(itemId)}/chunks`,
+    { collection: collectionId }
+  );
+  return payload.chunks;
+}
+
+/** Fetch the original file and hand back an object URL for it.
+ *
+ *  Fetched through the same credentialed path as every other call — rather than
+ *  pointing an <iframe src> straight at the API, which the browser would treat
+ *  as a third-party request and may strip the session cookie from. The caller
+ *  must revoke the URL when done. */
+export async function originalBlobUrl(
+  itemId: string,
+  collectionId?: string
+): Promise<{ url: string; contentType: string }> {
+  const headers: Record<string, string> = {};
+  if (collectionId) headers["X-Collection"] = collectionId;
+  const res = await fetch(`${API}/api/items/${encodeURIComponent(itemId)}/original`, {
+    credentials: "include",
+    headers,
+  });
+  if (!res.ok) {
+    if (res.status === 401) onLost?.();
+    throw new ApiError(res.status, "The original file could not be loaded.");
+  }
+  const blob = await res.blob();
+  return { url: URL.createObjectURL(blob), contentType: blob.type };
 }
 
 /** Ingests that produced no content, and the reason each gave.
@@ -471,6 +540,26 @@ export type ChunkDetail = {
 
 /** One passage in full — what a point in the graph actually holds. */
 export const chunk = (id: string) => call<ChunkDetail>(`/api/chunks/${encodeURIComponent(id)}`);
+
+// -------------------------------- playground --------------------------------
+
+/** A single request run raw: the status, wall time and untransformed body.
+ *
+ *  `search` and `ask` above shape the payload into what a view renders and drop
+ *  the status and timing on the floor. The Playground is the one place those
+ *  are the point — it shows the developer exactly what the API returned — so it
+ *  gets its own path that hands back the response verbatim. */
+export type RawRun = { status: number; ms: number; ok: boolean; body: unknown };
+
+export async function run(path: string, collection?: string): Promise<RawRun> {
+  const started = performance.now();
+  const res = await fetch(`${API}${path}`, {
+    credentials: "include",
+    headers: collection ? { "X-Collection": collection } : {},
+  });
+  const body = await res.json().catch(() => null);
+  return { status: res.status, ms: performance.now() - started, ok: res.ok, body };
+}
 
 // ---------------------------------- traces ----------------------------------
 

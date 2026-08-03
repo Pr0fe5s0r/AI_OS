@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from fastapi import HTTPException
 
 from packages.core.collections import (
     create_cluster,
@@ -8,11 +9,13 @@ from packages.core.collections import (
     delete_collection,
     get_collection,
     list_clusters,
+    rename_collection,
     slugify,
     valid_id,
 )
 from packages.core.keys import create_key, list_keys, resolve_key, revoke_key
 from packages.core.store import put_item
+from packages.core.tenancy import enforce_binding, workspace_scope
 from packages.shared.schema import Item, Scope, SourceRef
 from tests.conftest import WORKSPACE
 
@@ -192,3 +195,81 @@ async def test_using_a_key_records_when(db):
     await resolve_key(db, issued["key"])
     await db.commit()
     assert (await list_keys(db, WORKSPACE))[0]["last_used_at"] is not None
+
+
+# ------------------------- keys bound to a collection -------------------------
+
+
+async def test_a_key_can_be_bound_to_one_collection(db):
+    await create_collection(db, WORKSPACE, "Research")
+    issued = await create_key(db, WORKSPACE, "ci", collection_id="research")
+    await db.commit()
+
+    assert issued["collection_id"] == "research"
+    holder = await resolve_key(db, issued["key"])
+    await db.commit()
+    assert holder is not None and holder["collection_id"] == "research"
+    # The binding is visible in the listing so the console can show it.
+    assert (await list_keys(db, WORKSPACE))[0]["collection_id"] == "research"
+
+
+async def test_an_unbound_key_is_workspace_wide(db):
+    issued = await create_key(db, WORKSPACE, "wide")
+    await db.commit()
+    holder = await resolve_key(db, issued["key"])
+    await db.commit()
+    assert holder is not None and holder["collection_id"] is None
+
+
+async def test_a_key_cannot_bind_to_a_collection_that_does_not_exist(db):
+    with pytest.raises(ValueError, match="No such collection"):
+        await create_key(db, WORKSPACE, "bad", collection_id="imaginary")
+
+
+def test_enforce_binding_confines_a_bound_key():
+    bound = {"collection_id": "research"}
+    # Its own collection is fine; anything else is refused, not silently allowed.
+    enforce_binding(bound, "research")
+    with pytest.raises(HTTPException) as exc:
+        enforce_binding(bound, "other")
+    assert exc.value.status_code == 403
+
+    # An unbound key (or a session) may touch any collection.
+    enforce_binding({"collection_id": None}, "anything")
+
+
+async def test_workspace_scope_locks_a_bound_key_to_its_collection():
+    bound = {"company_id": WORKSPACE, "collection_id": "research"}
+    # No header resolves to the bound collection rather than the whole workspace.
+    scope = await workspace_scope(principal=bound, x_collection=None)
+    assert scope.collection_id == "research"
+
+    # A header naming the bound collection agrees and is allowed.
+    scope = await workspace_scope(principal=bound, x_collection="research")
+    assert scope.collection_id == "research"
+
+    # A header naming a different collection is refused.
+    with pytest.raises(HTTPException) as exc:
+        await workspace_scope(principal=bound, x_collection="other")
+    assert exc.value.status_code == 403
+
+
+# ------------------------------ renaming -------------------------------------
+
+
+async def test_renaming_changes_the_name_but_not_the_id(db):
+    await create_collection(db, WORKSPACE, "Old name")
+    await db.commit()
+
+    renamed = await rename_collection(db, WORKSPACE, "old-name", "New name")
+    await db.commit()
+    assert renamed == {"collection_id": "old-name", "name": "New name"}
+
+    found = await get_collection(db, WORKSPACE, "old-name")
+    assert found is not None
+    assert found["name"] == "New name"
+    assert found["collection_id"] == "old-name"
+
+
+async def test_renaming_a_missing_collection_reports_nothing_changed(db):
+    assert await rename_collection(db, WORKSPACE, "ghost", "Whatever") is None

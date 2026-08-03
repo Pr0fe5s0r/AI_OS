@@ -8,6 +8,7 @@ from typing import Any
 from arq import create_pool
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,9 +16,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from apps.api.auth_routes import router as auth_router
 from apps.common.consolidation import enabled as consolidation_enabled
 from apps.common.consolidation import interval_seconds as consolidation_interval
-from packages.core import graph
+from packages.core import blobs, graph
 from packages.core.answer import answer
 from packages.core.chunks import by_ids as chunks_by_ids
+from packages.core.chunks import for_item as chunks_for_item
 from packages.core.classify import (
     bulk_override,
     classes_for,
@@ -33,6 +35,7 @@ from packages.core.collections import (
     delete_collection,
     get_collection,
     list_clusters,
+    rename_collection,
 )
 from packages.core.consolidate import recent_runs
 from packages.core.consolidate import run_once as run_consolidation
@@ -45,7 +48,12 @@ from packages.core.pipeline import redis_settings
 from packages.core.search import RetrievalConfig, search_traced
 from packages.core.snippets import build as build_snippets
 from packages.core.store import get_item, item_versions, list_items
-from packages.core.tenancy import require_write, resolve_caller, workspace_scope
+from packages.core.tenancy import (
+    enforce_binding,
+    require_write,
+    resolve_caller,
+    workspace_scope,
+)
 from packages.core.tracing import get_trace, list_traces, record, stats
 from packages.shared.schema import Lifecycle, Scope
 
@@ -64,6 +72,7 @@ from packages.shared.schema import Lifecycle, Scope
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await graph.bootstrap()
+    await blobs.ensure_bucket()
     app.state.queue = await create_pool(redis_settings())
     yield
     await app.state.queue.close()
@@ -193,6 +202,9 @@ async def retrieve(
     limit: int = Query(10, ge=1, le=100),
     min_score: float = Query(0.0, ge=0.0, le=1.0),
     sources: list[str] | None = Query(None),
+    item_ids: list[str] | None = Query(
+        None, description="Restrict the search to these document ids."
+    ),
     period_from: datetime | None = None,
     period_to: datetime | None = None,
     include_superseded: bool = False,
@@ -203,12 +215,14 @@ async def retrieve(
     """The single read path. Every agent uses this; behaviour comes from config.
 
     Results carry provenance — source, locator and link — which is what a
-    citation is rendered from.
+    citation is rendered from. Pass `item_ids` to confine the search to specific
+    documents; omit it to search the whole (collection-scoped) store.
     """
     cfg = RetrievalConfig(
         limit=limit,
         min_score=min_score,
         sources=tuple(sources or ()),
+        item_ids=tuple(item_ids or ()),
         period_from=period_from,
         period_to=period_to,
         include_superseded=include_superseded,
@@ -544,6 +558,69 @@ async def related_items(
     return (await graph.related(scope, item_id, hops=hops)).model_dump()
 
 
+@app.get("/api/items/{item_id}/chunks")
+async def item_chunks(
+    item_id: str,
+    scope: Scope = Depends(workspace_scope),
+    session: AsyncSession = Depends(db),
+) -> dict[str, Any]:
+    """The passages a document was split into — what actually got indexed.
+
+    A document is the unit of identity; a chunk is the unit of retrieval. This
+    is how a person sees the difference: one uploaded file becomes N passages,
+    and this is those N, in document order.
+    """
+    chunks = await chunks_for_item(session, scope, item_id)
+    return {
+        "item_id": item_id,
+        "count": len(chunks),
+        "chunks": [
+            {
+                "chunk_id": c.chunk_id,
+                "ordinal": c.ordinal,
+                "heading": c.heading,
+                "text": c.text,
+            }
+            for c in chunks
+        ],
+    }
+
+
+# Types a browser can render in place; everything else is served to download.
+_INLINE_PREFIXES = ("application/pdf", "image/", "text/")
+
+
+@app.get("/api/items/{item_id}/original")
+async def item_original(
+    item_id: str,
+    scope: Scope = Depends(workspace_scope),
+    session: AsyncSession = Depends(db),
+) -> Response:
+    """The original file as it was uploaded — a PDF as a PDF, an image as an
+    image. 404 when none was kept: text pasted directly, files ingested before
+    originals were stored, or anything over the size cap."""
+    item = await get_item(session, scope, item_id)
+    if item is None:
+        raise HTTPException(404, "No such item.")
+    original = (item.metadata or {}).get("original")
+    if not original:
+        raise HTTPException(404, "No original file is stored for this document.")
+
+    try:
+        data, content_type = await blobs.get(blobs.key_for(scope.workspace_id, item_id))
+    except Exception as exc:  # noqa: BLE001 - any store error is a missing original
+        raise HTTPException(404, "The original file is no longer available.") from exc
+
+    media_type = content_type or original.get("content_type") or "application/octet-stream"
+    disposition = "inline" if media_type.startswith(_INLINE_PREFIXES) else "attachment"
+    filename = str(original.get("filename") or item_id).replace('"', "")
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={"Content-Disposition": f'{disposition}; filename="{filename}"'},
+    )
+
+
 # ---------------------------------- brands ----------------------------------
 
 
@@ -605,6 +682,10 @@ class ClusterIn(BaseModel):
     cluster_id: str | None = None
 
 
+class CollectionRename(BaseModel):
+    name: str = Field(min_length=1)
+
+
 @app.get("/api/clusters")
 async def clusters(
     principal: dict[str, Any] = Depends(resolve_caller),
@@ -661,10 +742,31 @@ async def collection_detail(
     principal: dict[str, Any] = Depends(resolve_caller),
     session: AsyncSession = Depends(db),
 ) -> dict[str, Any]:
+    enforce_binding(principal, collection_id)
     found = await get_collection(session, str(principal["company_id"]), collection_id)
     if found is None:
         raise HTTPException(404, "No such collection.")
     return found
+
+
+@app.patch("/api/collections/{collection_id}")
+async def edit_collection(
+    collection_id: str,
+    payload: CollectionRename,
+    principal: dict[str, Any] = Depends(resolve_caller),
+    session: AsyncSession = Depends(db),
+) -> dict[str, Any]:
+    """Rename a collection. Only the display name — the id is its stable handle
+    and is fixed at creation."""
+    require_write(principal)
+    enforce_binding(principal, collection_id)
+    renamed = await rename_collection(
+        session, str(principal["company_id"]), collection_id, payload.name
+    )
+    if renamed is None:
+        raise HTTPException(404, "No such collection.")
+    await session.commit()
+    return renamed
 
 
 @app.get("/api/collections/{collection_id}/graph")
@@ -681,6 +783,7 @@ async def collection_shape(
     Similarity edges are computed from the embeddings, so this is the actual
     shape of the data rather than a diagram of it.
     """
+    enforce_binding(principal, collection_id)
     scope = Scope(workspace_id=str(principal["company_id"]), collection_id=collection_id)
     return await collection_graph(session, scope, k=k, limit=limit)
 
@@ -698,6 +801,7 @@ async def consolidation_history(
     model-written text, so "it ran" is not enough — how much it changed, and
     whether it failed, is the part worth seeing.
     """
+    enforce_binding(principal, collection_id)
     scope = Scope(workspace_id=str(principal["company_id"]), collection_id=collection_id)
     return {
         "enabled": consolidation_enabled(),
@@ -718,6 +822,7 @@ async def consolidate_now(
     tried on a collection deliberately before being left to run unattended.
     """
     require_write(principal)
+    enforce_binding(principal, collection_id)
     scope = Scope(workspace_id=str(principal["company_id"]), collection_id=collection_id)
     outcome = await run_consolidation(session, scope)
     return outcome.as_dict()
@@ -814,6 +919,7 @@ async def drop_collection(
 ) -> dict[str, Any]:
     """Delete a collection and its contents, reporting how much went."""
     require_write(principal)
+    enforce_binding(principal, collection_id)
     removed = await delete_collection(session, str(principal["company_id"]), collection_id)
     await session.commit()
     return {"deleted": True, "items_removed": removed}
@@ -825,6 +931,9 @@ async def drop_collection(
 class KeyIn(BaseModel):
     name: str = Field(min_length=1)
     scopes: str = "read,write"
+    # None -> workspace-wide (the console default). A value binds the key to one
+    # collection and is verified against the workspace before the key is minted.
+    collection_id: str | None = None
 
 
 @app.get("/api/keys")
@@ -844,13 +953,17 @@ async def add_key(
 ) -> dict[str, Any]:
     """Issue a key. The plaintext is in this response and nowhere else, ever."""
     require_write(principal)
-    created = await create_key(
-        session,
-        str(principal["company_id"]),
-        payload.name,
-        created_by=str(principal.get("email") or ""),
-        scopes=payload.scopes,
-    )
+    try:
+        created = await create_key(
+            session,
+            str(principal["company_id"]),
+            payload.name,
+            created_by=str(principal.get("email") or ""),
+            scopes=payload.scopes,
+            collection_id=payload.collection_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     await session.commit()
     return created
 

@@ -51,13 +51,20 @@ class RetrievalConfig:
     min_score: float = 0.0
     semantic_weight: float = 0.7  # the remainder goes to recency
     sources: tuple[str, ...] = ()  # empty = every source
+    item_ids: tuple[str, ...] = ()  # empty = every document; else search only these
     period_from: datetime | None = None
     period_to: datetime | None = None
     include_superseded: bool = False
     recall_multiplier: int = 4  # candidates fetched per arm before fusing
 
     def candidates(self) -> int:
-        return max(self.limit * self.recall_multiplier, self.limit)
+        base = max(self.limit * self.recall_multiplier, self.limit)
+        # When the search is confined to specific documents, cast a much wider
+        # net per arm so their passages survive to hydration even in a large
+        # collection — the item filter there then keeps only them.
+        if self.item_ids:
+            return max(base, 200)
+        return base
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -65,6 +72,7 @@ class RetrievalConfig:
             "min_score": self.min_score,
             "semantic_weight": self.semantic_weight,
             "sources": list(self.sources),
+            "item_ids": list(self.item_ids),
             "period_from": self.period_from.isoformat() if self.period_from else None,
             "period_to": self.period_to.isoformat() if self.period_to else None,
             "include_superseded": self.include_superseded,
@@ -155,6 +163,12 @@ def _filters(scope: Scope, cfg: RetrievalConfig) -> tuple[str, dict[str, Any]]:
     if cfg.sources:
         clauses.append("source = ANY(:sources)")
         params["sources"] = list(cfg.sources)
+    # Confine the search to specific documents. Applied at hydration like every
+    # other filter, so a candidate from either arm that is not in the set is
+    # dropped here and the trace shows it go.
+    if cfg.item_ids:
+        clauses.append("item_id = ANY(:item_ids)")
+        params["item_ids"] = list(cfg.item_ids)
     # Time-aware: filter on the period the content DESCRIBES, falling back to
     # when it was created. A July report about Q2 must match a Q2 query.
     if cfg.period_from is not None:
@@ -199,6 +213,7 @@ async def search_traced(
             "workspace_id": scope.workspace_id,
             "collection_id": scope.collection_id,
             "sources": list(cfg.sources),
+            "item_ids": list(cfg.item_ids),
             "include_superseded": cfg.include_superseded,
         },
     )

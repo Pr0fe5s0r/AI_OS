@@ -2,7 +2,7 @@
 
 import { ReactNode, useEffect, useState } from "react";
 import * as api from "../api";
-import { ApiKey, MintedKey, ago, cx } from "../data";
+import { ApiKey, Collection, MintedKey, ago, cx } from "../data";
 import { Button, Card, Chip, Copy, Empty, Label, Mono } from "../ui/kit";
 
 /** API keys.
@@ -11,11 +11,19 @@ import { Button, Card, Chip, Copy, Empty, Label, Mono } from "../ui/kit";
  *  store cannot do that and should not pretend to: only a hash is kept, so a
  *  key exists in readable form exactly once — in the response that created
  *  it. That single fact shapes the whole screen. */
-export function Keys({ toast }: { toast: (m: string) => void }) {
+export function Keys({
+  collections,
+  toast,
+}: {
+  collections: Collection[];
+  toast: (m: string) => void;
+}) {
   const [keys, setKeys] = useState<ApiKey[] | null>(null);
   const [minted, setMinted] = useState<MintedKey | null>(null);
   const [name, setName] = useState("");
   const [scopes, setScopes] = useState("read,write");
+  // "" means workspace-wide; otherwise the key is locked to this collection.
+  const [collectionId, setCollectionId] = useState("");
   const [creating, setCreating] = useState(false);
   const [busy, setBusy] = useState(false);
 
@@ -31,8 +39,9 @@ export function Keys({ toast }: { toast: (m: string) => void }) {
     if (!name.trim()) return;
     setBusy(true);
     try {
-      setMinted(await api.createKey(name.trim(), scopes));
+      setMinted(await api.createKey(name.trim(), scopes, collectionId || null));
       setName("");
+      setCollectionId("");
       setCreating(false);
       await load();
     } catch (e) {
@@ -117,6 +126,21 @@ export function Keys({ toast }: { toast: (m: string) => void }) {
                 <option value="read">read only</option>
               </select>
             </label>
+            <label>
+              <Label className="mb-1.5 block">Collection</Label>
+              <select
+                value={collectionId}
+                onChange={(e) => setCollectionId(e.target.value)}
+                className="rounded-lg border border-edge bg-canvas px-3 py-2 font-mono text-xs text-ink outline-none focus:border-accent/60"
+              >
+                <option value="">Whole workspace</option>
+                {collections.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.id}
+                  </option>
+                ))}
+              </select>
+            </label>
             <Button variant="primary" onClick={create} disabled={busy || !name.trim()}>
               {busy ? "…" : "Create"}
             </Button>
@@ -159,7 +183,21 @@ export function Keys({ toast }: { toast: (m: string) => void }) {
                   )}
                 >
                   <td className="py-3 pl-4">
-                    <Mono className="text-xs text-ink">{k.name}</Mono>
+                    <div className="flex items-center gap-1.5">
+                      <Mono className="text-xs text-ink">{k.name}</Mono>
+                      {k.collectionId ? (
+                        <Chip
+                          title="This key can only reach one collection."
+                          tone="text-heat-2 border-heat-2/30 bg-heat-2/10"
+                        >
+                          {k.collectionId}
+                        </Chip>
+                      ) : (
+                        <Chip title="This key can reach every collection in the workspace.">
+                          workspace
+                        </Chip>
+                      )}
+                    </div>
                     <div className="mt-0.5 text-2xs text-subtle">
                       created {ago(k.createdAt)}
                       {k.createdBy ? ` by ${k.createdBy}` : ""}
