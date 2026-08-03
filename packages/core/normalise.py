@@ -125,7 +125,7 @@ class PdfParser:
             raise UnsupportedFormat(f"no extractable text in {filename} (scanned image?)")
 
         body = "\n\n---\n\n".join(pages)
-        info = reader.metadata or {}
+        info: dict[str, Any] = dict(reader.metadata or {})
         declared = str(info.get("/Title") or "").strip()
         return Normalised(
             title=declared[:200] or title_from(body, filename),

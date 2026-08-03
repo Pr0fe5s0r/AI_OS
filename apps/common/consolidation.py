@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any
 
@@ -26,10 +27,24 @@ def enabled() -> bool:
 
 
 def interval_seconds() -> int:
-    """StixDB cycles every 30s. Anything under 30 is refused: each pass makes a
-    model call per merge group, and a tighter loop spends money faster than it
-    learns anything."""
+    """How often the pass fires.
+
+    The reference implementation cycles every 30s and that is the default, but
+    a measured pass took ~54 seconds on a 28-passage collection: on anything
+    real the cadence is shorter than the work. Overlapping runs are refused
+    outright rather than queued, so a too-short interval degrades into "runs
+    back to back" instead of into corruption — but raise it on a large store
+    anyway, or most ticks are skips.
+    """
     return max(30, int(os.getenv("CONSOLIDATION_INTERVAL_SECONDS", "30")))
+
+
+# One pass at a time, per process. A measured pass took ~54 seconds on a
+# 28-passage collection while the cadence defaults to 30, so runs would overlap
+# — and two passes consolidating the same collection at once is not slow, it is
+# wrong: both read the same live passages, both write summaries of them, and
+# the second archives members the first has already replaced.
+_running = asyncio.Lock()
 
 
 async def consolidate_all(ctx: dict[str, Any]) -> dict[str, Any]:
@@ -41,6 +56,18 @@ async def consolidate_all(ctx: dict[str, Any]) -> dict[str, Any]:
     """
     if not enabled():
         return {"skipped": "CONSOLIDATION_ENABLED is not set"}
+
+    if _running.locked():
+        # Skipped rather than queued. These passes are idempotent maintenance,
+        # so a missed one costs nothing and the next tick picks the work up;
+        # queueing them would build a backlog that never drains.
+        return {"skipped": "a consolidation pass is already running"}
+
+    async with _running:
+        return await _pass()
+
+
+async def _pass() -> dict[str, Any]:
 
     async with Session() as session:
         rows = (

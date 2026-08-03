@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import text
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.shared.schema import Scope
@@ -268,7 +269,7 @@ async def delete_collection(
         ),
         {"ws": workspace_id, "cid": collection_id},
     )
-    return int(removed.rowcount or 0)
+    return int(cast(CursorResult, removed).rowcount or 0)
 
 
 def scope_for(workspace_id: str, collection_id: str | None) -> Scope:

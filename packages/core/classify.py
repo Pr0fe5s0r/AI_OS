@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import text
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.llm import chat
@@ -118,7 +119,7 @@ async def delete_class(session: AsyncSession, scope: Scope, class_id: str) -> bo
         ),
         {"workspace": scope.workspace_id, "cid": class_id},
     )
-    if not result.rowcount:
+    if not cast(CursorResult, result).rowcount:
         return False
     await session.execute(
         text("DELETE FROM kb_item_classes WHERE workspace_id = :workspace AND class_id = :cid"),

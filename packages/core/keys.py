@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import secrets
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import text
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # ---------------------------------------------------------------------------
@@ -147,7 +148,7 @@ async def revoke_key(session: AsyncSession, workspace_id: str, key_id: str) -> b
         ),
         {"ws": workspace_id, "kid": key_id},
     )
-    return bool(result.rowcount)
+    return bool(cast(CursorResult, result).rowcount)
 
 
 def redact(key: str) -> str:

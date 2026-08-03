@@ -125,9 +125,53 @@ async def _move_vector_index_to_chunks() -> bool:
     return True
 
 
+# Labels this store stopped using when it became a knowledge base. Their nodes
+# are gone; their indexes were not, because dropping an index is not something
+# a schema migration on Postgres can reach into Neo4j and do.
+_RETIRED_LABELS = ("Event", "Thing")
+
+
+async def drop_retired_indexes() -> list[str]:
+    """Remove indexes and constraints for labels nothing writes any more.
+
+    A vector index on a label with no nodes is not harmless: it is 1536
+    dimensions of structure the database keeps ready for writes that will never
+    come, and it shows up in every listing as though it meant something.
+
+    Guarded on the label being genuinely empty. If a node of that label exists
+    the index stays, because an index dropped out from under live data is a
+    silent full scan rather than an error — and this runs on every boot.
+    """
+    dropped: list[str] = []
+    for label in _RETIRED_LABELS:
+        rows = await _run(f"MATCH (n:{label}) RETURN count(n) AS n")
+        if rows and rows[0]["n"]:
+            continue
+
+        constraints = await _run(
+            "SHOW CONSTRAINTS YIELD name, labelsOrTypes RETURN name, labelsOrTypes AS labels"
+        )
+        for entry in constraints:
+            if label in (entry.get("labels") or []):
+                await _run(f"DROP CONSTRAINT {entry['name']} IF EXISTS")
+                dropped.append(entry["name"])
+
+        # After the constraints, or dropping a constraint would take its
+        # backing index with it and this would try to drop it twice.
+        indexes = await _run(
+            "SHOW INDEXES YIELD name, labelsOrTypes RETURN name, labelsOrTypes AS labels"
+        )
+        for entry in indexes:
+            if label in (entry.get("labels") or []):
+                await _run(f"DROP INDEX {entry['name']} IF EXISTS")
+                dropped.append(entry["name"])
+    return dropped
+
+
 async def bootstrap() -> None:
     """Constraints and indexes, created idempotently. Safe on every boot."""
     await _move_vector_index_to_chunks()
+    await drop_retired_indexes()
     for stmt in [
         "CREATE CONSTRAINT item_id IF NOT EXISTS FOR (i:Item) REQUIRE i.item_id IS UNIQUE",
         "CREATE INDEX item_tenant IF NOT EXISTS FOR (i:Item) ON (i.workspace_id)",
