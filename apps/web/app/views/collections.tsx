@@ -35,6 +35,8 @@ export function Collections({
   const [view, setView] = useState<"graph" | "map" | "table">("graph");
   const [k, setK] = useState(3);
   const [shape, setShape] = useState<api.CollectionShape | null>(null);
+  const [opened, setOpened] = useState<api.ChunkDetail | null>(null);
+  const [opening, setOpening] = useState<string | null>(null);
 
   useEffect(() => {
     let live = true;
@@ -68,6 +70,8 @@ export function Collections({
   useEffect(() => {
     let live = true;
     setShape(null);
+    setOpened(null);
+    setOpening(null);
     if (!selected || view === "table") return;
     api
       .collectionGraph(selected, k)
@@ -89,6 +93,21 @@ export function Collections({
       live = false;
     };
   }, [selected, view, k]);
+
+  /** Fetch the passage a point stands for. Requested on click rather than
+   *  shipped with the graph: four hundred passages of text would be most of a
+   *  megabyte to draw a few hundred circles. */
+  async function openPassage(chunkId: string) {
+    setOpening(chunkId);
+    setOpened(null);
+    try {
+      const detail = await api.chunk(chunkId);
+      setOpened(detail);
+    } catch (e) {
+      toast((e as Error).message);
+      setOpening(null);
+    }
+  }
 
   async function create() {
     if (!name.trim()) return;
@@ -245,7 +264,61 @@ export function Collections({
                     nodes={shape.nodes}
                     edges={shape.edges}
                     mode={view === "map" ? "map" : "graph"}
+                    onOpen={openPassage}
                   />
+
+                  {/* A point that cannot say what it represents is decoration.
+                      Clicking one opens the passage it stands for. */}
+                  {(opening || opened) && (
+                    <Card className="card-in mt-2 p-4">
+                      {opening && !opened ? (
+                        <div className="font-mono text-2xs text-subtle">reading the passage…</div>
+                      ) : opened ? (
+                        <>
+                          <div className="mb-2 flex items-start justify-between gap-3">
+                            <div className="min-w-0">
+                              <div className="truncate text-xs font-medium text-ink">
+                                {opened.heading || `passage ${opened.ordinal + 1}`}
+                              </div>
+                              <div className="mt-0.5 flex flex-wrap items-center gap-1.5">
+                                {opened.document && (
+                                  <Mono className="text-2xs text-subtle">{opened.document}</Mono>
+                                )}
+                                <Chip>passage {opened.ordinal + 1}</Chip>
+                                <Chip>stage {opened.stage}</Chip>
+                                {opened.node_type === "summary" && (
+                                  <Chip tone="text-heat-2 border-heat-2/40 bg-heat-2/10">
+                                    written by the store · from {opened.merged_from.length} passages
+                                  </Chip>
+                                )}
+                                {opened.archived && (
+                                  <Chip tone="text-hot border-hot/40 bg-hot/10">archived</Chip>
+                                )}
+                              </div>
+                            </div>
+                            <button
+                              onClick={() => {
+                                setOpened(null);
+                                setOpening(null);
+                              }}
+                              className="shrink-0 rounded-md border border-edge px-2 py-0.5 font-mono text-2xs text-subtle transition hover:text-ink"
+                            >
+                              close
+                            </button>
+                          </div>
+                          <p className="max-h-52 overflow-y-auto whitespace-pre-wrap text-xs leading-relaxed text-muted">
+                            {opened.text}
+                          </p>
+                          {opened.node_type === "summary" && (
+                            <p className="mt-2 border-t border-edge pt-2 text-2xs text-subtle">
+                              This text was written by the store from other passages, not taken
+                              from a document.
+                            </p>
+                          )}
+                        </>
+                      ) : null}
+                    </Card>
+                  )}
                   <p className="mt-2 text-2xs leading-relaxed text-subtle">
                     {view === "map" ? (
                       <>

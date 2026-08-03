@@ -11,6 +11,10 @@ from tests.conftest import SCOPE
 # Answering writes prose, which is the one thing this store previously refused
 # to do. What makes it acceptable is that every claim has to be traceable — so
 # these tests are almost entirely about refusing to invent.
+#
+# Where a test sets up hybrid retrieval it asks for hybrid by name. Answer
+# composition is identical whichever retrieval fed it, and a test that relied on
+# the default silently changed meaning the day the default did.
 
 
 def _passage(chunk_id: str, text: str, heading: str = "", score: float = 0.9) -> Passage:
@@ -138,7 +142,7 @@ async def test_an_empty_collection_is_answered_without_asking_a_model(db, monkey
 
     monkeypatch.setattr("packages.core.llm.chat", explode)
 
-    result, _ = await answer(db, SCOPE, "anything at all")
+    result, _ = await answer(db, SCOPE, "anything at all", mode="hybrid")
     assert called is False
     assert result.grounded is False
     assert result.citations == []
@@ -157,7 +161,7 @@ async def test_an_unreachable_model_still_returns_the_passages(db, monkeypatch):
 
     monkeypatch.setattr("packages.core.llm.chat", unreachable)
 
-    result, _ = await answer(db, SCOPE, "receipts submitted within thirty days")
+    result, _ = await answer(db, SCOPE, "receipts submitted within thirty days", mode="hybrid")
     assert result.grounded is False
     assert result.degraded and "answer unavailable" in result.degraded
     assert result.hits, "the passages that were found must survive the failure"
@@ -173,7 +177,7 @@ async def test_an_answer_citing_nothing_is_not_treated_as_grounded(db, monkeypat
         lambda *a, **k: "Expenses must be filed promptly and approved by a manager.",
     )
 
-    result, _ = await answer(db, SCOPE, "receipts submitted within thirty days")
+    result, _ = await answer(db, SCOPE, "receipts submitted within thirty days", mode="hybrid")
     assert result.citations == []
     assert result.grounded is False
 
@@ -187,7 +191,7 @@ async def test_a_model_declining_is_reported_as_ungrounded(db, monkeypatch):
         lambda *a, **k: "NOT_IN_CONTEXT the passages say nothing about holiday pay.",
     )
 
-    result, _ = await answer(db, SCOPE, "receipts submitted within thirty days")
+    result, _ = await answer(db, SCOPE, "receipts submitted within thirty days", mode="hybrid")
     assert result.grounded is False
     assert "NOT_IN_CONTEXT" not in result.text
     assert "holiday pay" in result.text
@@ -205,7 +209,7 @@ async def test_a_decline_keeps_any_near_miss_citations(db, monkeypatch):
         lambda *a, **k: "NOT_IN_CONTEXT They mention receipts [1] but give no figure.",
     )
 
-    result, _ = await answer(db, SCOPE, "receipts submitted within thirty days")
+    result, _ = await answer(db, SCOPE, "receipts submitted within thirty days", mode="hybrid")
     assert result.grounded is False
     assert [c.marker for c in result.citations] == [1]
 
@@ -219,7 +223,7 @@ async def test_a_grounded_answer_carries_its_evidence(db, monkeypatch):
         lambda *a, **k: "Receipts go in within thirty days [1].",
     )
 
-    result, _ = await answer(db, SCOPE, "receipts submitted within thirty days")
+    result, _ = await answer(db, SCOPE, "receipts submitted within thirty days", mode="hybrid")
     assert result.grounded is True
     assert len(result.citations) == 1
     assert "thirty days" in result.citations[0].text
@@ -231,7 +235,7 @@ async def test_the_answer_shape_survives_serialisation(db, monkeypatch):
     await db.commit()
     monkeypatch.setattr("packages.core.llm.chat", lambda *a, **k: "Within thirty days [1].")
 
-    result, _ = await answer(db, SCOPE, "receipts")
+    result, _ = await answer(db, SCOPE, "receipts", mode="hybrid")
     payload = result.as_dict()
     assert payload["grounded"] is True
     assert payload["citations"][0]["marker"] == 1
@@ -244,3 +248,37 @@ def test_an_answer_defaults_to_grounded_with_no_degradation():
     only ever constructed with text put into it deliberately."""
     blank = Answer(question="q", text="")
     assert blank.citations == [] and blank.degraded is None
+
+
+async def test_vectorless_is_the_default_retrieval(db, monkeypatch):
+    """The default is a decision, so it is pinned. Changing it should require
+    changing this line, not discovering the change in production."""
+    seen: list[str] = []
+
+    async def spy(session, scope, question):
+        seen.append("vectorless")
+        from packages.core.search import Trace, new_trace_id
+        from packages.core.vectorless import Outcome
+
+        return Outcome(), Trace(trace_id=new_trace_id(), query=question, config={}, filters={})
+
+    monkeypatch.setattr("packages.core.vectorless.retrieve", spy)
+    result, _ = await answer(db, SCOPE, "anything")
+    assert seen == ["vectorless"]
+    assert result.mode == "vectorless"
+
+
+async def test_an_empty_vectorless_result_says_so_in_its_own_terms(db, monkeypatch):
+    """"Nothing in this collection" and "no section looks like it answers that"
+    are different claims. The one shown should match the retrieval that ran."""
+
+    async def nothing(session, scope, question):
+        from packages.core.search import Trace, new_trace_id
+        from packages.core.vectorless import Outcome
+
+        return Outcome(), Trace(trace_id=new_trace_id(), query=question, config={}, filters={})
+
+    monkeypatch.setattr("packages.core.vectorless.retrieve", nothing)
+    result, _ = await answer(db, SCOPE, "anything", mode="vectorless")
+    assert result.grounded is False
+    assert "section" in result.text

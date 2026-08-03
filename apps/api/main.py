@@ -243,7 +243,7 @@ async def retrieve(
 async def answer_question(
     q: str = Query(min_length=1),
     limit: int = Query(8, ge=1, le=20),
-    mode: str = Query("hybrid", pattern="^(hybrid|vectorless)$"),
+    mode: str = Query("vectorless", pattern="^(hybrid|vectorless)$"),
     sources: list[str] | None = Query(None),
     scope: Scope = Depends(workspace_scope),
     principal: dict[str, Any] = Depends(resolve_caller),
@@ -264,9 +264,9 @@ async def answer_question(
 
     `mode` picks how the evidence is found:
 
-      hybrid      passage embeddings and keyword matching, fused (default)
       vectorless  reason over each document's table of contents and open the
-                  sections that look like they answer it
+                  sections that look like they answer it (default)
+      hybrid      passage embeddings and keyword matching, fused
 
     Neither is a strict improvement on the other, so this is a choice rather
     than a migration. The mode comes back on the response, because two answers
@@ -721,6 +721,59 @@ async def consolidate_now(
     scope = Scope(workspace_id=str(principal["company_id"]), collection_id=collection_id)
     outcome = await run_consolidation(session, scope)
     return outcome.as_dict()
+
+
+@app.get("/api/chunks/{chunk_id}")
+async def read_chunk(
+    chunk_id: str,
+    principal: dict[str, Any] = Depends(resolve_caller),
+    session: AsyncSession = Depends(db),
+) -> dict[str, Any]:
+    """One passage, in full, with the document it belongs to.
+
+    What the graph opens when a point is clicked. A point on a chart that
+    cannot tell you what it represents is decoration; this is what makes it an
+    index you can read.
+    """
+    workspace = str(principal["company_id"])
+    row = (
+        await session.execute(
+            text(
+                """
+                SELECT c.chunk_id, c.item_id, c.ordinal, c.heading, c.text,
+                       c.node_type, c.stage, c.importance, c.archived_at,
+                       c.merged_from, i.title AS document, i.source, i.locator, i.url
+                FROM kb_chunks c
+                LEFT JOIN kb_items i
+                       ON i.item_id = c.item_id AND i.workspace_id = c.workspace_id
+                      AND i.status = 'active'
+                WHERE c.workspace_id = :w AND c.chunk_id = :c
+                """
+            ),
+            {"w": workspace, "c": chunk_id},
+        )
+    ).first()
+    if row is None:
+        raise HTTPException(404, "No such passage in this workspace.")
+
+    return {
+        "chunk_id": row.chunk_id,
+        "item_id": row.item_id,
+        "ordinal": row.ordinal,
+        "heading": row.heading,
+        "text": row.text,
+        "document": row.document,
+        "source": row.source,
+        "locator": row.locator,
+        "url": row.url,
+        # A summary node is text the store wrote, not text from a document.
+        # The reader has to be able to tell those apart at a glance.
+        "node_type": row.node_type,
+        "stage": row.stage,
+        "importance": float(row.importance),
+        "archived": row.archived_at is not None,
+        "merged_from": row.merged_from or [],
+    }
 
 
 @app.get("/api/chunks/{chunk_id}/lineage")

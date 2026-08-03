@@ -90,7 +90,7 @@ class Answer:
     # Which retrieval produced the evidence. Travels with the answer because
     # two answers to the same question can differ entirely on this, and a
     # reader comparing them needs to know which they are looking at.
-    mode: str = "hybrid"
+    mode: str = "vectorless"
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -180,15 +180,21 @@ async def answer(
     scope: Scope,
     question: str,
     cfg: RetrievalConfig = DEFAULT,
-    mode: str = "hybrid",
+    mode: str = "vectorless",
 ) -> tuple[Answer, Trace]:
     """Retrieve, then write an answer from what was retrieved.
 
     Two ways of retrieving, and the writing is identical either way:
 
-      hybrid      passage embeddings and keyword matching, fused
       vectorless  reason over each document's table of contents and open the
-                  sections that look like they answer the question
+                  sections that look like they answer the question (default)
+      hybrid      passage embeddings and keyword matching, fused
+
+    Vectorless is the default because on the material this store actually
+    holds — long documents with headings their authors wrote on purpose — it
+    was measurably faster and cited more precisely. That is a default, not a
+    verdict: hybrid remains a request away, and is the better choice for flat
+    text or for finding an identifier buried anywhere in a corpus.
 
     They suit different material. Hybrid is better at finding a specific figure
     or identifier anywhere in a corpus; vectorless is better on long structured

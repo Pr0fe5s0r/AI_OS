@@ -450,6 +450,26 @@ export async function ask(
   };
 }
 
+export type ChunkDetail = {
+  chunk_id: string;
+  item_id: string;
+  ordinal: number;
+  heading: string;
+  text: string;
+  document: string | null;
+  source: string | null;
+  locator: string | null;
+  url: string | null;
+  node_type: string;
+  stage: number;
+  importance: number;
+  archived: boolean;
+  merged_from: string[];
+};
+
+/** One passage in full — what a point in the graph actually holds. */
+export const chunk = (id: string) => call<ChunkDetail>(`/api/chunks/${encodeURIComponent(id)}`);
+
 // ---------------------------------- traces ----------------------------------
 
 type RawTrace = {

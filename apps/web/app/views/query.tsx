@@ -76,7 +76,20 @@ export function Query({ collections }: { collections: Collection[] }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [focus, setFocus] = useState<api.Citation | null>(null);
-  const [mode, setMode] = useState<api.AskMode>("hybrid");
+  // Remembered rather than reset every visit: a retrieval preference is a
+  // standing choice about how you want the store to work, not a per-question
+  // one. Vectorless is the default until someone says otherwise.
+  const [mode, setMode] = useState<api.AskMode>("vectorless");
+
+  useEffect(() => {
+    const saved = localStorage.getItem("retrieval-mode");
+    if (saved === "hybrid" || saved === "vectorless") setMode(saved);
+  }, []);
+
+  function choose(next: api.AskMode) {
+    setMode(next);
+    localStorage.setItem("retrieval-mode", next);
+  }
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -125,14 +138,14 @@ export function Query({ collections }: { collections: Collection[] }) {
             <div className="flex items-center gap-1.5">
               <Label>retrieval</Label>
               <div className="flex gap-1 rounded-lg border border-edge bg-elevated p-0.5">
-                {(["hybrid", "vectorless"] as const).map((m) => (
+                {(["vectorless", "hybrid"] as const).map((m) => (
                   <button
                     key={m}
-                    onClick={() => setMode(m)}
+                    onClick={() => choose(m)}
                     title={
                       m === "hybrid"
                         ? "Match passages by meaning and by wording, then fuse. Better at finding a specific figure or identifier anywhere in a collection."
-                        : "Read each document's table of contents and reason about which sections answer the question. No embeddings. Better on long structured documents."
+                        : "Read each document's table of contents and reason about which sections answer the question. No embeddings. Better on long structured documents. (default)"
                     }
                     className={cx(
                       "rounded-md px-2.5 py-1 font-mono text-2xs transition",
