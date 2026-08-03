@@ -28,14 +28,14 @@ _PROVIDER = OAuthProvider(
 
 
 def test_authorize_url_carries_only_public_values() -> None:
-    url = authorize_url(_PROVIDER, state="st-1", redirect_uri="http://localhost:8000/cb")
+    url = authorize_url(_PROVIDER, state="st-1", redirect_uri="http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me/cb")
     query = parse_qs(urlparse(url).query)
 
     assert url.startswith("https://github.com/login/oauth/authorize?")
     assert query["client_id"] == ["cid-123"]
     assert query["state"] == ["st-1"]
     assert query["scope"] == ["public_repo"]
-    assert query["redirect_uri"] == ["http://localhost:8000/cb"]
+    assert query["redirect_uri"] == ["http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me/cb"]
     # the secret must never travel through the browser
     assert "super-secret" not in url
 
@@ -43,7 +43,7 @@ def test_authorize_url_carries_only_public_values() -> None:
 def test_authorize_url_encodes_state_safely() -> None:
     """State is a sealed blob; it must survive the round trip intact."""
     state = "abc+def/ghi=="
-    url = authorize_url(_PROVIDER, state=state, redirect_uri="http://localhost:8000/cb")
+    url = authorize_url(_PROVIDER, state=state, redirect_uri="http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me/cb")
     assert parse_qs(urlparse(url).query)["state"] == [state]
 
 
@@ -170,7 +170,7 @@ def _patch_client(monkeypatch, response) -> _FakeClient:
 async def test_exchange_code_returns_the_token_and_sends_the_secret_backchannel(monkeypatch) -> None:
     client = _patch_client(monkeypatch, _FakeResponse({"access_token": "gho_real", "scope": "public_repo"}))
 
-    token = await exchange_code(_PROVIDER, "the-code", "http://localhost:8000/cb")
+    token = await exchange_code(_PROVIDER, "the-code", "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me/cb")
 
     assert token == "gho_real"
     # the secret goes in the POST body, server-to-server — never a URL
@@ -187,7 +187,7 @@ async def test_exchange_code_surfaces_a_provider_error_inside_a_200(monkeypatch)
     )
 
     with pytest.raises(OAuthError) as exc:
-        await exchange_code(_PROVIDER, "stale", "http://localhost:8000/cb")
+        await exchange_code(_PROVIDER, "stale", "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me/cb")
     assert "The code is incorrect." in str(exc.value)
 
 
@@ -195,7 +195,7 @@ async def test_exchange_code_rejects_a_response_with_no_token(monkeypatch) -> No
     _patch_client(monkeypatch, _FakeResponse({"scope": "public_repo"}))
 
     with pytest.raises(OAuthError) as exc:
-        await exchange_code(_PROVIDER, "code", "http://localhost:8000/cb")
+        await exchange_code(_PROVIDER, "code", "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me/cb")
     assert "no access_token" in str(exc.value)
 
 
@@ -203,7 +203,7 @@ async def test_exchange_code_never_leaks_the_secret_in_an_error(monkeypatch) -> 
     _patch_client(monkeypatch, _FakeResponse({"error": "server_error"}, status_code=500))
 
     with pytest.raises(OAuthError) as exc:
-        await exchange_code(_PROVIDER, "code", "http://localhost:8000/cb")
+        await exchange_code(_PROVIDER, "code", "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me/cb")
     assert "super-secret" not in str(exc.value)
 
 

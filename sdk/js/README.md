@@ -39,7 +39,7 @@ if (answer.grounded) {
 
 The key identifies a workspace; no method takes a workspace ID. By default the
 client reads `MARKVECTOR_API_KEY` and `MARKVECTOR_URL` (falling back to
-`http://localhost:8000`).
+`http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me`).
 
 ## Files and document structure
 

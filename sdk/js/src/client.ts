@@ -20,7 +20,7 @@ import {
   toStructure,
 } from "./models.js";
 
-const DEFAULT_URL = "http://localhost:8000";
+const DEFAULT_URL = "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me";
 const RETRYABLE = new Set([429, 500, 502, 503, 504]);
 const SDK_CLIENT = "javascript/0.2.0";
 

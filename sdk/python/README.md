@@ -156,7 +156,7 @@ All inherit from `KnowledgeBaseError`.
 | Argument | Environment | Default |
 |---|---|---|
 | `api_key` | `KB_API_KEY` | — required |
-| `base_url` | `KB_URL` | `http://localhost:8000` |
+| `base_url` | `KB_URL` | `http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me` |
 | `timeout` | — | `30.0` |
 | `max_retries` | — | `2` (GET only) |
 

@@ -1047,7 +1047,7 @@ async def code_snippets(
     The key is never interpolated — snippets get copied into chat, tickets and
     screenshots, so they read it from the environment instead.
     """
-    return build_snippets(os.getenv("PUBLIC_API_URL", "http://localhost:8000"), collection)
+    return build_snippets(os.getenv("PUBLIC_API_URL", "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me"), collection)
 
 
 @app.get("/api/whoami")

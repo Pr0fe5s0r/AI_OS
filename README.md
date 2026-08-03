@@ -150,20 +150,20 @@ payloads to prove it:
 
 ```bash
 # software company (company_id=default, profile from profiles/software.yaml)
-curl "http://localhost:8000/api/search?q=payment%20bug&company_id=default"
+curl "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me/api/search?q=payment%20bug&company_id=default"
 
 # inventory company: push one real-shaped event, then search for it
-curl -X POST "http://localhost:8000/api/ingest/push?company_id=acme-inventory" \
+curl -X POST "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me/api/ingest/push?company_id=acme-inventory" \
   -H "Content-Type: application/json" \
   -d '{"source":"ops","events":[{"ref":"PO-1","kind":"purchase_order","status":"open","occurred_at":"2026-07-01T00:00:00Z","title":"Restock widgets","supplier":"YourSupplier","sku":"SKU-1","quantity":100,"actor":{"id":"you","name":"You"}}]}'
-curl "http://localhost:8000/api/search?q=widgets&company_id=acme-inventory"
+curl "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me/api/search?q=widgets&company_id=acme-inventory"
 
 # graph landed in Neo4j (Things typed by each profile, links typed by each profile)
 docker compose exec neo4j cypher-shell -u neo4j -p markos-graph \
   "MATCH (n) RETURN labels(n)[0], n.company_id, count(n)"
 
 # 2-hop cluster around that purchase order — FULFILLS comes from profile data
-curl "http://localhost:8000/api/entity/ops-PO-1/related?company_id=acme-inventory&hops=2"
+curl "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me/api/entity/ops-PO-1/related?company_id=acme-inventory&hops=2"
 ```
 
 Editing a profile is a product change without a deploy: bump the YAML (or the
@@ -183,7 +183,7 @@ of old issues enriches baselines without retroactively firing alerts on work
 that's long finished.
 
 ```bash
-curl -X POST "http://localhost:8000/api/connections/github/backfill?company_id=default&since_days=90"
+curl -X POST "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me/api/connections/github/backfill?company_id=default&since_days=90"
 ```
 
 **Norms (part B).** `core.learn_norms()` is trend-aware and outlier-trimmed,
@@ -196,7 +196,7 @@ baseline carries a `maturity` flag (`insufficient` < 5 samples, `learning` <
 much to trust a number.
 
 ```bash
-curl "http://localhost:8000/api/norms?company_id=default"
+curl "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me/api/norms?company_id=default"
 # -> issue_resolution_hours  n=5  maturity=learning  median=1.76  trend_per_period=…
 ```
 
@@ -241,8 +241,8 @@ the stream can never drift out of sync with Postgres. The CP3 Feed page
 subscribes and refetches on each nudge; a new card lands without a refresh.
 
 ```bash
-curl "http://localhost:8000/api/feed?company_id=default"
-curl -N "http://localhost:8000/api/feed/stream?company_id=default"   # SSE
+curl "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me/api/feed?company_id=default"
+curl -N "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me/api/feed/stream?company_id=default"   # SSE
 ```
 
 ## The agent that can act (CP4)
@@ -275,7 +275,7 @@ guard), asking the agent to escalate something already queued is a no-op, not a
 second card.
 
 ```bash
-curl -X POST "http://localhost:8000/api/agent/chat?company_id=default" \
+curl -X POST "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me/api/agent/chat?company_id=default" \
   -H "Content-Type: application/json" \
   -d '{"message":"which issue is most overdue, and label it a bug?"}'
 ```
@@ -292,7 +292,7 @@ Register an OAuth app once (github.com → Settings → Developer settings →
 | Field | Value |
 | --- | --- |
 | Homepage URL | `http://localhost:3005` |
-| Authorization callback URL | `http://localhost:8000/api/oauth/github/callback` |
+| Authorization callback URL | `http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me/api/oauth/github/callback` |
 
 Put the Client ID + a generated Client Secret in `.env`
 (`GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`) and recreate the api container.
@@ -337,13 +337,13 @@ engine proposes a profile from what that tool actually returns.
 
 ```bash
 # 1. a brand-new company connects a source (no profile needed yet)
-curl -X POST "http://localhost:8000/api/connections/github?company_id=acme" \
+curl -X POST "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me/api/connections/github?company_id=acme" \
   -H "Content-Type: application/json" -d '{"token":"","repo":"owner/name"}'
 # 2. look at the real payloads and PROPOSE a profile (activates nothing)
-curl -X POST "http://localhost:8000/api/profile/induce?company_id=acme" \
+curl -X POST "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me/api/profile/induce?company_id=acme" \
   -H "Content-Type: application/json" -d '{"source":"github"}'
 # 3. a human says yes -> it becomes the live confirmed profile
-curl -X POST "http://localhost:8000/api/profile/confirm?company_id=acme" \
+curl -X POST "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me/api/profile/confirm?company_id=acme" \
   -H "Content-Type: application/json" -d '{"version":1}'
 ```
 
@@ -418,8 +418,8 @@ situations are hidden from `GET /api/situations` by default and require
 authorization.
 
 ```bash
-curl "http://localhost:8000/api/connector-health?company_id=default"
-curl "http://localhost:8000/api/situations?company_id=default&include_system=true"
+curl "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me/api/connector-health?company_id=default"
+curl "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me/api/situations?company_id=default&include_system=true"
 ```
 
 ## Clarifications (CP6 part B)
@@ -457,7 +457,7 @@ like a Feed card does.
 
 ```bash
 # resolve a clarification the same way the UI's choice buttons do
-curl -X POST "http://localhost:8000/api/situations/<situation_id>/resolve?company_id=default" \
+curl -X POST "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me/api/situations/<situation_id>/resolve?company_id=default" \
   -H "Content-Type: application/json" -d '{"choice":"recalculate"}'
 ```
 
@@ -503,11 +503,11 @@ down to zero. The one thing that survives is a stripped audit trail proving
 this is the basis for a real privacy policy, not a marketing promise.
 
 ```bash
-curl -X POST "http://localhost:8000/api/company/delete?company_id=<id>" -d '{}'
-curl -X POST "http://localhost:8000/api/company/delete?company_id=<id>" \
+curl -X POST "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me/api/company/delete?company_id=<id>" -d '{}'
+curl -X POST "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me/api/company/delete?company_id=<id>" \
   -H "Content-Type: application/json" \
   -d '{"confirm": true, "confirmation_token": "<token from the first call>"}'
-curl "http://localhost:8000/api/company/delete?company_id=<id>"   # poll status
+curl "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me/api/company/delete?company_id=<id>"   # poll status
 ```
 
 ## Checkpoints

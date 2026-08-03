@@ -52,7 +52,7 @@ with Markvector() as mv:            # reads MARKVECTOR_API_KEY / MARKVECTOR_URL
 | argument   | env var               | default                 |
 | ---------- | --------------------- | ----------------------- |
 | `api_key`  | `MARKVECTOR_API_KEY`  | — (required)            |
-| `base_url` | `MARKVECTOR_URL`      | `http://localhost:8000` |
+| `base_url` | `MARKVECTOR_URL`      | `http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me` |
 
 ```python
 mv = Markvector()  # both read from the environment

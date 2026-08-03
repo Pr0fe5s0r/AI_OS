@@ -3,7 +3,7 @@
 Run against a live MarkVector API:
 
     export MARKVECTOR_API_KEY=kb_live_…      # from the console, Developer → API keys
-    export MARKVECTOR_URL=http://localhost:8000
+    export MARKVECTOR_URL=http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me
     python examples/quickstart.py
 """
 from __future__ import annotations

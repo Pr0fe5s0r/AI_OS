@@ -1,5 +1,5 @@
 /** @type {import('next').NextConfig} */
-const API_URL = process.env.API_URL || "http://localhost:8000";
+const API_URL = process.env.API_URL || "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me";
 
 const nextConfig = {
   /* Next gzips everything it proxies, INCLUDING text/event-stream — and gzip

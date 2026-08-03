@@ -17,7 +17,7 @@ from .errors import (
 )
 from .models import CollectionInfo, Document, Results, WriteResult
 
-DEFAULT_URL = "http://localhost:8000"
+DEFAULT_URL = "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me"
 _RETRYABLE = {429, 500, 502, 503, 504}
 
 

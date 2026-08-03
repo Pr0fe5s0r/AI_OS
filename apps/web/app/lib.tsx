@@ -2,8 +2,9 @@
 
 /** Types and helpers shared by every view. One API client, one vocabulary. */
 
-export const API =
-  process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+// Empty means same-origin. next.config.js forwards /api/* to the backend using
+// the server-only API_URL environment variable.
+export const API = (process.env.NEXT_PUBLIC_API_URL || "").replace(/\/$/, "");
 
 export type Klass = {
   class_id: string;

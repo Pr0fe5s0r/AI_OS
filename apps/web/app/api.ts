@@ -22,7 +22,11 @@ import {
  * workspace-wide and only narrow when a collection is selected.
  */
 
-export const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+// A public API origin is optional. In the normal Docker/Dokploy deployment the
+// browser calls same-origin /api routes and Next.js proxies them to the
+// server-only API_URL (for example http://api:8000). This avoids sending a
+// container-only hostname—or the user's own localhost—to the browser.
+export const API = (process.env.NEXT_PUBLIC_API_URL || "").replace(/\/$/, "");
 
 export class ApiError extends Error {
   constructor(public status: number, message: string) {
