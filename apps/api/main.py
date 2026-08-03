@@ -202,6 +202,9 @@ async def retrieve(
     limit: int = Query(10, ge=1, le=100),
     min_score: float = Query(0.0, ge=0.0, le=1.0),
     sources: list[str] | None = Query(None),
+    item_ids: list[str] | None = Query(
+        None, description="Restrict the search to these document ids."
+    ),
     period_from: datetime | None = None,
     period_to: datetime | None = None,
     include_superseded: bool = False,
@@ -212,12 +215,14 @@ async def retrieve(
     """The single read path. Every agent uses this; behaviour comes from config.
 
     Results carry provenance — source, locator and link — which is what a
-    citation is rendered from.
+    citation is rendered from. Pass `item_ids` to confine the search to specific
+    documents; omit it to search the whole (collection-scoped) store.
     """
     cfg = RetrievalConfig(
         limit=limit,
         min_score=min_score,
         sources=tuple(sources or ()),
+        item_ids=tuple(item_ids or ()),
         period_from=period_from,
         period_to=period_to,
         include_superseded=include_superseded,
