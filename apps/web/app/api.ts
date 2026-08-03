@@ -573,6 +573,7 @@ type RawTrace = {
   via: string;
   actor: string | null;
   created_at: string;
+  retrieval?: string;
 };
 
 const toTrace = (t: RawTrace): Trace => ({
@@ -585,6 +586,8 @@ const toTrace = (t: RawTrace): Trace => ({
   via: t.via,
   actor: t.actor,
   createdAt: t.created_at,
+  retrieval:
+    t.retrieval === "hybrid" || t.retrieval === "vectorless" ? t.retrieval : "unknown",
 });
 
 export async function traces(

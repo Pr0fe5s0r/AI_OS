@@ -81,6 +81,7 @@ def _summary(r: Any) -> dict[str, Any]:
         "via": r.via,
         "actor": r.actor,
         "created_at": r.created_at.isoformat(),
+        "retrieval": r.retrieval or "hybrid",
     }
 
 
@@ -108,7 +109,8 @@ async def list_traces(
             text(
                 f"""
                 SELECT trace_id, query, collection_id, result_count, duration_ms,
-                       degraded, via, actor, created_at
+                       degraded, via, actor, created_at,
+                       COALESCE(config->>'retrieval', 'hybrid') AS retrieval
                 FROM query_traces
                 WHERE {" AND ".join(clauses)}
                 ORDER BY created_at DESC
@@ -131,7 +133,8 @@ async def get_trace(
                 """
                 SELECT trace_id, query, collection_id, config, filters, semantic,
                        keyword, fused, returned, timings_ms, degraded, result_count,
-                       duration_ms, via, actor, created_at
+                       duration_ms, via, actor, created_at,
+                       COALESCE(config->>'retrieval', 'hybrid') AS retrieval
                 FROM query_traces
                 WHERE workspace_id = :ws AND trace_id = :tid
                 """

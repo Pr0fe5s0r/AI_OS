@@ -83,22 +83,31 @@ export type Trace = {
   via: string;
   actor: string | null;
   createdAt: string;
+  retrieval: "hybrid" | "vectorless" | "unknown";
 };
 
 /** One fused candidate inside a trace — the per-result derivation. */
 export type Candidate = {
   item_id: string;
+  chunk_id?: string | null;
+  heading?: string | null;
   score: number;
-  semantic: number;
-  keyword: number;
-  recency: number;
+  semantic?: number;
+  keyword?: number;
+  recency?: number;
   kept: boolean;
+};
+
+export type NavigationStep = {
+  step: number;
+  action: string;
+  detail: string;
 };
 
 export type TraceDetail = Trace & {
   config: Record<string, unknown>;
   filters: Record<string, unknown>;
-  semantic: { item_id: string; similarity: number }[];
+  semantic: ({ item_id: string; chunk_id?: string; similarity: number } | NavigationStep)[];
   keyword: { item_id: string; rank: number }[];
   fused: Candidate[];
   returned: string[];

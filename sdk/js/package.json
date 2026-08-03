@@ -1,0 +1,31 @@
+{
+  "name": "markvector",
+  "version": "0.2.0",
+  "description": "JavaScript/TypeScript client for MarkVector — store documents, search them by meaning and wording, get grounded answers with citations, keep the original files, and run a streaming, tool-using agent over your own LLM.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test tests/*.test.mjs"
+  },
+  "keywords": ["vector", "search", "rag", "embeddings", "retrieval", "knowledge-base", "agent"],
+  "license": "MIT",
+  "engines": { "node": ">=18" },
+  "peerDependencies": { "openai": ">=4.0.0" },
+  "peerDependenciesMeta": { "openai": { "optional": true } },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "openai": "^4.56.0",
+    "typescript": "^5.5.0"
+  }
+}

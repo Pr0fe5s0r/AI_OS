@@ -110,6 +110,10 @@ async def test_a_trace_survives_a_round_trip_through_storage(db):
     assert stored["via"] == "api_key"
     assert stored["returned"] == trace.returned
     assert stored["fused"][0]["item_id"] == trace.fused[0]["item_id"]
+    assert stored["retrieval"] == "hybrid"
+
+    listed = await list_traces(db, SCOPE)
+    assert listed[0]["retrieval"] == "hybrid"
 
 
 async def test_traces_are_scoped_to_their_workspace(db):
