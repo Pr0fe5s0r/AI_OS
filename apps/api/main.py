@@ -88,7 +88,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         o.strip()
-        for o in os.getenv("WEB_ORIGINS", "http://localhost:3000").split(",")
+        for o in os.getenv("WEB_ORIGINS", "http://localhost:3005").split(",")
         if o.strip()
     ],
     allow_credentials=True,

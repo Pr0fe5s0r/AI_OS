@@ -121,7 +121,7 @@ cp .env.example .env     # embedding key + FERNET_KEY, then set GITHUB_REPO to
 make up                  # postgres + neo4j + redis + api + worker + web + migrations
 make seed                # profile rows from profiles/*.yaml — no mock events, ever
 make ingest              # pull real GitHub events for the software company
-# open http://localhost:3000
+# open http://localhost:3005
 ```
 
 > **No mock/demo/fixture data, anywhere.** `make seed` only creates the
@@ -291,7 +291,7 @@ Register an OAuth app once (github.com → Settings → Developer settings →
 
 | Field | Value |
 | --- | --- |
-| Homepage URL | `http://localhost:3000` |
+| Homepage URL | `http://localhost:3005` |
 | Authorization callback URL | `http://localhost:8000/api/oauth/github/callback` |
 
 Put the Client ID + a generated Client Secret in `.env`

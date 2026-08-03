@@ -27,7 +27,8 @@ x-app-env: &app-env
   SLACK_OAUTH_SCOPE: ${SLACK_OAUTH_SCOPE:-channels:history,channels:read,users:read}
   # inbound email reply handling (POST /api/inbound/email) is off until set
   INBOUND_EMAIL_SECRET: ${INBOUND_EMAIL_SECRET:-}
-  WEB_BASE_URL: ${WEB_BASE_URL:-http://localhost:3000}
+  WEB_BASE_URL: ${WEB_BASE_URL:-http://localhost:3005}
+  WEB_ORIGINS: ${WEB_ORIGINS:-http://localhost:3005}
   FERNET_KEY: ${FERNET_KEY:-}
   # Object storage for the ORIGINAL uploaded files. The KB keeps the converted
   # Markdown for retrieval and now also the original bytes, so a PDF can be
@@ -181,7 +182,7 @@ services:
       - /app/node_modules
       - /app/.next
     ports:
-      - "3000:3000"
+      - "3005:3000"
     depends_on:
       - api
 
