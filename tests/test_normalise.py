@@ -24,6 +24,20 @@ def test_extraction_padding_is_collapsed():
     assert tidy("  padded  \n   lines   ") == "padded\nlines"
 
 
+def test_control_bytes_are_stripped():
+    """PDF extraction leaves NUL and stray control bytes. Postgres rejects NUL
+    in a text column, so one anywhere fails the whole write — they are dropped
+    here, keeping only tab and newline."""
+    assert "\x00" not in tidy("Bro\x00caly")
+    assert tidy("Bro\x00caly") == "Brocaly"
+    # Form feed (a PDF page break) and other C0 controls are deleted outright.
+    assert tidy("a\x0cb") == "ab"
+    # Tab and newline survive the control strip — a tab is then collapsed to a
+    # space by the whitespace pass, not removed like a control byte.
+    assert tidy("a\tb") == "a b"
+    assert tidy("line1\nline2") == "line1\nline2"
+
+
 def test_a_title_is_always_found():
     assert title_from("# Q2 Report\n\nbody", "x.md") == "Q2 Report"
     # Nothing usable in the content: fall back to the filename, never empty.

@@ -2,33 +2,21 @@
 
 import { useEffect, useState } from "react";
 import * as api from "../api";
-import { Cluster, Collection, Trace, ago, cx, ms, num, statusTone, traceStatus } from "../data";
+import { Collection, Trace, ms, num, statusTone, traceStatus } from "../data";
 import { Button, Card, Chip, HeatLegend, Label, Mono, Stat, VectorField } from "../ui/kit";
 
-type Section =
-  | "overview"
-  | "collections"
-  | "upload"
-  | "query"
-  | "keys"
-  | "sdk"
-  | "playground"
-  | "traces";
+type Section = "overview" | "upload" | "query" | "keys" | "sdk" | "playground" | "traces";
 
-/** The cluster at a glance.
+/** The knowledge base at a glance.
  *
- *  Every number here is counted from the store. A workspace with nothing in it
- *  shows zeroes and says what to do next, rather than being padded out with
- *  something that looks like activity. */
+ *  Every number here is counted from the store. An empty base shows zeroes and
+ *  says what to do next, rather than being padded with something that looks
+ *  like activity. */
 export function Overview({
-  cluster,
   collections,
-  onOpen,
   go,
 }: {
-  cluster: Cluster;
   collections: Collection[];
-  onOpen: (id: string) => void;
   go: (s: Section) => void;
 }) {
   const [stats, setStats] = useState<api.TraceStats | null>(null);
@@ -37,7 +25,7 @@ export function Overview({
   useEffect(() => {
     api.traceStats().then(setStats).catch(() => setStats(null));
     api.traces(undefined, { limit: 6 }).then(setRecent).catch(() => setRecent([]));
-  }, [cluster.id]);
+  }, []);
 
   const documents = collections.reduce((sum, c) => sum + c.items, 0);
   const empty = documents === 0;
@@ -46,14 +34,15 @@ export function Overview({
     <div className="px-6 py-6">
       <div className="mb-5 flex flex-wrap items-start justify-between gap-4">
         <div>
-          <h1 className="font-mono text-base font-semibold text-ink">{cluster.name}</h1>
+          <h1 className="text-base font-semibold text-ink">Overview</h1>
           <div className="mt-1.5 flex items-center gap-2">
             <Chip tone="text-success border-success/30 bg-success/10">
               <span className="mr-1 h-1.5 w-1.5 rounded-full bg-success" />
               healthy
             </Chip>
-            <Label>{cluster.region}</Label>
-            <span className="font-mono text-2xs text-subtle">created {ago(cluster.createdAt)}</span>
+            <span className="font-mono text-2xs text-subtle">
+              your knowledge base at a glance
+            </span>
           </div>
         </div>
         <div className="flex gap-2">
@@ -67,7 +56,6 @@ export function Overview({
       <div className="grid gap-4 lg:grid-cols-3">
         <div className="space-y-4 lg:col-span-2">
           <Card className="flex flex-wrap gap-x-10 gap-y-4 p-4">
-            <Stat value={num(collections.length)} label="collections" />
             <Stat value={num(documents)} label="documents" />
             <Stat value={stats ? num(stats.queries) : "—"} label="queries · 24h" />
             <Stat
@@ -81,43 +69,6 @@ export function Overview({
               tone={stats && stats.degraded ? "text-hot" : undefined}
             />
           </Card>
-
-          <div>
-            <div className="mb-2 flex items-center justify-between">
-              <Label>collections</Label>
-              <button
-                onClick={() => go("collections")}
-                className="font-mono text-2xs text-subtle transition hover:text-ink"
-              >
-                see all →
-              </button>
-            </div>
-            {collections.length === 0 ? (
-              <Card className="p-6 text-center">
-                <p className="text-xs text-ink">No collections yet</p>
-                <Button className="mt-3" variant="primary" onClick={() => go("collections")}>
-                  Create one
-                </Button>
-              </Card>
-            ) : (
-              <div className="grid gap-2 sm:grid-cols-2">
-                {collections.slice(0, 6).map((c) => (
-                  <Card key={c.id} hover onClick={() => onOpen(c.id)} className="p-3.5">
-                    <div className="flex items-start justify-between gap-2">
-                      <Mono className="truncate text-xs font-medium text-ink">{c.name}</Mono>
-                      <Chip>{c.dimensions}d</Chip>
-                    </div>
-                    <div className="mt-2 flex items-baseline gap-1.5">
-                      <span className="font-mono text-base font-semibold tabular-nums text-ink">
-                        {num(c.items)}
-                      </span>
-                      <Label>documents</Label>
-                    </div>
-                  </Card>
-                ))}
-              </div>
-            )}
-          </div>
 
           <div>
             <div className="mb-2 flex items-center justify-between">

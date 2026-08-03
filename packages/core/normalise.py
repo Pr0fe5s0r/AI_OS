@@ -56,8 +56,15 @@ def tidy(text: str) -> str:
     justified text becomes double spaces. That padding is dead weight in the
     embedding and reads as a rendering fault on screen, so it is removed once,
     here, rather than in each parser.
+
+    They also emit stray control bytes — PDFs especially leave NUL (0x00) in
+    extracted text. Postgres rejects NUL in a text column outright, so a single
+    one anywhere in a document fails the whole write (the item never lands, and
+    the upload times out looking for a document that was refused). They carry no
+    meaning, so they are stripped here too — keeping only tab and newline.
     """
     text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r" *\n *", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)

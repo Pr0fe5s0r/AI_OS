@@ -4,7 +4,6 @@ import { useCallback, useEffect, useState } from "react";
 import * as api from "./api";
 import { Cluster, cx } from "./data";
 import { Chip, Label, Logo, Mono, useToast } from "./ui/kit";
-import { Collections } from "./views/collections";
 import { Gate } from "./views/gate";
 import { Keys } from "./views/keys";
 import { Overview } from "./views/overview";
@@ -14,19 +13,10 @@ import { Sdk } from "./views/sdk";
 import { Traces } from "./views/traces";
 import { Upload } from "./views/upload";
 
-type Section =
-  | "overview"
-  | "collections"
-  | "upload"
-  | "query"
-  | "keys"
-  | "sdk"
-  | "playground"
-  | "traces";
+type Section = "overview" | "upload" | "query" | "keys" | "sdk" | "playground" | "traces";
 
 const NAV: { id: Section; label: string; icon: string; group: string }[] = [
-  { id: "overview", label: "Overview", icon: "M3 3h7v7H3zM14 3h7v4h-7zM14 10h7v11h-7zM3 14h7v7H3z", group: "Cluster" },
-  { id: "collections", label: "Collections", icon: "M4 5c0-1.1 3.6-2 8-2s8 .9 8 2-3.6 2-8 2-8-.9-8-2zM4 5v14c0 1.1 3.6 2 8 2s8-.9 8-2V5", group: "Cluster" },
+  { id: "overview", label: "Overview", icon: "M3 3h7v7H3zM14 3h7v4h-7zM14 10h7v11h-7zM3 14h7v7H3z", group: "Workspace" },
   { id: "upload", label: "Upload data", icon: "M12 15V4m0 0L8 8m4-4l4 4M4 17v2a1 1 0 001 1h14a1 1 0 001-1v-2", group: "Data" },
   { id: "query", label: "Query & chat", icon: "M21 12a9 9 0 01-9 9 9 9 0 01-4-1l-4 1 1-4a9 9 0 1116-5z", group: "Data" },
   { id: "traces", label: "Traces", icon: "M3 12h4l3 8 4-16 3 8h4", group: "Data" },
@@ -35,26 +25,31 @@ const NAV: { id: Section; label: string; icon: string; group: string }[] = [
   { id: "playground", label: "Playground", icon: "M8 3H5a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-3M7 8l4 4-4 4M13 16h5", group: "Developer" },
 ];
 
-const GROUPS = ["Cluster", "Data", "Developer"];
+const GROUPS = ["Workspace", "Data", "Developer"];
+const DEFAULT_COLLECTION = "default";
 
 export default function Page() {
   const [me, setMe] = useState<api.Me | null | undefined>(undefined);
   const [clusters, setClusters] = useState<Cluster[] | null>(null);
   const [section, setSection] = useState<Section>("overview");
-  const [clusterId, setClusterId] = useState<string | null>(null);
-  const [collectionId, setCollectionId] = useState<string | null>(null);
-  // The active collection every data/developer view runs inside. null = the
-  // whole workspace ("All collections"). Distinct from collectionId, which is
-  // only which collection the Collections manager has open.
-  const [active, setActive] = useState<string | null>(null);
-  const [switcher, setSwitcher] = useState(false);
+  // undefined = not chosen yet (falls back to the default collection); null =
+  // explicitly "All collections"; a string = one collection.
+  const [selected, setSelected] = useState<string | null | undefined>(undefined);
   const [collOpen, setCollOpen] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [newName, setNewName] = useState("");
   const { toast, node } = useToast();
 
+  // Every workspace starts with one collection so there is always somewhere to
+  // put data — but more can be created. If none exists yet, the default one is
+  // made on load.
   const load = useCallback(async () => {
-    const tree = await api.clusters();
+    let tree = await api.clusters();
+    if (!tree.some((c) => c.collections.length > 0)) {
+      await api.createCollection("Default").catch(() => {});
+      tree = await api.clusters();
+    }
     setClusters(tree);
-    setClusterId((current) => current ?? tree[0]?.id ?? null);
   }, []);
 
   const check = useCallback(async () => {
@@ -78,9 +73,7 @@ export default function Page() {
     api.onUnauthorized(() => {
       setMe(null);
       setClusters(null);
-      setClusterId(null);
-      setCollectionId(null);
-      setActive(null);
+      setSelected(undefined);
     });
     return () => api.onUnauthorized(null);
   }, []);
@@ -95,16 +88,28 @@ export default function Page() {
 
   if (me === null) return <Gate onIn={check} />;
 
-  const cluster = clusters?.find((c) => c.id === clusterId) || null;
-  const collections = cluster?.collections || [];
+  const collections = clusters?.flatMap((c) => c.collections) || [];
+  const fallback =
+    collections.find((c) => c.id === DEFAULT_COLLECTION)?.id ?? collections[0]?.id ?? null;
+  // The active collection every view runs inside. Defaults to the pre-built
+  // one; the sidebar switches it, and "All collections" (null) searches across.
+  const active = selected === undefined ? fallback : selected;
+  const activeLabel = active ?? "All collections";
 
-  /** A workspace with no cluster yet is the correct resting state, not an
-   *  error — so the console offers to make one rather than showing chrome
-   *  around nothing. */
-  async function firstCollection() {
-    await api.createCollection("Default collection");
-    await load();
-    toast("Collection created");
+  async function createCollection() {
+    const name = newName.trim();
+    if (!name) return;
+    try {
+      const made = await api.createCollection(name);
+      setNewName("");
+      setCreating(false);
+      setCollOpen(false);
+      await load();
+      setSelected(made.collection_id);
+      toast("Collection created");
+    } catch (e) {
+      toast((e as Error).message);
+    }
   }
 
   return (
@@ -114,38 +119,36 @@ export default function Page() {
           <Logo />
         </div>
 
-        {/* Active collection — the scope every data & developer view runs in.
-            Chosen once here rather than re-picked on each screen. */}
+        {/* The collection every data & developer view runs in. One exists by
+            default; the list here switches between them and makes more. */}
         <div className="relative border-b border-edge px-3 py-3">
           <Label className="px-1">Collection</Label>
           <button
             onClick={() => setCollOpen((o) => !o)}
-            disabled={!cluster}
-            className="mt-1.5 flex w-full items-center gap-2 rounded-lg border border-edge bg-elevated px-2.5 py-2 transition hover:border-edgeStrong disabled:opacity-50"
+            className="mt-1.5 flex w-full items-center gap-2 rounded-lg border border-edge bg-elevated px-2.5 py-2 transition hover:border-edgeStrong"
           >
-            <span
-              className={cx(
-                "h-2 w-2 shrink-0 rounded-full",
-                active ? "bg-accent" : "bg-subtle"
-              )}
-            />
-            <Mono className="min-w-0 flex-1 truncate text-left text-xs text-ink">
-              {active || "All collections"}
-            </Mono>
+            <span className={cx("h-2 w-2 shrink-0 rounded-full", active ? "bg-accent" : "bg-subtle")} />
+            <Mono className="min-w-0 flex-1 truncate text-left text-xs text-ink">{activeLabel}</Mono>
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-subtle">
               <path d="M6 9l6 6 6-6" />
             </svg>
           </button>
 
-          {collOpen && cluster && (
+          {collOpen && (
             <>
-              <div className="fixed inset-0 z-20" onClick={() => setCollOpen(false)} />
-              <div className="card-in absolute inset-x-3 top-full z-30 mt-1 max-h-72 overflow-y-auto rounded-xl border border-edgeStrong bg-raised p-1.5 shadow-2xl shadow-black/50">
+              <div
+                className="fixed inset-0 z-20"
+                onClick={() => {
+                  setCollOpen(false);
+                  setCreating(false);
+                }}
+              />
+              <div className="card-in absolute inset-x-3 top-full z-30 mt-1 max-h-80 overflow-y-auto rounded-xl border border-edgeStrong bg-raised p-1.5 shadow-2xl shadow-black/50">
                 {[null, ...collections.map((c) => c.id)].map((id) => (
                   <button
                     key={id ?? "__all__"}
                     onClick={() => {
-                      setActive(id);
+                      setSelected(id);
                       setCollOpen(false);
                     }}
                     className={cx(
@@ -153,18 +156,45 @@ export default function Page() {
                       id === active ? "bg-accent/10" : "hover:bg-elevated"
                     )}
                   >
-                    <span
-                      className={cx(
-                        "h-2 w-2 shrink-0 rounded-full",
-                        id ? "bg-accent" : "bg-subtle"
-                      )}
-                    />
+                    <span className={cx("h-2 w-2 shrink-0 rounded-full", id ? "bg-accent" : "bg-subtle")} />
                     <Mono className="min-w-0 flex-1 truncate text-xs text-ink">
                       {id || "All collections"}
                     </Mono>
                     {id === active && <span className="h-1.5 w-1.5 rounded-full bg-accent" />}
                   </button>
                 ))}
+
+                <div className="my-1 border-t border-edge" />
+                {creating ? (
+                  <div className="flex items-center gap-1.5 px-1.5 py-1">
+                    <input
+                      autoFocus
+                      value={newName}
+                      onChange={(e) => setNewName(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") createCollection();
+                        if (e.key === "Escape") setCreating(false);
+                      }}
+                      placeholder="Collection name"
+                      className="min-w-0 flex-1 rounded-md border border-edge bg-canvas px-2 py-1 font-mono text-2xs text-ink outline-none focus:border-accent/60"
+                    />
+                    <button
+                      onClick={createCollection}
+                      disabled={!newName.trim()}
+                      className="rounded-md border border-accent bg-accent px-2 py-1 font-mono text-2xs font-semibold text-canvas transition hover:bg-accentSoft disabled:opacity-40"
+                    >
+                      add
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    onClick={() => setCreating(true)}
+                    className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-accentSoft transition hover:bg-elevated"
+                  >
+                    <span className="font-mono text-sm leading-none">＋</span>
+                    <span className="font-mono text-xs">New collection</span>
+                  </button>
+                )}
               </div>
             </>
           )}
@@ -237,49 +267,10 @@ export default function Page() {
 
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="relative flex h-14 shrink-0 items-center gap-3 border-b border-edge px-5">
-          <button
-            onClick={() => setSwitcher((s) => !s)}
-            disabled={!cluster}
-            className="flex items-center gap-2.5 rounded-lg border border-edge bg-elevated px-3 py-1.5 transition hover:border-edgeStrong disabled:opacity-50"
-          >
+          <div className="flex items-center gap-2">
             <span className="h-2 w-2 rounded-full bg-success" />
-            <Mono className="text-xs font-medium text-ink">{cluster?.name || "no cluster"}</Mono>
-            {cluster && <Label>{cluster.region}</Label>}
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-subtle">
-              <path d="M6 9l6 6 6-6" />
-            </svg>
-          </button>
-
-          {switcher && clusters && (
-            <>
-              <div className="fixed inset-0 z-20" onClick={() => setSwitcher(false)} />
-              <div className="card-in absolute left-5 top-14 z-30 w-72 rounded-xl border border-edgeStrong bg-raised p-1.5 shadow-2xl shadow-black/50">
-                <Label className="px-2 py-1">Switch cluster</Label>
-                {clusters.map((c) => (
-                  <button
-                    key={c.id}
-                    onClick={() => {
-                      setClusterId(c.id);
-                      setCollectionId(null);
-                      setActive(null);
-                      setSwitcher(false);
-                    }}
-                    className={cx(
-                      "flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition",
-                      c.id === clusterId ? "bg-accent/10" : "hover:bg-elevated"
-                    )}
-                  >
-                    <span className="h-2 w-2 shrink-0 rounded-full bg-success" />
-                    <div className="min-w-0 flex-1">
-                      <Mono className="block truncate text-xs text-ink">{c.name}</Mono>
-                      <span className="text-2xs text-subtle">{c.region}</span>
-                    </div>
-                    <Chip>{c.collections.length} coll</Chip>
-                  </button>
-                ))}
-              </div>
-            </>
-          )}
+            <Mono className="text-xs font-medium text-ink">{me.workspace_id}</Mono>
+          </div>
 
           <div className="ml-auto flex items-center gap-2">
             <Chip tone="text-muted border-edgeStrong bg-elevated">
@@ -292,43 +283,14 @@ export default function Page() {
         <div className="min-h-0 flex-1 overflow-y-auto">
           {clusters === null ? (
             <div className="px-6 py-10 font-mono text-xs text-subtle">Loading workspace…</div>
-          ) : !cluster ? (
-            <div className="px-6 py-16 text-center">
-              <p className="text-sm text-ink">Nothing here yet</p>
-              <p className="mx-auto mt-1.5 max-w-md text-xs leading-relaxed text-subtle">
-                A workspace starts empty. Create a collection and the console fills in as
-                you put data into it — nothing is generated for you.
-              </p>
-              <button
-                onClick={firstCollection}
-                className="mt-4 rounded-lg border border-accent bg-accent px-3.5 py-2 text-xs font-semibold text-canvas transition hover:bg-accentSoft"
-              >
-                Create the first collection
-              </button>
+          ) : !fallback ? (
+            <div className="flex h-full items-center justify-center gap-2 font-mono text-xs text-subtle">
+              <span className="h-3 w-3 animate-spin rounded-full border-2 border-edgeStrong border-t-accent" />
+              Preparing your workspace…
             </div>
           ) : (
             <>
-              {section === "overview" && (
-                <Overview
-                  cluster={cluster}
-                  collections={collections}
-                  onOpen={(id) => {
-                    setCollectionId(id);
-                    setSection("collections");
-                  }}
-                  go={setSection}
-                />
-              )}
-              {section === "collections" && (
-                <Collections
-                  collections={collections}
-                  selected={collectionId}
-                  onSelect={setCollectionId}
-                  onQuery={() => setSection("query")}
-                  onChanged={load}
-                  toast={toast}
-                />
-              )}
+              {section === "overview" && <Overview collections={collections} go={setSection} />}
               {section === "upload" && (
                 <Upload
                   collections={collections}
