@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from fastapi import Header
 from httpx import ASGITransport, AsyncClient
 
 from tests.conftest import WORKSPACE
@@ -40,8 +41,13 @@ async def client(monkeypatch):
 
     queue = _Queue()
 
-    async def fake_caller():
-        return {"company_id": WORKSPACE, "via": "test", "scopes": ["read", "write"]}
+    async def fake_caller(x_markvector_client: str | None = Header(default=None)):
+        return {
+            "company_id": WORKSPACE,
+            "via": "test",
+            "client": x_markvector_client,
+            "scopes": ["read", "write"],
+        }
 
     from packages.core.tenancy import resolve_caller, workspace_scope
     from packages.shared.schema import Scope
@@ -127,6 +133,19 @@ async def test_search_returns_the_documented_shape(client):
 
 async def test_search_requires_a_query(client):
     assert (await client.get("/api/search", params={"q": ""})).status_code == 422
+
+
+async def test_sdk_search_is_identified_and_its_trace_can_be_opened(client):
+    response = await client.get(
+        "/api/search",
+        params={"q": "sdk trace provenance"},
+        headers={"X-Markvector-Client": "javascript/0.2.0"},
+    )
+    assert response.status_code == 200
+
+    detail = await client.get(f"/api/traces/{response.json()['trace_id']}")
+    assert detail.status_code == 200
+    assert detail.json()["via"] == "sdk:javascript/0.2.0"
 
 
 async def test_the_answer_route_defaults_to_vectorless(client, monkeypatch):

@@ -22,6 +22,7 @@ import {
 
 const DEFAULT_URL = "http://localhost:8000";
 const RETRYABLE = new Set([429, 500, 502, 503, 504]);
+const SDK_CLIENT = "javascript/0.2.0";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -92,7 +93,13 @@ export class Markvector {
     const url = new URL(this.baseUrl + path);
     for (const [k, v] of opts.query ?? []) url.searchParams.append(k, v);
 
-    const headers: Record<string, string> = { Authorization: `Bearer ${this.key}` };
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${this.key}`,
+      // Unlike User-Agent, this is available in browsers too. The API records
+      // it on retrieval traces so SDK traffic is distinguishable from raw API
+      // key calls without trusting it for authentication or tenancy.
+      "X-Markvector-Client": SDK_CLIENT,
+    };
     if (opts.collection) headers["X-Collection"] = opts.collection;
 
     let payload: BodyInit | undefined;

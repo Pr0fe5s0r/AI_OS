@@ -338,7 +338,9 @@ async def replace_chunks(scope: Scope, item_id: str, chunks: list[dict]) -> int:
             c.ordinal       = row.ordinal,
             c.heading       = row.heading,
             c.title         = row.title,
-            c.status        = $status
+            c.status        = $status,
+            c.node_type     = 'fact',
+            c.stage         = 1
         WITH c, row
         CALL db.create.setNodeVectorProperty(c, 'embedding', row.embedding)
         WITH c
@@ -366,14 +368,19 @@ async def collection_chunk_vectors(
     """
     clause, params = _scope_clause("c", scope)
     if live_only:
-        clause += " AND c.archived IS NULL"
+        # Every Chunk has status from the moment it is written. `archived` is
+        # intentionally absent until consolidation archives a node, so asking
+        # for c.archived before that has ever happened makes Neo4j emit an
+        # UnknownPropertyKeyWarning on otherwise healthy collections.
+        clause += " AND c.status = $active"
+        params["active"] = str(Lifecycle.ACTIVE)
     return await _run(
         f"""
         MATCH (c:Chunk) WHERE {clause} AND c.embedding IS NOT NULL
         RETURN c.chunk_id AS id, c.item_id AS item_id, c.ordinal AS ordinal,
                c.heading AS heading, c.title AS title, c.embedding AS embedding,
-               coalesce(c.node_type, 'fact') AS node_type,
-               coalesce(c.stage, 1) AS stage
+               coalesce(properties(c)['node_type'], 'fact') AS node_type,
+               coalesce(properties(c)['stage'], 1) AS stage
         ORDER BY c.item_id, c.ordinal
         LIMIT $limit
         """,
@@ -470,7 +477,7 @@ async def chunk_lineage(scope: Scope, chunk_id: str) -> list[dict]:
         MATCH (c:Chunk {{chunk_id: $chunk_id}})-[:DERIVED_FROM]->(s:Chunk)
         WHERE {clause}
         RETURN s.chunk_id AS chunk_id, s.heading AS heading,
-               s.item_id AS item_id, s.archived AS archived
+               s.item_id AS item_id, properties(s)['archived'] AS archived
         """,
         chunk_id=chunk_id,
         **params,

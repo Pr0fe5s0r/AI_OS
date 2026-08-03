@@ -252,7 +252,7 @@ await docs.downloadOriginal(file.id, { path: "q2-copy.pdf" });`}
         {topic === "agent" && (
           <TopicPanel
             title="Run a read-only agent"
-            description="Bring an OpenAI-compatible model. The agent can search, list files, inspect structure, and read documents. It cannot write to the collection."
+            description="Bring an OpenAI-compatible model. Ask across the entire collection, or enforce a selected-file scope for one question. The agent cannot write to the collection."
           >
             <Install lang={lang} agent />
             <LanguageCode
@@ -262,9 +262,16 @@ await docs.downloadOriginal(file.id, { path: "q2-copy.pdf" });`}
 agent = docs.agent(
     api_key="sk-…",
     model="gpt-4o-mini",
+    instructions="Answer tersely in JSON and use ISO dates.",
 )
 
-for event in agent.stream("How does the spec handle voice input?"):
+# Pass ids or Document objects. Omit files= to use every file.
+selected = docs.files()[:3]
+
+for event in agent.stream(
+    "How does the spec handle voice input?",
+    files=selected,
+):
     if isinstance(event, ToolCall):
         print("→", event.name, event.arguments)
     elif isinstance(event, ToolResult):
@@ -276,14 +283,36 @@ for event in agent.stream("How does the spec handle voice input?"):
 const agent = docs.agent({
   apiKey: process.env.OPENAI_API_KEY,
   model: "gpt-4o-mini",
+  instructions: "Answer tersely in JSON and use ISO dates.",
 });
 
-for await (const event of agent.stream("How does the spec handle voice input?")) {
+// Pass ids or Document objects. Omit files to use every file.
+const selected = (await docs.files()).slice(0, 3);
+
+for await (const event of agent.stream("How does the spec handle voice input?", {
+  files: selected,
+})) {
   if (event instanceof ToolCall) console.log("→", event.name, event.arguments);
   else if (event instanceof ToolResult) console.log("←", event.summary);
   else if (event instanceof AgentAnswer) console.log(event.text);
 }`}
             />
+            <div className="rounded-lg border border-edge bg-panel px-4 py-3">
+              <h3 className="text-sm font-semibold text-ink">Custom agent instructions</h3>
+              <p className="mt-1 text-xs leading-5 text-muted">
+                Pass <Mono>instructions</Mono> when creating the agent to add role, tone,
+                language, output-format, or domain guidance. These instructions are appended
+                to the grounded, read-only system prompt. Use <Mono>system</Mono> only when you
+                intentionally need to replace that complete prompt. If both are supplied,
+                <Mono>instructions</Mono> is appended to your custom <Mono>system</Mono>.
+              </p>
+            </div>
+            <Note>
+              A selected-file run is a hard boundary: search, file listing, structure, and
+              document reads are all restricted. Omit <Mono>files</Mono> to use the whole
+              collection. Use <Mono>instructions</Mono> for additive custom prompting;
+              <Mono>system</Mono> replaces the complete built-in prompt.
+            </Note>
           </TopicPanel>
         )}
 
@@ -451,6 +480,8 @@ function aiDoc(lang: Lang, collection: string, base: string): string {
     "- Search combines semantic and keyword retrieval and returns a trace ID.",
     "- Always check `grounded` before presenting an answer.",
     "- Agent tools are read-only.",
+    "- Agent questions accept an optional file selection. Omit it to use all files; when provided it is enforced across every agent tool.",
+    "- Agent `instructions` are appended to the protected grounding prompt. `system` replaces that prompt completely.",
     "",
   ];
 
@@ -480,6 +511,8 @@ function aiDoc(lang: Lang, collection: string, base: string): string {
       "- `docs.download_original(document_id, path=...)` restores the uploaded file.",
       "- `docs.get_many(files)` and `docs.structures(files)` perform bulk reads.",
       "- `mv.trace(trace_id)` returns retrieval candidates, scores, and timings.",
+      "- `agent.answer(question, files=[...])` and `agent.stream(question, files=[...])` restrict one run to selected ids or Document objects; omit `files` for all documents.",
+      "- `docs.agent(..., instructions='...')` appends custom role, tone, format, or domain guidance; `system='...'` fully replaces the system prompt.",
       "",
       "## Search and answer",
       "",
@@ -502,8 +535,13 @@ if answer.grounded:
       "",
       block(
         "python",
-        `agent = docs.agent(api_key="sk-…", model="gpt-4o-mini")
-result = agent.answer("Summarise the refund policy")
+        `agent = docs.agent(
+    api_key="sk-…",
+    model="gpt-4o-mini",
+    instructions="Answer tersely in JSON and use ISO dates.",
+)
+selected = docs.files()[:3]
+result = agent.answer("Summarise the refund policy", files=selected)
 print(result.answer, result.tool_calls)`
       ),
       "",
@@ -540,6 +578,8 @@ print(result.answer, result.tool_calls)`
     "- `docs.downloadOriginal(documentId, { path })` restores the uploaded file.",
     "- `docs.getMany(files)` and `docs.structures(files)` perform bulk reads.",
     "- `mv.trace(traceId)` returns retrieval candidates, scores, and timings.",
+    "- `agent.answer(question, { files })` and `agent.stream(question, { files })` restrict one run to selected ids or Document objects; omit `files` for all documents.",
+    "- `docs.agent({ instructions: '...' })` appends custom role, tone, format, or domain guidance; `system` fully replaces the system prompt.",
     "",
     "## Search and answer",
     "",
@@ -566,8 +606,10 @@ if (answer.grounded) {
       `const agent = docs.agent({
   apiKey: process.env.OPENAI_API_KEY,
   model: "gpt-4o-mini",
+  instructions: "Answer tersely in JSON and use ISO dates.",
 });
-const result = await agent.answer("Summarise the refund policy");
+const selected = (await docs.files()).slice(0, 3);
+const result = await agent.answer("Summarise the refund policy", { files: selected });
 console.log(result.answer, result.toolCalls);`
     ),
     "",

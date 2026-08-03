@@ -1,6 +1,6 @@
 import { MarkvectorError } from "./errors.js";
 import { type Collection } from "./client.js";
-import { walkSections } from "./models.js";
+import { type Document, walkSections } from "./models.js";
 
 const DEFAULT_MODEL = "gpt-4o-mini";
 const READ_BUDGET = 8000;
@@ -44,9 +44,17 @@ export interface AgentOptions {
   /** Base URL for an OpenAI-compatible endpoint. */
   baseUrl?: string;
   model?: string;
+  /** Additional system instructions appended without replacing grounding safeguards. */
+  instructions?: string;
+  /** Full system-prompt replacement. Prefer `instructions` for additive guidance. */
   system?: string;
   maxSteps?: number;
   temperature?: number;
+}
+
+/** Scope one question to selected documents. Omit `files` to use the entire collection. */
+export interface AgentQueryOptions {
+  files?: (string | Document)[];
 }
 
 export class Thinking {
@@ -168,7 +176,7 @@ export class Agent {
     options: AgentOptions = {},
   ) {
     this.model = options.model ?? DEFAULT_MODEL;
-    this.system = options.system ?? DEFAULT_SYSTEM;
+    this.system = withInstructions(options.system ?? DEFAULT_SYSTEM, options.instructions);
     this.maxSteps = options.maxSteps ?? 8;
     this.temperature = options.temperature ?? 0;
     this.client = options.client
@@ -177,10 +185,18 @@ export class Agent {
   }
 
   /** Reason, call tools, and answer, yielding each step as it happens. */
-  async *stream(query: string): AsyncGenerator<AgentEvent> {
+  async *stream(query: string, options: AgentQueryOptions = {}): AsyncGenerator<AgentEvent> {
+    const selectedFiles = options.files === undefined
+      ? undefined
+      : new Set(options.files.map((file) => typeof file === "string" ? file : file.id));
     const messages: Message[] = [
       { role: "system", content: this.system },
-      { role: "user", content: query },
+      {
+        role: "user",
+        content: selectedFiles === undefined
+          ? query
+          : `${query}\n\nFile scope: use only these item_ids: ${JSON.stringify([...selectedFiles])}.`,
+      },
     ];
 
     for (let step = 0; step < this.maxSteps; step++) {
@@ -207,7 +223,7 @@ export class Agent {
       for (const call of calls) {
         const args = parseArguments(call.arguments);
         yield new ToolCall(call.name, args);
-        const result = await this.runTool(call.name, args);
+        const result = await this.runTool(call.name, args, selectedFiles);
         yield new ToolResult(call.name, summarise(result));
         messages.push({
           role: "tool",
@@ -226,10 +242,10 @@ export class Agent {
   }
 
   /** Run to completion and return the answer plus its tool-use transcript. */
-  async answer(query: string): Promise<AgentResult> {
+  async answer(query: string, options: AgentQueryOptions = {}): Promise<AgentResult> {
     const steps: Exclude<AgentEvent, AgentAnswer>[] = [];
     let answer = "";
-    for await (const event of this.stream(query)) {
+    for await (const event of this.stream(query, options)) {
       if (event instanceof AgentAnswer) answer = event.text;
       else steps.push(event);
     }
@@ -278,11 +294,21 @@ export class Agent {
   }
 
   /** @internal Execute one read-only agent tool. Errors become model-readable data. */
-  async runTool(name: string, args: JsonObject): Promise<unknown> {
+  async runTool(
+    name: string,
+    args: JsonObject,
+    selectedFiles?: ReadonlySet<string>,
+  ): Promise<unknown> {
     try {
       if (name === "search") {
         const limit = finiteNumber(args.limit, 8);
-        const files = Array.isArray(args.files) ? args.files.map(String) : undefined;
+        const requested = Array.isArray(args.files) ? args.files.map(String) : undefined;
+        const files = selectedFiles === undefined
+          ? requested
+          : (requested ?? [...selectedFiles]).filter((id) => selectedFiles.has(id));
+        // An empty item_ids query means "no filter" to the HTTP API, so stop
+        // here rather than accidentally widening an empty selection to all.
+        if (selectedFiles !== undefined && (files?.length ?? 0) === 0) return [];
         const results = await this.collection.search(String(args.query ?? ""), { limit, files });
         return results.matches.map((hit) => ({
           item_id: hit.id,
@@ -292,15 +318,22 @@ export class Agent {
         }));
       }
       if (name === "list_files") {
-        return (await this.collection.list({ limit: 200 })).map((doc) => ({
+        if (selectedFiles?.size === 0) return [];
+        return (await this.collection.list({ limit: 200 }))
+          .filter((doc) => selectedFiles === undefined || selectedFiles.has(doc.id))
+          .map((doc) => ({
           item_id: doc.id,
           filename: doc.original?.filename ?? doc.source.locator,
           title: doc.title,
           source: doc.source.source,
-        }));
+          }));
       }
       if (name === "structure") {
-        const structure = await this.collection.structure(String(args.item_id ?? ""));
+        const itemId = String(args.item_id ?? "");
+        if (selectedFiles !== undefined && !selectedFiles.has(itemId)) {
+          return { error: `document ${JSON.stringify(itemId)} is outside the selected file scope` };
+        }
+        const structure = await this.collection.structure(itemId);
         return {
           item_id: structure.itemId,
           title: structure.title,
@@ -313,7 +346,11 @@ export class Agent {
         };
       }
       if (name === "read_document") {
-        const doc = await this.collection.get(String(args.item_id ?? ""));
+        const itemId = String(args.item_id ?? "");
+        if (selectedFiles !== undefined && !selectedFiles.has(itemId)) {
+          return { error: `document ${JSON.stringify(itemId)} is outside the selected file scope` };
+        }
+        const doc = await this.collection.get(itemId);
         const result: JsonObject = {
           item_id: doc.id,
           title: doc.title,
@@ -357,6 +394,11 @@ function summarise(result: unknown): string {
     }
   }
   return "ok";
+}
+
+function withInstructions(system: string, instructions?: string): string {
+  const custom = instructions?.trim();
+  return custom ? `${system}\n\nAdditional instructions from the caller:\n${custom}` : system;
 }
 
 async function buildClient(apiKey?: string, baseUrl?: string): Promise<AgentClient> {

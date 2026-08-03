@@ -217,12 +217,16 @@ export function Traces({ active }: { active: string | null }) {
                     <td className="py-2.5 pr-3">
                       <Chip
                         tone={
-                          t.via === "api_key"
+                          t.via === "api_key" || t.via.startsWith("sdk:")
                             ? "text-hot border-hot/30 bg-hot/10"
                             : "text-muted border-edgeStrong bg-elevated"
                         }
                       >
-                        {t.via}
+                        {t.via.startsWith("sdk:javascript/")
+                          ? `JS SDK ${t.via.slice("sdk:javascript/".length)}`
+                          : t.via.startsWith("sdk:python/")
+                            ? `Python SDK ${t.via.slice("sdk:python/".length)}`
+                            : t.via}
                       </Chip>
                     </td>
                     <td className="py-2.5 pr-3 text-right font-mono text-2xs tabular-nums text-muted">

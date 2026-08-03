@@ -1,5 +1,5 @@
 export { Agent, AgentAnswer, AgentResult, Thinking, ToolCall, ToolResult } from "./agent.js";
-export type { AgentClient, AgentEvent, AgentOptions } from "./agent.js";
+export type { AgentClient, AgentEvent, AgentOptions, AgentQueryOptions } from "./agent.js";
 export { Collection, Markvector } from "./client.js";
 export type { FileInput, MarkvectorOptions } from "./client.js";
 export {

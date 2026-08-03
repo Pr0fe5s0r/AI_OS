@@ -35,8 +35,10 @@ class _FakeCompletions:
     def __init__(self, script):
         self._script = script
         self.turns = 0
+        self.requests = []
 
     def create(self, **kwargs):
+        self.requests.append(kwargs)
         chunks = self._script[self.turns]
         self.turns += 1
         return iter(chunks)
@@ -132,6 +134,46 @@ def test_tool_error_is_data_not_an_exception():
     agent = mv.collection("default").agent(client=_FakeLLM(), model="fake")
     out = agent._run_tool("structure", {"item_id": "missing"})
     assert "error" in out
+
+
+def test_agent_file_selection_is_enforced_on_every_search():
+    seen: dict[str, list[str]] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/search":
+            seen["files"] = request.url.params.get_list("item_ids")
+        return _search_handler(request)
+
+    mv = Markvector(api_key="test", transport=httpx.MockTransport(handler))
+    agent = mv.collection("default").agent(client=_FakeLLM(), model="fake")
+    result = agent.answer("How does voice input work?", files=["item-1"])
+
+    assert result.tool_calls == 1
+    assert seen["files"] == ["item-1"]
+
+
+def test_agent_cannot_open_a_document_outside_the_selected_file_scope():
+    agent = _agent()
+    result = agent._run_tool(
+        "read_document", {"item_id": "item-2"}, selected_files={"item-1"}
+    )
+    assert "outside the selected file scope" in result["error"]
+
+
+def test_custom_instructions_are_appended_to_the_protected_system_prompt():
+    llm = _FakeLLM()
+    mv = Markvector(api_key="test", transport=httpx.MockTransport(_search_handler))
+    agent = mv.collection("default").agent(
+        client=llm,
+        model="fake",
+        instructions="Return a terse JSON object in Spanish.",
+    )
+    agent.answer("How does voice input work?")
+
+    system = llm.chat.completions.requests[0]["messages"][0]["content"]
+    assert "using ONLY the tools provided" in system
+    assert "Additional instructions from the caller" in system
+    assert "terse JSON object in Spanish" in system
 
 
 def test_config_without_openai_is_a_clear_error(monkeypatch):

@@ -52,6 +52,7 @@ from packages.core.tenancy import (
     enforce_binding,
     require_write,
     resolve_caller,
+    trace_via,
     workspace_scope,
 )
 from packages.core.tracing import get_trace, list_traces, record, stats
@@ -232,7 +233,7 @@ async def retrieve(
         session,
         scope,
         trace,
-        via=str(principal.get("via", "session")),
+        via=trace_via(principal),
         actor=str(principal.get("email") or ""),
     )
     await session.commit()
@@ -295,7 +296,7 @@ async def answer_question(
         session,
         scope,
         trace,
-        via=str(principal.get("via", "session")),
+        via=trace_via(principal),
         actor=str(principal.get("email") or ""),
     )
     await session.commit()

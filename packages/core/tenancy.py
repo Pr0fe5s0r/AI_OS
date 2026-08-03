@@ -26,6 +26,21 @@ from packages.shared.schema import Scope
 SESSION_COOKIE = "markos_session"
 
 
+def trace_via(principal: dict[str, Any]) -> str:
+    """Stable provenance for query traces.
+
+    The client header is descriptive only: identity and scope still come
+    exclusively from the verified credential. Restricting its shape keeps an
+    arbitrary caller-supplied string out of the trace console.
+    """
+    client = principal.get("client")
+    if isinstance(client, str) and 0 < len(client) <= 80:
+        allowed = all(c.isalnum() or c in "._/-" for c in client)
+        if allowed:
+            return f"sdk:{client}"
+    return str(principal.get("via", "session"))
+
+
 async def current_principal(
     markos_session: str | None = Cookie(default=None),
 ) -> dict[str, Any]:
@@ -42,6 +57,7 @@ async def current_principal(
 async def resolve_caller(
     markos_session: str | None = Cookie(default=None),
     authorization: str | None = Header(default=None),
+    x_markvector_client: str | None = Header(default=None),
 ) -> dict[str, Any]:
     """Whoever is calling: a signed-in person, or a program holding a key.
 
@@ -67,6 +83,7 @@ async def resolve_caller(
             # enforce_binding, never trusted from the request.
             "collection_id": holder.get("collection_id"),
             "via": "api_key",
+            "client": x_markvector_client,
         }
 
     async with Session() as session:
@@ -83,6 +100,7 @@ async def resolve_caller(
         "via": "session",
         "scopes": ["read", "write"],
         "collection_id": None,
+        "client": x_markvector_client,
     }
 
 

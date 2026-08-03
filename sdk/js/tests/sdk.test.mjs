@@ -24,7 +24,10 @@ const document = {
 
 function mockFetch(input, init) {
   const url = new URL(input);
-  assert.equal(init.headers["X-Collection"], "sdk-demo");
+  assert.equal(init.headers["X-Markvector-Client"], "javascript/0.2.0");
+  if (!url.pathname.startsWith("/api/traces/")) {
+    assert.equal(init.headers["X-Collection"], "sdk-demo");
+  }
   if (url.pathname === "/api/search") {
     return Promise.resolve(Response.json({
       query: url.searchParams.get("q"),
@@ -44,6 +47,14 @@ function mockFetch(input, init) {
   }
   if (url.pathname === "/api/items") {
     return Promise.resolve(Response.json({ items: [document] }));
+  }
+  if (url.pathname === "/api/traces/trace-1") {
+    return Promise.resolve(Response.json({
+      trace_id: "trace-1",
+      query: "why did paid results fall",
+      via: "sdk:javascript/0.2.0",
+      timings_ms: { total: 12 },
+    }));
   }
   return Promise.resolve(Response.json({ detail: "unhandled" }, { status: 404 }));
 }
@@ -69,9 +80,21 @@ test("search maps server JSON to typed camelCase results", async () => {
   assert.equal(result.matches[0].cleanExcerpt, "paid conversions fell");
 });
 
+test("trace lookup works for the trace id returned by an SDK search", async () => {
+  const mv = new Markvector({ apiKey: "test", fetch: mockFetch });
+  const result = await mv.collection("sdk-demo").search("why did paid results fall");
+  const trace = await mv.trace(result.traceId);
+  assert.equal(trace.trace_id, result.traceId);
+  assert.equal(trace.via, "sdk:javascript/0.2.0");
+});
+
 class FakeLLM {
   turn = 0;
-  chat = { completions: { create: async () => this.chunks() } };
+  requests = [];
+  chat = { completions: { create: async (options) => {
+    this.requests.push(options);
+    return this.chunks();
+  } } };
 
   async *chunks() {
     if (this.turn++ === 0) {
@@ -103,4 +126,45 @@ test("agent answer includes transcript and tool count", async () => {
   assert.equal(result.toolCalls, 1);
   assert.match(result.answer, /item-1/);
   assert.ok(!result.steps.some((event) => event instanceof AgentAnswer));
+});
+
+test("agent file selection is enforced on every search", async () => {
+  let searchedFiles = [];
+  const scopedFetch = (input, init) => {
+    const url = new URL(input);
+    if (url.pathname === "/api/search") searchedFiles = url.searchParams.getAll("item_ids");
+    return mockFetch(input, init);
+  };
+  const docs = new Markvector({ apiKey: "test", fetch: scopedFetch }).collection("sdk-demo");
+  const result = await docs.agent({ client: new FakeLLM(), model: "fake" }).answer("How?", {
+    files: ["item-1"],
+  });
+  assert.equal(result.toolCalls, 1);
+  assert.deepEqual(searchedFiles, ["item-1"]);
+});
+
+test("agent cannot open a document outside the selected file scope", async () => {
+  const docs = new Markvector({ apiKey: "test", fetch: mockFetch }).collection("sdk-demo");
+  const agent = docs.agent({ client: new FakeLLM(), model: "fake" });
+  const result = await agent.runTool(
+    "read_document",
+    { item_id: "item-2" },
+    new Set(["item-1"]),
+  );
+  assert.match(result.error, /outside the selected file scope/);
+});
+
+test("custom instructions are appended to the protected system prompt", async () => {
+  const llm = new FakeLLM();
+  const docs = new Markvector({ apiKey: "test", fetch: mockFetch }).collection("sdk-demo");
+  await docs.agent({
+    client: llm,
+    model: "fake",
+    instructions: "Return a terse JSON object in Spanish.",
+  }).answer("How?");
+
+  const system = llm.requests[0].messages[0].content;
+  assert.match(system, /using ONLY the tools provided/);
+  assert.match(system, /Additional instructions from the caller/);
+  assert.match(system, /terse JSON object in Spanish/);
 });

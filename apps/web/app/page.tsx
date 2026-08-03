@@ -6,6 +6,7 @@ import { Cluster, cx } from "./data";
 import { Chip, Label, Logo, Mono, useToast } from "./ui/kit";
 import { Gate } from "./views/gate";
 import { Keys } from "./views/keys";
+import { IndexGraph } from "./views/index-graph";
 import { Overview } from "./views/overview";
 import { Playground } from "./views/playground";
 import { Query } from "./views/query";
@@ -13,11 +14,12 @@ import { Sdk } from "./views/sdk";
 import { Traces } from "./views/traces";
 import { Upload } from "./views/upload";
 
-type Section = "overview" | "upload" | "query" | "keys" | "sdk" | "playground" | "traces";
+type Section = "overview" | "upload" | "graph" | "query" | "keys" | "sdk" | "playground" | "traces";
 
 const NAV: { id: Section; label: string; icon: string; group: string }[] = [
   { id: "overview", label: "Overview", icon: "M3 3h7v7H3zM14 3h7v4h-7zM14 10h7v11h-7zM3 14h7v7H3z", group: "Workspace" },
   { id: "upload", label: "Upload data", icon: "M12 15V4m0 0L8 8m4-4l4 4M4 17v2a1 1 0 001 1h14a1 1 0 001-1v-2", group: "Data" },
+  { id: "graph", label: "Index graph", icon: "M6 5h.01M18 7h.01M8 18h.01M6 5l12 2M6 5l2 13M18 7L8 18", group: "Data" },
   { id: "query", label: "Query & chat", icon: "M21 12a9 9 0 01-9 9 9 9 0 01-4-1l-4 1 1-4a9 9 0 1116-5z", group: "Data" },
   { id: "traces", label: "Traces", icon: "M3 12h4l3 8 4-16 3 8h4", group: "Data" },
   { id: "sdk", label: "SDK & docs", icon: "M8 9l-4 3 4 3m8-6l4 3-4 3M13 5l-2 14", group: "Developer" },
@@ -298,6 +300,9 @@ export default function Page() {
                   toast={toast}
                   onIngested={load}
                 />
+              )}
+              {section === "graph" && (
+                <IndexGraph active={active} onUpload={() => setSection("upload")} />
               )}
               {section === "query" && <Query active={active} />}
               {section === "keys" && <Keys collections={collections} toast={toast} />}

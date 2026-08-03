@@ -91,6 +91,7 @@ const mv = new Markvector({ apiKey: "kb_live_…" });
 const agent = mv.collection("default").agent({
   apiKey: process.env.OPENAI_API_KEY,
   model: "gpt-4o-mini",
+  instructions: "Answer tersely in JSON and use ISO dates.",
   // baseUrl: "https://your-openai-compatible-endpoint/v1",
   // client: existingOpenAIClient,
 });
@@ -106,8 +107,44 @@ const result = await agent.answer("How does voice input work?");
 console.log(result.answer, result.toolCalls, result.steps);
 ```
 
+Scope a question to selected files by passing document IDs or `Document`
+objects. Omit `files` to let the agent use the entire collection:
+
+```ts
+const selected = (await docs.files()).slice(0, 3);
+const result = await agent.answer("Compare these reports", { files: selected });
+
+for await (const event of agent.stream("What changed?", { files: selected })) {
+  // Only the selected files can be searched, listed, or opened in this run.
+}
+```
+
+### Custom agent instructions
+
+Use `instructions` for additional role, tone, output-format, language, or domain
+guidance. It is appended to the built-in prompt, so the agent keeps its
+grounding and read-only tool rules:
+
+```ts
+const agent = docs.agent({
+  apiKey: process.env.OPENAI_API_KEY,
+  model: "gpt-4o-mini",
+  instructions: `
+    Act as a compliance analyst.
+    Return JSON with summary, risks, and cited_file_ids.
+    Never omit uncertainty.
+  `,
+});
+```
+
+Use `system` only when you intentionally want to replace the entire built-in
+system prompt. When both are supplied, `instructions` is appended to `system`.
+
 The `openai` package is an optional peer dependency. Install it when building
 an agent internally (`npm install openai`), or pass any compatible `client`.
+Use `instructions` to append custom role, tone, format, or domain guidance to
+the built-in grounded-research prompt. `system` remains available when you
+deliberately need to replace the complete system prompt.
 
 ## Collections, keys, and traces
 
@@ -141,4 +178,3 @@ try {
 
 GET requests retry transient 429/5xx responses with backoff. Writes are never
 retried because a timed-out write may already have landed.
-

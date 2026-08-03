@@ -120,6 +120,7 @@ mv = Markvector(api_key="kb_live_…")
 agent = mv.collection("default").agent(
     api_key="sk-…",                  # your LLM key
     model="gpt-4o-mini",
+    instructions="Answer tersely in JSON and use ISO dates.",
     # base_url="…",                  # any OpenAI-compatible endpoint (local, OpenRouter, …)
     # client=my_openai_client,       # …or pass a client you already built
 )
@@ -141,10 +142,44 @@ print(result.answer)
 print(result.tool_calls, "tool calls,", len(result.steps), "steps")
 ```
 
+Scope one question to selected files by passing document ids or `Document`
+objects. Omit `files` to use the entire collection:
+
+```python
+selected = docs.files()[:3]
+result = agent.answer("Compare these reports", files=selected)
+
+for event in agent.stream("What changed?", files=selected):
+    ...  # only these files can be searched, listed, or opened
+```
+
+### Custom agent instructions
+
+Use `instructions` for additional role, tone, output-format, language, or
+domain guidance. It is appended to the built-in prompt, so grounding and the
+read-only tool rules remain in place:
+
+```python
+agent = docs.agent(
+    api_key="sk-…",
+    model="gpt-4o-mini",
+    instructions="""
+    Act as a compliance analyst.
+    Return JSON with summary, risks, and cited_file_ids.
+    Never omit uncertainty.
+    """,
+)
+```
+
+Use `system` only when intentionally replacing the complete built-in system
+prompt. When both are supplied, `instructions` is appended to `system`.
+
 The agent is **read-only** — it can `search` (optionally within selected files),
 `list_files`, read a document's `structure` (PageIndex), and `read_document`. It
-never writes to your store. Configure `model`, `system` (prompt), `max_steps`,
-and `temperature` on `.agent(...)`.
+never writes to your store. Configure `model`, `instructions`, `max_steps`,
+and `temperature` on `.agent(...)`. `instructions` appends role, tone, format,
+or domain guidance to the built-in grounded-research prompt; use `system` only
+when you deliberately need to replace that prompt completely.
 
 ## Vectorless search & document structure (PageIndex)
 

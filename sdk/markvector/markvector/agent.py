@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Generator, Iterator
+from collections.abc import Generator, Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -9,6 +9,7 @@ from .errors import MarkvectorError
 
 if TYPE_CHECKING:
     from .client import Collection
+    from .models import Document
 
 # ---------------------------------------------------------------------------
 # THE AGENT — reasoning + tool execution, entirely on the client.
@@ -176,27 +177,46 @@ class Agent:
         base_url: str | None = None,
         model: str = DEFAULT_MODEL,
         system: str | None = None,
+        instructions: str | None = None,
         max_steps: int = 8,
         temperature: float = 0.0,
     ) -> None:
         self._c = collection
         self._client = client or _build_client(api_key, base_url)
         self.model = model
-        self.system = system or SYSTEM
+        self.system = _with_instructions(system or SYSTEM, instructions)
         self.max_steps = max_steps
         self.temperature = temperature
 
     # ------------------------------ the loop ------------------------------
 
-    def stream(self, query: str) -> Iterator[Event]:
+    def stream(
+        self,
+        query: str,
+        *,
+        files: Iterable[str | Document] | None = None,
+    ) -> Iterator[Event]:
         """Reason, call tools, and answer — yielding each step as it happens.
 
         Yields `Thinking` as the model narrates, `ToolCall`/`ToolResult` around
         each lookup, and finally one `AgentAnswer`.
         """
+        selected_files = (
+            None
+            if files is None
+            else {f if isinstance(f, str) else f.id for f in files}
+        )
+        scoped_query = query
+        if selected_files is not None:
+            scoped_query += (
+                "\n\nFile scope: use only these item_ids: "
+                + json.dumps(sorted(selected_files))
+                + "."
+            )
+
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": self.system},
-            {"role": "user", "content": query},
+            {"role": "user", "content": scoped_query},
         ]
 
         for step in range(self.max_steps):
@@ -230,7 +250,7 @@ class Agent:
                 except json.JSONDecodeError:
                     args = {}
                 yield ToolCall(c["name"], args)
-                result = self._run_tool(c["name"], args)
+                result = self._run_tool(c["name"], args, selected_files=selected_files)
                 yield ToolResult(c["name"], _summarise(result))
                 messages.append(
                     {"role": "tool", "tool_call_id": c["id"], "content": json.dumps(result)}
@@ -240,11 +260,16 @@ class Agent:
         content, _ = yield from self._turn(messages, use_tools=False)
         yield AgentAnswer(content)
 
-    def answer(self, query: str) -> AgentResult:
+    def answer(
+        self,
+        query: str,
+        *,
+        files: Iterable[str | Document] | None = None,
+    ) -> AgentResult:
         """Run to completion and return the answer plus the full transcript."""
         steps: list[Event] = []
         final = ""
-        for event in self.stream(query):
+        for event in self.stream(query, files=files):
             if isinstance(event, AgentAnswer):
                 final = event.text
             else:
@@ -295,15 +320,37 @@ class Agent:
         ]
         return "".join(parts), reassembled
 
-    def _run_tool(self, name: str, args: dict[str, Any]) -> Any:
+    def _run_tool(
+        self,
+        name: str,
+        args: dict[str, Any],
+        *,
+        selected_files: set[str] | None = None,
+    ) -> Any:
         """Execute a tool against the collection. Errors become data the model
         can read and recover from, never exceptions that kill the run."""
         try:
             if name == "search":
+                requested = args.get("files")
+                requested_files = requested if isinstance(requested, list) else None
+                files = (
+                    requested_files
+                    if selected_files is None
+                    else [
+                        str(item_id)
+                        for item_id in (requested_files or sorted(selected_files))
+                        if str(item_id) in selected_files
+                    ]
+                )
+                # The API interprets no item_ids as an unscoped search. An
+                # explicitly empty/intersected selection must therefore stop
+                # locally rather than widening to the whole collection.
+                if selected_files is not None and not files:
+                    return []
                 hits = self._c.search(
                     str(args.get("query", "")),
                     limit=int(args.get("limit", 8) or 8),
-                    files=args.get("files") or None,
+                    files=files or None,
                 )
                 return [
                     {
@@ -315,6 +362,8 @@ class Agent:
                     for h in hits
                 ]
             if name == "list_files":
+                if selected_files == set():
+                    return []
                 return [
                     {
                         "item_id": d.id,
@@ -323,9 +372,13 @@ class Agent:
                         "source": d.source.source,
                     }
                     for d in self._c.list(limit=200)
+                    if selected_files is None or d.id in selected_files
                 ]
             if name == "structure":
-                s = self._c.structure(str(args["item_id"]))
+                item_id = str(args["item_id"])
+                if selected_files is not None and item_id not in selected_files:
+                    return {"error": f"document {item_id!r} is outside the selected file scope"}
+                s = self._c.structure(item_id)
                 return {
                     "item_id": s.item_id,
                     "title": s.title,
@@ -336,7 +389,10 @@ class Agent:
                     ],
                 }
             if name == "read_document":
-                doc = self._c.get(str(args["item_id"]))
+                item_id = str(args["item_id"])
+                if selected_files is not None and item_id not in selected_files:
+                    return {"error": f"document {item_id!r} is outside the selected file scope"}
+                doc = self._c.get(item_id)
                 body = doc.body[:_READ_BUDGET]
                 out: dict[str, Any] = {"item_id": doc.id, "title": doc.title, "text": body}
                 if len(doc.body) > _READ_BUDGET:
@@ -360,6 +416,14 @@ def _summarise(result: Any) -> str:
             n = len(result["text"])
             return f"{n} chars{' (truncated)' if result.get('truncated') else ''}"
     return "ok"
+
+
+def _with_instructions(system: str, instructions: str | None) -> str:
+    """Add caller guidance without silently replacing grounding safeguards."""
+    custom = (instructions or "").strip()
+    if not custom:
+        return system
+    return f"{system}\n\nAdditional instructions from the caller:\n{custom}"
 
 
 def _build_client(api_key: str | None, base_url: str | None) -> Any:
