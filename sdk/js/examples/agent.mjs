@@ -1,9 +1,11 @@
 import { AgentAnswer, Markvector, Thinking, ToolCall, ToolResult } from "markvector";
 
-const question = process.argv.slice(2).join(" ") || "Hello";
-const mv = new Markvector({apiKey: "kb_live_4yVotNdXLTGxADrMsNVqgq8zjByGSbAs0oMn4ZIHPTk"}); // MARKVECTOR_API_KEY / MARKVECTOR_URL
+const question = process.argv.slice(2).join(" ") || "what is the bank details?";
+
+const mv = new Markvector({apiKey: "kb_live_U7wojtVTiKL0IvTUEHgcAfn3c4EJqlo9YDpwoaFXy74"}); // MARKVECTOR_API_KEY / MARKVECTOR_URL
+
 const agent = mv.collection("checking-collection").agent({
-  apiKey: "v1.CmMKHHN0YXRpY2tleS1lMDBreGJhdnBxNTJwOTd6enQSIXNlcnZpY2VhY2NvdW50LWUwMHljeWt5bjhyendhNDRlcTILCP6wrswGEMDPzzM6DAj9s8aXBxCA_OuOAkACWgNlMDA.AAAAAAAAAAFX3TPuGB5p10KSS8cwpiVYwqtWfUPdUXSFnnTy4z17Vqzn8Hr2V_C-7B4BJkBtTwDviyGwibudnPbztpworoYE",
+  apiKey: "v1.CmMKHHN0YXRpY2tlZS1lMDBreGJhdnBxNTJwOTd6enQSIXNlcnZpY2VhY2NvdW50LWUwMHljeWt5bjhyendhNDRlcTILCP6wrswGEMDPzzM6DAj9s8aXBxCA_OuOAkACWgNlMDA.AAAAAAAAAAFX3TPuGB5p10KSS8cwpiVYwqtWfUPdUXSFnnTy4z17Vqzn8Hr2V_C-7B4BJkBtTwDviyGwibudnPbztpworoYE",
   baseUrl: "https://api.studio.nebius.com/v1",
   model: "zai-org/GLM-5.2",
 });

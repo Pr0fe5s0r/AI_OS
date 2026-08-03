@@ -24,6 +24,7 @@ def main() -> None:
         api_key="v1.CmMKHHN0YXRpY2tleS1lMDBreGJhdnBxNTJwOTd6enQSIXNlcnZpY2VhY2NvdW50LWUwMHljeWt5bjhyendhNDRlcTILCP6wrswGEMDPzzM6DAj9s8aXBxCA_OuOAkACWgNlMDA.AAAAAAAAAAFX3TPuGB5p10KSS8cwpiVYwqtWfUPdUXSFnnTy4z17Vqzn8Hr2V_C-7B4BJkBtTwDviyGwibudnPbztpworoYE",
         base_url="https://api.studio.nebius.com/v1",
         model="zai-org/GLM-5.2",
+        
     )
 
     for event in agent.stream(question):
