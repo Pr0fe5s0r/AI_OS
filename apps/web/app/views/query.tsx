@@ -18,6 +18,7 @@ import { Card, Chip, HeatLegend, Label, Mono, ScoreBar, VectorField } from "../u
  *  you cannot trace is the thing worth refusing, not prose. */
 type Turn = {
   question: string;
+  mode: api.AskMode;
   answer: string;
   citations: api.Citation[];
   grounded: boolean;
@@ -75,6 +76,7 @@ export function Query({ collections }: { collections: Collection[] }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [focus, setFocus] = useState<api.Citation | null>(null);
+  const [mode, setMode] = useState<api.AskMode>("hybrid");
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -88,11 +90,12 @@ export function Query({ collections }: { collections: Collection[] }) {
     setError(null);
     setQuestion("");
     try {
-      const out = await api.ask(collectionId, q, 8);
+      const out = await api.ask(collectionId, q, 8, mode);
       setTurns((t) => [
         ...t,
         {
           question: q,
+          mode: out.mode,
           answer: out.answer,
           citations: out.citations,
           grounded: out.grounded,
@@ -116,7 +119,31 @@ export function Query({ collections }: { collections: Collection[] }) {
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="flex shrink-0 items-center gap-3 border-b border-edge px-6 py-3">
           <h1 className="text-sm font-semibold text-ink">Query &amp; chat</h1>
-          <div className="ml-auto flex items-center gap-2">
+          <div className="ml-auto flex items-center gap-3">
+            {/* Two ways of finding the evidence. Neither is strictly better,
+                so it is a choice rather than a setting with a right answer. */}
+            <div className="flex items-center gap-1.5">
+              <Label>retrieval</Label>
+              <div className="flex gap-1 rounded-lg border border-edge bg-elevated p-0.5">
+                {(["hybrid", "vectorless"] as const).map((m) => (
+                  <button
+                    key={m}
+                    onClick={() => setMode(m)}
+                    title={
+                      m === "hybrid"
+                        ? "Match passages by meaning and by wording, then fuse. Better at finding a specific figure or identifier anywhere in a collection."
+                        : "Read each document's table of contents and reason about which sections answer the question. No embeddings. Better on long structured documents."
+                    }
+                    className={cx(
+                      "rounded-md px-2.5 py-1 font-mono text-2xs transition",
+                      mode === m ? "bg-accent/15 text-ink" : "text-subtle hover:text-muted"
+                    )}
+                  >
+                    {m}
+                  </button>
+                ))}
+              </div>
+            </div>
             <Label>collection</Label>
             <select
               value={collectionId || ""}
@@ -138,10 +165,12 @@ export function Query({ collections }: { collections: Collection[] }) {
             <div className="mx-auto max-w-lg py-16 text-center">
               <h2 className="text-sm text-ink">Ask your data a question</h2>
               <p className="mt-2 text-xs leading-relaxed text-subtle">
-                Your question is matched against the collection by meaning and by exact
-                wording together, and the answer is written from what comes back. Every
-                claim carries a number you can click to see the passage behind it — and
-                an answer with nothing behind it is labelled as such.
+                <span className="text-muted">hybrid</span> matches passages by meaning and
+                by exact wording together. <span className="text-muted">vectorless</span>{" "}
+                reads each document&rsquo;s table of contents and reasons about which sections
+                answer you — no embeddings at all. Either way the answer is written only from
+                what came back, every claim carries a number you can click to see the passage
+                behind it, and an answer with nothing behind it is labelled as such.
               </p>
             </div>
           )}
@@ -202,6 +231,7 @@ export function Query({ collections }: { collections: Collection[] }) {
                   <Mono className="text-2xs text-subtle">
                     {t.matches.length} passage{t.matches.length === 1 ? "" : "s"} · {ms(t.tookMs)}
                   </Mono>
+                  <Chip title="which retrieval found the evidence">{t.mode}</Chip>
                   <Chip title="the derivation of this answer">trace {t.traceId.slice(0, 8)}</Chip>
                   {t.degraded && (
                     <Chip tone="text-hot border-hot/40 bg-hot/10">{t.degraded}</Chip>

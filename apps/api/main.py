@@ -243,6 +243,7 @@ async def retrieve(
 async def answer_question(
     q: str = Query(min_length=1),
     limit: int = Query(8, ge=1, le=20),
+    mode: str = Query("hybrid", pattern="^(hybrid|vectorless)$"),
     sources: list[str] | None = Query(None),
     scope: Scope = Depends(workspace_scope),
     principal: dict[str, Any] = Depends(resolve_caller),
@@ -260,9 +261,19 @@ async def answer_question(
     or when it produced prose citing nothing. That flag is the difference
     between an answer and a guess, so it travels with the text rather than
     being left for the reader to infer.
+
+    `mode` picks how the evidence is found:
+
+      hybrid      passage embeddings and keyword matching, fused (default)
+      vectorless  reason over each document's table of contents and open the
+                  sections that look like they answer it
+
+    Neither is a strict improvement on the other, so this is a choice rather
+    than a migration. The mode comes back on the response, because two answers
+    to one question can differ entirely on it.
     """
     cfg = RetrievalConfig(limit=limit, sources=tuple(sources or ()))
-    result, trace = await answer(session, scope, q, cfg)
+    result, trace = await answer(session, scope, q, cfg, mode=mode)
 
     # Recorded once, under the retrieval that produced it: an answer whose
     # retrieval cannot be inspected is not one anybody can argue with.

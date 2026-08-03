@@ -406,6 +406,9 @@ export type Citation = {
 export type AnswerOutcome = SearchOutcome & {
   answer: string;
   citations: Citation[];
+  /** Which retrieval found the evidence. Two answers to one question can
+   *  differ entirely on this. */
+  mode: AskMode;
   /** False when the store had nothing to answer from, when the model said the
    *  passages did not cover the question, or when it wrote prose citing
    *  nothing. The difference between an answer and a guess. */
@@ -414,10 +417,13 @@ export type AnswerOutcome = SearchOutcome & {
 
 /** Retrieval plus a written answer built only from what was retrieved.
  *  Separate from `search`, which never returns generated text. */
+export type AskMode = "hybrid" | "vectorless";
+
 export async function ask(
   collectionId: string | undefined,
   question: string,
-  limit = 8
+  limit = 8,
+  mode: AskMode = "hybrid"
 ): Promise<AnswerOutcome> {
   const payload = await call<{
     answer: string;
@@ -426,13 +432,15 @@ export async function ask(
     trace_id: string;
     took_ms: number;
     degraded: string | null;
+    mode: AskMode;
     results: RawResult[];
-  }>(`/api/answer?q=${encodeURIComponent(question)}&limit=${limit}`, {
+  }>(`/api/answer?q=${encodeURIComponent(question)}&limit=${limit}&mode=${mode}`, {
     collection: collectionId,
   });
 
   return {
     answer: payload.answer,
+    mode: payload.mode || mode,
     grounded: payload.grounded,
     citations: payload.citations || [],
     traceId: payload.trace_id,

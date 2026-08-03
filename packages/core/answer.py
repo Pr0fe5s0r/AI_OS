@@ -87,11 +87,16 @@ class Answer:
     # screen, so it is a field rather than something inferred from the prose.
     grounded: bool = True
     degraded: str | None = None
+    # Which retrieval produced the evidence. Travels with the answer because
+    # two answers to the same question can differ entirely on this, and a
+    # reader comparing them needs to know which they are looking at.
+    mode: str = "hybrid"
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "question": self.question,
             "answer": self.text,
+            "mode": self.mode,
             "grounded": self.grounded,
             "degraded": self.degraded,
             "trace_id": self.trace_id,
@@ -175,22 +180,46 @@ async def answer(
     scope: Scope,
     question: str,
     cfg: RetrievalConfig = DEFAULT,
+    mode: str = "hybrid",
 ) -> tuple[Answer, Trace]:
     """Retrieve, then write an answer from what was retrieved.
+
+    Two ways of retrieving, and the writing is identical either way:
+
+      hybrid      passage embeddings and keyword matching, fused
+      vectorless  reason over each document's table of contents and open the
+                  sections that look like they answer the question
+
+    They suit different material. Hybrid is better at finding a specific figure
+    or identifier anywhere in a corpus; vectorless is better on long structured
+    documents where the author already labelled what is where, and where
+    similarity keeps returning passages that sound right and are not. Neither
+    is a strict improvement, which is why this is a choice rather than a
+    replacement.
 
     Returns the trace alongside, so the answer and the retrieval that produced
     it can be recorded together — an answer whose retrieval cannot be inspected
     is not one anybody can argue with.
     """
     started = time.perf_counter()
-    hits, trace = await search_traced(session, scope, question, cfg)
+
+    if mode == "vectorless":
+        from packages.core.vectorless import retrieve
+
+        outcome, trace = await retrieve(session, scope, question)
+        hits = outcome.hits
+        degraded = outcome.degraded
+    else:
+        hits, trace = await search_traced(session, scope, question, cfg)
+        degraded = trace.degraded
 
     result = Answer(
         question=question,
         text="",
         hits=hits,
         trace_id=trace.trace_id,
-        degraded=trace.degraded,
+        degraded=degraded,
+        mode=mode,
     )
 
     passages = _gather(hits)
@@ -201,6 +230,8 @@ async def answer(
         result.text = (
             "Nothing in this collection answers that. Try different wording, or add "
             "a document that covers it."
+            if mode != "vectorless"
+            else "No section of these documents looks like it answers that."
         )
         result.took_ms = int((time.perf_counter() - started) * 1000)
         return result, trace
