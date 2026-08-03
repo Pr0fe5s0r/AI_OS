@@ -310,8 +310,12 @@ export function Upload({
                   className="flex w-full items-center gap-3 px-4 py-2.5 text-left transition hover:bg-elevated"
                 >
                   <div className="min-w-0 flex-1">
-                    <div className="truncate text-xs text-ink">{d.title}</div>
-                    <div className="truncate font-mono text-2xs text-subtle">{d.locator}</div>
+                    {/* The file name first — it is what a person recognises. The
+                        extracted title is secondary. */}
+                    <div className="truncate font-mono text-xs text-ink">
+                      {d.original?.filename || d.locator}
+                    </div>
+                    <div className="truncate text-2xs text-subtle">{d.title}</div>
                   </div>
                   <Chip>{d.source}</Chip>
                   {d.original && (
@@ -406,8 +410,10 @@ function DocPanel({
         <header className="border-b border-edge px-5 py-4">
           <div className="flex items-start gap-3">
             <div className="min-w-0 flex-1">
-              <div className="truncate text-sm font-medium text-ink">{doc.title}</div>
-              <Mono className="mt-1 block truncate text-2xs text-subtle">{doc.locator}</Mono>
+              <Mono className="block truncate text-sm font-medium text-ink">
+                {doc.original?.filename || doc.locator}
+              </Mono>
+              <div className="mt-1 truncate text-2xs text-subtle">{doc.title}</div>
             </div>
             <button
               onClick={onClose}

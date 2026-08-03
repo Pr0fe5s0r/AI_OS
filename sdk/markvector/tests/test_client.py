@@ -12,6 +12,7 @@ from markvector import (
     Markvector,
     NotFound,
     Results,
+    Structure,
 )
 
 # A tiny fake of the MarkVector API, wired in through httpx's MockTransport so
@@ -26,6 +27,22 @@ DOC = {
     "source": {"source": "sdk", "locator": "notes/q2"},
     "classes": [],
     "metadata": {"original": {"filename": "q2.pdf", "content_type": "application/pdf", "size": 5}},
+}
+
+STRUCTURE = {
+    "item_id": "item-1",
+    "title": "Q2 note",
+    "nodes": 3,
+    "sections": [
+        {"id": "n001", "title": "Intro", "tokens": 5, "opens": "the opening", "sections": []},
+        {
+            "id": "n002",
+            "title": "Details",
+            "tokens": 8,
+            "opens": "more",
+            "sections": [{"id": "n003", "title": "Sub", "tokens": 3, "opens": "x", "sections": []}],
+        },
+    ],
 }
 
 
@@ -66,6 +83,18 @@ def handler(request: httpx.Request) -> httpx.Response:
         )
     if path == "/api/items/missing/original":
         return httpx.Response(404, json={"detail": "No original file is stored."})
+    if path == "/api/items/item-1/structure":
+        return httpx.Response(200, json=STRUCTURE)
+    if path == "/api/items/batch" and method == "POST":
+        body = json.loads(request.content)
+        wanted = [i for i in body["ids"] if i == "item-1"]  # only item-1 exists
+        items = []
+        for _ in wanted:
+            row = dict(DOC)
+            if body.get("structure"):
+                row["structure"] = STRUCTURE
+            items.append(row)
+        return httpx.Response(200, json={"count": len(items), "items": items})
 
     if path == "/api/search":
         assert request.headers.get("X-Collection") == "sdk-demo"
@@ -212,6 +241,31 @@ def test_search_within_selected_files():
     doc = Document.from_json(DOC)
     docs.search("why did paid results fall", files=["item-1", doc])
     assert seen["item_ids"] == ["item-1", "item-1"]
+
+
+def test_structure_is_a_heading_tree():
+    tree = make().collection("sdk-demo").structure("item-1")
+    assert isinstance(tree, Structure)
+    assert tree.nodes == 3
+    assert [s.title for s in tree.sections] == ["Intro", "Details"]
+    # walk() flattens the whole tree, including nested sections.
+    assert [s.title for s in tree.walk()] == ["Intro", "Details", "Sub"]
+    assert tree.sections[0].opens == "the opening"
+
+
+def test_get_many_is_bulk_and_ordered():
+    docs = make().collection("sdk-demo")
+    got = docs.get_many(["item-1", "missing"])  # missing ids simply absent
+    assert [d.id for d in got] == ["item-1"]
+    assert isinstance(got[0], Document)
+
+
+def test_structures_bulk_extraction():
+    docs = make().collection("sdk-demo")
+    trees = docs.structures([Document.from_json(DOC)])
+    assert len(trees) == 1
+    assert isinstance(trees[0], Structure)
+    assert trees[0].item_id == "item-1"
 
 
 def test_files_returns_only_uploads():

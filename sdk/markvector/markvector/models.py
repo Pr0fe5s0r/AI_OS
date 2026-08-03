@@ -127,6 +127,70 @@ class Chunk:
 
 
 @dataclass(slots=True)
+class Section:
+    """One node in a document's heading tree, and the sections beneath it.
+
+    `tokens` is the section's size and `opens` a one-line preview of its
+    content — enough to decide whether to read it without reading it, which is
+    exactly what vectorless (PageIndex) retrieval does.
+    """
+
+    id: str
+    title: str
+    tokens: int = 0
+    opens: str = ""
+    sections: list[Section] = field(default_factory=list)
+
+    def walk(self) -> list[Section]:
+        """This section and every section nested under it, depth-first."""
+        out: list[Section] = [self]
+        for child in self.sections:
+            out.extend(child.walk())
+        return out
+
+    @classmethod
+    def from_json(cls, d: dict[str, Any]) -> Section:
+        return cls(
+            id=d.get("id", ""),
+            title=d.get("title", ""),
+            tokens=int(d.get("tokens", 0) or 0),
+            opens=d.get("opens", ""),
+            sections=[Section.from_json(s) for s in d.get("sections") or []],
+        )
+
+
+@dataclass(slots=True)
+class Structure:
+    """A document's own table of contents as a tree — the PageIndex structure.
+
+    Built from the document's headings (deterministic, no model calls). It is
+    what vectorless search reasons over: pick sections by their titles and
+    previews, then read only those. Iterate `sections` for the top level or
+    `walk()` for every section flat.
+    """
+
+    item_id: str
+    title: str
+    nodes: int
+    sections: list[Section]
+
+    def walk(self) -> list[Section]:
+        out: list[Section] = []
+        for s in self.sections:
+            out.extend(s.walk())
+        return out
+
+    @classmethod
+    def from_json(cls, d: dict[str, Any]) -> Structure:
+        return cls(
+            item_id=d.get("item_id", ""),
+            title=d.get("title", ""),
+            nodes=int(d.get("nodes", 0) or 0),
+            sections=[Section.from_json(s) for s in d.get("sections") or []],
+        )
+
+
+@dataclass(slots=True)
 class Match:
     """One search result, with the provenance a citation needs."""
 
@@ -367,6 +431,8 @@ __all__ = [
     "MintedKey",
     "Original",
     "Results",
+    "Section",
     "Source",
+    "Structure",
     "WriteResult",
 ]

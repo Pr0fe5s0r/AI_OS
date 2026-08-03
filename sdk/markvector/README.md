@@ -101,6 +101,88 @@ for hit in docs.search("refund policy", files=picked):
 Omit `files=` to search the whole collection. A scoped search never returns a
 document outside the set.
 
+## Agent — reasoning + tools, streamed (bring your own LLM)
+
+Configure your own LLM and let the library run an agent over your collection: it
+reasons, calls tools to look things up, reads the results, reasons again, and
+keeps going until it can answer — streaming the chain of thought and every tool
+call as it happens. The loop runs entirely client-side; the tools are ordinary
+markvector reads.
+
+```bash
+pip install 'markvector[agent]'      # adds the openai client
+```
+
+```python
+from markvector import Markvector, Thinking, ToolCall, ToolResult, AgentAnswer
+
+mv = Markvector(api_key="kb_live_…")
+agent = mv.collection("default").agent(
+    api_key="sk-…",                  # your LLM key
+    model="gpt-4o-mini",
+    # base_url="…",                  # any OpenAI-compatible endpoint (local, OpenRouter, …)
+    # client=my_openai_client,       # …or pass a client you already built
+)
+
+# Stream the chain of thought + tool execution:
+for event in agent.stream("How does Brocaly handle voice input?"):
+    if isinstance(event, Thinking):
+        print(event.text, end="", flush=True)      # the model's reasoning, live
+    elif isinstance(event, ToolCall):
+        print(f"\n  → {event.name}({event.arguments})")
+    elif isinstance(event, ToolResult):
+        print(f"  ← {event.summary}")
+    elif isinstance(event, AgentAnswer):
+        print("\n\nANSWER:\n" + event.text)
+
+# Or just get the answer, with the transcript of how it got there:
+result = agent.answer("How does Brocaly handle voice input?")
+print(result.answer)
+print(result.tool_calls, "tool calls,", len(result.steps), "steps")
+```
+
+The agent is **read-only** — it can `search` (optionally within selected files),
+`list_files`, read a document's `structure` (PageIndex), and `read_document`. It
+never writes to your store. Configure `model`, `system` (prompt), `max_steps`,
+and `temperature` on `.agent(...)`.
+
+## Vectorless search & document structure (PageIndex)
+
+Beyond embedding-based search, MarkVector can answer by reasoning over a
+document's **own structure** — its heading tree — and reading only the sections
+that matter. That's the default for `answer()`:
+
+```python
+ans = docs.answer("what does section 4 require?", mode="vectorless")  # default
+# mode="hybrid" uses passage embeddings + keyword instead
+```
+
+Get the structure itself — the PageIndex tree a document is indexed as:
+
+```python
+doc = docs.files()[0]
+tree = docs.structure(doc)                       # -> Structure
+print(tree.title, f"{tree.nodes} sections")
+for section in tree.sections:                    # top level; .walk() for all
+    print(f"  {section.title}  (~{section.tokens} tokens)")
+    print(f"    {section.opens}")                # one-line preview
+
+# Bulk — extract the structure of many files in one round trip:
+for s in docs.structures(docs.files()):
+    print(s.item_id, s.nodes, "sections")
+```
+
+## Bulk retrieval
+
+Fetch many documents in one call instead of a request per id (order preserved,
+missing ids simply absent):
+
+```python
+picked = ["item-abc", "item-def", "item-ghi"]    # or Document objects
+for doc in docs.get_many(picked):
+    print(doc.id, doc.title)
+```
+
 ## Collections
 
 ```python

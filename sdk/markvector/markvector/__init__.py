@@ -16,6 +16,14 @@ wording together, get grounded answers with citations, read the passages a
 document was split into, and download the original file as it was uploaded.
 """
 
+from .agent import (
+    Agent,
+    AgentAnswer,
+    AgentResult,
+    Thinking,
+    ToolCall,
+    ToolResult,
+)
 from .client import Collection, Markvector
 from .errors import (
     AuthError,
@@ -37,13 +45,18 @@ from .models import (
     MintedKey,
     Original,
     Results,
+    Section,
     Source,
+    Structure,
     WriteResult,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
+    "Agent",
+    "AgentAnswer",
+    "AgentResult",
     "Answer",
     "ApiKey",
     "AuthError",
@@ -62,7 +75,12 @@ __all__ = [
     "NotFound",
     "Original",
     "Results",
+    "Section",
     "Source",
+    "Structure",
+    "Thinking",
+    "ToolCall",
+    "ToolResult",
     "Unavailable",
     "WriteResult",
     "__version__",

@@ -3,9 +3,12 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
+
+if TYPE_CHECKING:
+    from .agent import Agent
 
 from .errors import (
     AuthError,
@@ -23,6 +26,7 @@ from .models import (
     Document,
     MintedKey,
     Results,
+    Structure,
     WriteResult,
 )
 
@@ -400,6 +404,42 @@ class Collection:
         """
         return [d for d in self.list(limit=limit) if d.original is not None]
 
+    def get_many(self, files: _List[str | Document]) -> _List[Document]:
+        """Fetch several documents in one call, in the order given — bulk
+        retrieval instead of a request per id. Missing ids are simply absent."""
+        payload = self._mv._request(
+            "POST",
+            "/api/items/batch",
+            json={"ids": [_doc_id(f) for f in files]},
+            headers=self._headers,
+        )
+        return [Document.from_json(d) for d in payload.get("items", [])]
+
+    def structure(self, file: str | Document) -> Structure:
+        """The document's heading tree — the PageIndex structure vectorless
+        search reasons over. Titles, sizes and a one-line preview per section,
+        built from the document's own headings (no model calls)."""
+        return Structure.from_json(
+            self._mv._request(
+                "GET", f"/api/items/{_doc_id(file)}/structure", headers=self._headers
+            )
+        )
+
+    def structures(self, files: _List[str | Document]) -> _List[Structure]:
+        """Extract the PageIndex structure for a list of files in one round
+        trip — bulk structure extraction over `structure()` one at a time."""
+        payload = self._mv._request(
+            "POST",
+            "/api/items/batch",
+            json={"ids": [_doc_id(f) for f in files], "structure": True},
+            headers=self._headers,
+        )
+        return [
+            Structure.from_json(d["structure"])
+            for d in payload.get("items", [])
+            if d.get("structure")
+        ]
+
     def get(self, document_id: str, version: int | None = None) -> Document:
         """One document, current or at a specific version."""
         params = {"version": version} if version else None
@@ -449,6 +489,24 @@ class Collection:
         return CollectionInfo.from_json(
             self._mv._request("GET", f"/api/collections/{self.id}")
         )
+
+    # -------------------------------- agent --------------------------------
+
+    def agent(self, **kwargs: Any) -> Agent:
+        """An agent that answers questions about this collection by reasoning
+        and calling tools in a loop, driven by an OpenAI-compatible LLM you
+        configure. Needs the extra: ``pip install 'markvector[agent]'``.
+
+            agent = mv.collection("default").agent(api_key="sk-…", model="gpt-4o-mini")
+            for event in agent.stream("what does the spec require?"):
+                ...
+            print(agent.answer("what does the spec require?").answer)
+
+        See ``markvector.Agent`` for the full set of options.
+        """
+        from .agent import Agent
+
+        return Agent(self, **kwargs)
 
     # ------------------------------ categories ------------------------------
 

@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from apps.api.auth_routes import router as auth_router
 from apps.common.consolidation import enabled as consolidation_enabled
 from apps.common.consolidation import interval_seconds as consolidation_interval
-from packages.core import blobs, graph
+from packages.core import blobs, graph, tree
 from packages.core.answer import answer
 from packages.core.chunks import by_ids as chunks_by_ids
 from packages.core.chunks import for_item as chunks_for_item
@@ -47,7 +47,7 @@ from packages.core.normalise import can_parse, supported
 from packages.core.pipeline import redis_settings
 from packages.core.search import RetrievalConfig, search_traced
 from packages.core.snippets import build as build_snippets
-from packages.core.store import get_item, item_versions, list_items
+from packages.core.store import get_item, get_items_by_ids, item_versions, list_items
 from packages.core.tenancy import (
     enforce_binding,
     require_write,
@@ -584,6 +584,61 @@ async def item_chunks(
             for c in chunks
         ],
     }
+
+
+def _structure_of(item: Any) -> dict[str, Any]:
+    """A document's own table of contents as a tree — the PageIndex structure
+    vectorless retrieval reasons over. Titles, sizes and a one-line preview per
+    section; deterministic and free (no model calls)."""
+    root = tree.build(item.body, item.title)
+    return {
+        "item_id": item.id,
+        "title": item.title,
+        "nodes": tree.count(root),
+        "sections": root.outline().get("sections", []),
+    }
+
+
+@app.get("/api/items/{item_id}/structure")
+async def item_structure(
+    item_id: str,
+    scope: Scope = Depends(workspace_scope),
+    session: AsyncSession = Depends(db),
+) -> dict[str, Any]:
+    """The document's structure — its heading tree, the way vectorless search
+    sees it. This is the index a model chooses sections from before reading."""
+    item = await get_item(session, scope, item_id)
+    if item is None:
+        raise HTTPException(404, "No such item.")
+    return _structure_of(item)
+
+
+class BatchIn(BaseModel):
+    ids: list[str] = Field(min_length=1, max_length=100)
+    # Include each document's PageIndex structure — bulk structure extraction
+    # for a list of files, in one round trip.
+    structure: bool = False
+
+
+@app.post("/api/items/batch")
+async def batch_items(
+    payload: BatchIn,
+    scope: Scope = Depends(workspace_scope),
+    session: AsyncSession = Depends(db),
+) -> dict[str, Any]:
+    """Fetch many documents at once, in the order asked for. Missing ids are
+    simply absent. Set `structure` to also get each one's heading tree."""
+    items = await get_items_by_ids(session, scope, payload.ids)
+    by_id = {i.id: i for i in items}
+    ordered = [by_id[i] for i in payload.ids if i in by_id]
+    tagged = await classes_for(session, scope, [i.id for i in ordered])
+    out: list[dict[str, Any]] = []
+    for item in ordered:
+        row = {**item.model_dump(), "classes": tagged.get(item.id, [])}
+        if payload.structure:
+            row["structure"] = _structure_of(item)
+        out.append(row)
+    return {"count": len(out), "items": out}
 
 
 # Types a browser can render in place; everything else is served to download.
