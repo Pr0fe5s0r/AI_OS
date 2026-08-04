@@ -70,6 +70,10 @@ class Citation:
     heading: str
     text: str
     score: float
+    # The page it was read off, when it was read from a picture rather than
+    # from text. The reader gets shown that page beside the words, which is
+    # what makes a transcribed table checkable instead of merely plausible.
+    page: int | None = None
 
 
 @dataclass(slots=True)
@@ -87,6 +91,12 @@ class Answer:
     # screen, so it is a field rather than something inferred from the prose.
     grounded: bool = True
     degraded: str | None = None
+    # What the agent did to get here: which sections it opened, which ids it
+    # reached for and missed, where it stopped. Carried on the answer rather
+    # than left in the trace, because "why should I believe this" is answered
+    # by the route taken, and a reader will not go and open a trace to find it.
+    # Empty for hybrid, which has no route — it ranks and hands over.
+    steps: list[dict[str, Any]] = field(default_factory=list)
     # Which retrieval produced the evidence. Travels with the answer because
     # two answers to the same question can differ entirely on this, and a
     # reader comparing them needs to know which they are looking at.
@@ -101,6 +111,7 @@ class Answer:
             "degraded": self.degraded,
             "trace_id": self.trace_id,
             "took_ms": self.took_ms,
+            "steps": self.steps,
             "citations": [
                 {
                     "marker": c.marker,
@@ -110,6 +121,7 @@ class Answer:
                     "heading": c.heading,
                     "text": c.text,
                     "score": c.score,
+                    "page": c.page,
                 }
                 for c in self.citations
             ],
@@ -163,6 +175,7 @@ def _resolve_citations(
             heading=passage.heading,
             text=passage.text,
             score=passage.score,
+            page=passage.page,
         )
 
     def keep(match: re.Match[str]) -> str:
@@ -186,6 +199,55 @@ def _words(text: str) -> list[str]:
     return re.findall(r"[a-z0-9]+", text.lower())
 
 
+def _attribute_short(
+    answer_words: list[str], passages: list[tuple[Passage, Hit]]
+) -> Citation | None:
+    """Attribute an answer too short to have a seven-word run in it.
+
+    Asked for a headcount the model replied "96" — right, straight off the
+    passage on screen beneath it — and the answer was stamped "not supported by
+    the collection", because a one-word answer cannot contain a seven-word
+    shingle. Short factual answers are the commonest kind there is: a number, a
+    date, a name. A warning that fires on all of them is a warning nobody reads.
+
+    So a short answer is matched on its words instead, and only when the match
+    is UNAMBIGUOUS: every word of it present in exactly one passage. If two
+    passages both contain "96" there is no way to tell which was used, and
+    guessing would attach a checkable-looking reference to the wrong place —
+    which is worse than leaving it uncited.
+
+    It also needs something DISTINCTIVE to match on, which in practice means a
+    figure: a headcount, an amount, a date, a code. A short answer made only of
+    ordinary words — "Receipts must be", "yes", "the second one" — shares those
+    words with half the collection, so matching on them would credit a passage
+    that merely uses the same vocabulary. Those stay uncited, which is the case
+    the strict rule was written for in the first place.
+
+    Whole words, not substrings: "96" must not match "960".
+    """
+    if not any(char.isdigit() for word in answer_words for char in word):
+        return None
+
+    found: list[tuple[int, Passage, Hit]] = []
+    for index, (passage, hit) in enumerate(passages, start=1):
+        if set(answer_words) <= set(_words(passage.text)):
+            found.append((index, passage, hit))
+
+    if len(found) != 1:
+        return None
+    index, passage, hit = found[0]
+    return Citation(
+        marker=index,
+        chunk_id=passage.chunk_id,
+        item_id=hit.item_id,
+        title=hit.title,
+        heading=passage.heading,
+        text=passage.text,
+        score=passage.score,
+        page=passage.page,
+    )
+
+
 def _attribute(text: str, passages: list[tuple[Passage, Hit]]) -> Citation | None:
     """Find the passage an uncited answer was actually drawn from.
 
@@ -196,7 +258,7 @@ def _attribute(text: str, passages: list[tuple[Passage, Hit]]) -> Citation | Non
     """
     answer_words = _words(text)
     if len(answer_words) < _SHINGLE:
-        return None
+        return _attribute_short(answer_words, passages)
     shingles = {
         " ".join(answer_words[i : i + _SHINGLE])
         for i in range(len(answer_words) - _SHINGLE + 1)
@@ -213,8 +275,48 @@ def _attribute(text: str, passages: list[tuple[Passage, Hit]]) -> Citation | Non
                 heading=passage.heading,
                 text=passage.text,
                 score=passage.score,
+                page=passage.page,
             )
     return None
+
+
+async def _attach_pages(
+    session: AsyncSession, scope: Scope, citations: list[Citation]
+) -> None:
+    """Give every citation the page it came off, where the document has pages.
+
+    Passages cut by the chunker carry no page — only the page index knows that
+    — so a citation showed its page under vectorless and showed nothing under
+    hybrid. Same passage, same document, different story depending on a
+    retrieval choice the reader never made.
+
+    Looked up here rather than stored on the chunk because it needs no schema
+    change and cannot go stale: the page is derived from the body the passage
+    was cut from, so it is right by construction.
+    """
+    from packages.core import tree
+    from packages.core.store import get_items_by_ids
+
+    wanted = [c for c in citations if c.page is None]
+    if not wanted:
+        return
+    from packages.core import pages
+
+    items = await get_items_by_ids(session, scope, sorted({c.item_id for c in wanted}))
+    # Only documents whose pages can actually be RENDERED get a page number.
+    # A slide deck writes the same page markers a PDF does, so it looked like
+    # it had pages — and the citation offered a picture of slide 3 that nothing
+    # can produce, which the console rendered as a broken image. A promise the
+    # store cannot keep is worse than no promise.
+    bodies = {
+        item.id: item.body
+        for item in items
+        if pages.renderable("", item.source.locator or "")
+    }
+    for citation in wanted:
+        body = bodies.get(citation.item_id)
+        if body:
+            citation.page = tree.page_containing(body, citation.text)
 
 
 async def answer(
@@ -266,6 +368,13 @@ async def answer(
             trace_id=trace.trace_id,
             degraded=walk.degraded,
             mode=mode,
+            # Set before any early return: a walk that read three sections and
+            # still found nothing is the case where the route matters MOST, and
+            # it is exactly the case an "answer only" field would drop.
+            steps=[
+                {"round": s.round, "action": s.action, "detail": s.detail}
+                for s in walk.steps
+            ],
         )
         passages = _gather(walk.hits, limit=MAX_PASSAGES)
         if not passages:
@@ -303,10 +412,14 @@ async def answer(
                     heading=passage.heading,
                     text=passage.text,
                     score=passage.score,
+                    page=passage.page,
                 )
                 for index, (passage, hit) in enumerate(passages, start=1)
             ]
         result.grounded = bool(result.citations) and walk.found
+        # Sections the page index cut already know their page; a section the
+        # chunker cut does not. Both end up here, so both are filled in.
+        await _attach_pages(session, scope, result.citations)
         result.took_ms = int((time.perf_counter() - started) * 1000)
         return result, trace
     else:
@@ -395,6 +508,7 @@ async def answer(
         if found is not None:
             result.citations = [found]
     result.grounded = bool(result.citations)
+    await _attach_pages(session, scope, result.citations)
     result.took_ms = int((time.perf_counter() - started) * 1000)
     return result, trace
 

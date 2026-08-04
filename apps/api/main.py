@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from apps.api.auth_routes import router as auth_router
 from apps.common.consolidation import enabled as consolidation_enabled
 from apps.common.consolidation import interval_seconds as consolidation_interval
-from packages.core import blobs, graph, tree
+from packages.core import blobs, graph, pages, tree
 from packages.core.answer import answer
 from packages.core.chunks import by_ids as chunks_by_ids
 from packages.core.chunks import for_item as chunks_for_item
@@ -674,6 +674,42 @@ async def item_original(
         content=data,
         media_type=media_type,
         headers={"Content-Disposition": f'{disposition}; filename="{filename}"'},
+    )
+
+
+@app.get("/api/items/{item_id}/pages/{page}")
+async def item_page(
+    item_id: str,
+    page: int,
+    scope: Scope = Depends(workspace_scope),
+    session: AsyncSession = Depends(db),
+) -> Response:
+    """One page of the original, as a picture.
+
+    Serves the citation, not the reader's browsing: when an answer was read off
+    a page rather than out of extracted text, this is the page it was read off,
+    so the transcription can be checked against the thing itself. A citation
+    nobody can check is the failure mode this whole store is built against, and
+    a transcribed table is exactly where that matters most.
+
+    404 for everything without a page — pasted text, Markdown, a .docx, a
+    document whose original was never stored. Scoped like every other route:
+    the workspace comes from the caller, never from the path.
+    """
+    if await get_item(session, scope, item_id) is None:
+        raise HTTPException(404, "No such item.")
+    if page < 1:
+        raise HTTPException(422, "Pages are numbered from 1.")
+
+    png = await pages.image(scope.workspace_id, item_id, page)
+    if png is None:
+        raise HTTPException(404, "That page is not available as a picture.")
+    return Response(
+        content=png,
+        media_type="image/png",
+        # Deterministic: the same page of the same file renders identically, so
+        # it is worth caching hard. Private because it is workspace data.
+        headers={"Cache-Control": "private, max-age=86400"},
     )
 
 

@@ -476,11 +476,31 @@ export type Citation = {
   heading: string;
   text: string;
   score: number;
+  /** Set when this passage was read off a page picture rather than out of
+   *  extracted text — the page it came from. The reader is shown that page
+   *  beside the words, which is the only thing that makes a transcribed table
+   *  checkable rather than merely plausible. */
+  page?: number | null;
 };
+
+/** The picture of one page, for a citation that was read with vision. */
+export function pageImageUrl(itemId: string, page: number): string {
+  return `${API}/api/items/${encodeURIComponent(itemId)}/pages/${page}`;
+}
+
+/** One thing the agent did on the way to the answer.
+ *
+ *  `action` is "read" (opened a section, which became a citation), "missed"
+ *  (reached for a section id that does not exist) or "answered". A miss is
+ *  shown rather than hidden: an agent that groped twice before finding the
+ *  right section is telling you something true about the document. */
+export type Step = { round: number; action: string; detail: string };
 
 export type AnswerOutcome = SearchOutcome & {
   answer: string;
   citations: Citation[];
+  /** The route taken. Empty for hybrid, which ranks rather than navigates. */
+  steps: Step[];
   /** Which retrieval found the evidence. Two answers to one question can
    *  differ entirely on this. */
   mode: AskMode;
@@ -508,6 +528,7 @@ export async function ask(
     took_ms: number;
     degraded: string | null;
     mode: AskMode;
+    steps?: Step[];
     results: RawResult[];
   }>(`/api/answer?q=${encodeURIComponent(question)}&limit=${limit}&mode=${mode}`, {
     collection: collectionId,
@@ -518,6 +539,7 @@ export async function ask(
     mode: payload.mode || mode,
     grounded: payload.grounded,
     citations: payload.citations || [],
+    steps: payload.steps || [],
     traceId: payload.trace_id,
     tookMs: payload.took_ms,
     degraded: payload.degraded,

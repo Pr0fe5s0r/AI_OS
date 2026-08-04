@@ -79,11 +79,11 @@ async def test_an_unreadable_format_is_refused_while_the_caller_is_listening(cli
     whose reason nobody reads, and the console could only say the document was
     "not searchable yet" — which sounds like a delay."""
     response = await client.post(
-        "/api/items/file", files={"file": ("slides.pptx", b"not a document", "application/octet-stream")}
+        "/api/items/file", files={"file": ("meeting.mp3", b"not a document", "application/octet-stream")}
     )
     assert response.status_code == 415
     detail = response.json()["detail"]
-    assert "slides.pptx" in detail
+    assert "meeting.mp3" in detail
     assert ".pdf" in detail, "the refusal must say what IS accepted"
     assert client.queue.jobs == [], "nothing may be queued for a file we cannot read"
 

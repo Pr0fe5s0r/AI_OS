@@ -81,7 +81,14 @@ def test_can_parse_answers_before_the_bytes_are_read():
     """The API asks this while the uploader is still listening. Getting it
     wrong means accepting a file that can only fail in a worker."""
     assert can_parse("report.DOCX") and can_parse("notes.md")
-    assert not can_parse("deck.pptx") and not can_parse("sheet.xlsx")
+    # Decks, workbooks and pictures were unsupported when this was written and
+    # are supported now. The list is the contract, so it moves when the
+    # contract does.
+    assert can_parse("deck.pptx") and can_parse("sheet.xlsx") and can_parse("shot.PNG")
+    # Still nothing that reads audio, video or archives, and saying so is the
+    # point of the check: an accepted file that can only fail in a worker is
+    # the failure this whole path exists to prevent.
+    assert not can_parse("call.mp3") and not can_parse("backup.zip")
 
 
 # ------------------------------- Word documents -------------------------------

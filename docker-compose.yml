@@ -10,6 +10,9 @@ x-app-env: &app-env
   OPENAI_API_KEY: ${OPENAI_API_KEY:-}
   EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
   CHAT_MODEL: ${CHAT_MODEL:-gpt-4o-mini}
+  # Unset by default: without it the agent never looks at a page, and the
+  # system behaves exactly as it did before pages existed.
+  VISION_MODEL: ${VISION_MODEL:-}
   NEBIUS_BASE_URL: ${NEBIUS_BASE_URL:-https://api.studio.nebius.com/v1}
   NEBIUS_API_KEY: ${NEBIUS_API_KEY:-}
   OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
@@ -147,7 +150,13 @@ services:
       minio:
         condition: service_started
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me/api/health')"]
+      # Inside the container, against the process itself. A healthcheck that
+      # calls a public ingress URL is testing DNS, the internet and the proxy —
+      # none of which the container can do anything about, and all of which are
+      # absent on a laptop. It reported this API as unhealthy while it was
+      # serving 200s, which then blocked the worker from starting at all: every
+      # upload returned 202 and sat in a queue with nothing to run it.
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/api/health')"]
       interval: 3s
       timeout: 3s
       retries: 20
@@ -159,8 +168,10 @@ services:
     environment: *app-env
     command: ["arq", "apps.worker.main.WorkerSettings"]
     depends_on:
-      api:
-        condition: service_healthy
+      # NOT the api. The worker talks to Redis, Postgres, Neo4j and the object
+      # store; it never calls the API, so gating it on the API's health only
+      # creates a way for ingestion to be silently dead while uploads are
+      # still accepted.
       postgres:
         condition: service_healthy
       redis:

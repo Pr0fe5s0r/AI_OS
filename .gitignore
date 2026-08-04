@@ -10,3 +10,5 @@ apps/web/tsconfig.tsbuildinfo
 
 # A separately cloned repository, not part of this project.
 PageIndex/
+# Reference implementations cloned for reading, not part of this repo.
+PixelRAG/

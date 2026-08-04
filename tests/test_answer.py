@@ -268,6 +268,45 @@ async def test_vectorless_is_the_default_retrieval(db, monkeypatch):
     assert result.mode == "vectorless"
 
 
+async def test_the_route_the_agent_took_travels_with_the_answer(db, monkeypatch):
+    """The steps were always recorded and never shown, so the only account of
+    how an answer was reached was a trace id — a receipt number. They ride on
+    the answer now, including when nothing was found: a walk that opened two
+    sections and still came back empty is the case where the route matters
+    most, and an "answer only" field is exactly what would drop it."""
+
+    async def walked(session, scope, question):
+        from packages.core.navigator import Outcome, Step
+        from packages.core.search import Trace, new_trace_id
+
+        outcome = Outcome(
+            steps=[
+                Step(1, "read", "Expenses → [1]"),
+                Step(1, "missed", "n099"),
+                Step(2, "answered", "not found"),
+            ]
+        )
+        return outcome, Trace(trace_id=new_trace_id(), query=question, config={}, filters={})
+
+    monkeypatch.setattr("packages.core.navigator.navigate", walked)
+    result, _ = await answer(db, SCOPE, "anything", mode="vectorless")
+
+    assert result.grounded is False, "nothing was read, so nothing is grounded"
+    assert [s["action"] for s in result.steps] == ["read", "missed", "answered"]
+    assert result.as_dict()["steps"][1]["detail"] == "n099"
+
+
+async def test_hybrid_reports_no_route_because_it_takes_none(db, monkeypatch):
+    """Hybrid ranks and hands over. Inventing steps for it would put a story on
+    screen that describes work nothing did."""
+    await put_item(db, _doc(_HANDBOOK))
+    await db.commit()
+    monkeypatch.setattr("packages.core.llm.chat", lambda *a, **k: "Within thirty days [1].")
+
+    result, _ = await answer(db, SCOPE, "receipts", mode="hybrid")
+    assert result.steps == []
+
+
 async def test_an_empty_vectorless_result_says_so_in_its_own_terms(db, monkeypatch):
     """"Nothing in this collection" and "no section looks like it answers that"
     are different claims. The one shown should match the retrieval that ran."""
@@ -331,3 +370,137 @@ async def test_attribution_needs_a_real_run_of_words_not_a_stray_phrase(db, monk
 
     result, _ = await answer(db, SCOPE, "receipts submitted within thirty days", mode="hybrid")
     assert result.grounded is False
+
+
+async def test_a_one_word_answer_is_still_credited_to_its_passage(db, monkeypatch):
+    """Asked for a headcount the model replied "96" — correct, straight off the
+    passage displayed beneath it — and the console stamped the answer "not
+    supported by the collection", because one word cannot contain a seven-word
+    run. Short factual answers are the commonest kind there is."""
+    await put_item(db, _doc("# Segments\n\nNordics headcount is 96 across two offices."))
+    await db.commit()
+    monkeypatch.setattr("packages.core.llm.chat", lambda *a, **k: "96")
+
+    result, _ = await answer(db, SCOPE, "nordics headcount", mode="hybrid")
+    assert result.grounded is True
+    assert result.citations and "96" in result.citations[0].text
+
+
+async def test_an_ambiguous_short_answer_stays_uncited(db, monkeypatch):
+    """If two passages both contain the figure there is no way to tell which was
+    used. Guessing would attach a checkable-looking reference to the wrong
+    place, which is worse than leaving it uncited."""
+    from packages.shared.schema import Item, SourceRef
+
+    for n, locator in ((1, "a.md"), (2, "b.md")):
+        await put_item(
+            db,
+            Item(
+                id="",
+                scope=SCOPE,
+                title=f"Report {n}",
+                body=f"# Report {n}\n\nThe headcount recorded here is 96 people.",
+                source=SourceRef(source="upload", locator=locator),
+            ),
+        )
+    await db.commit()
+    monkeypatch.setattr("packages.core.llm.chat", lambda *a, **k: "96")
+
+    result, _ = await answer(db, SCOPE, "headcount", mode="hybrid")
+    assert result.citations == []
+    assert result.grounded is False
+
+
+def test_a_short_answer_matches_whole_words_not_substrings():
+    """"96" must not be credited to a passage that only says "960"."""
+    from packages.core.answer import _attribute_short
+    from packages.shared.schema import Hit, Passage, SourceRef
+
+    hit = Hit(
+        item_id="i",
+        title="t",
+        excerpt="",
+        source=SourceRef(source="upload", locator="l"),
+        score=1.0,
+        passages=[],
+    )
+    passage = Passage(chunk_id="c", ordinal=0, heading="h", text="The figure is 960.", score=1.0)
+    assert _attribute_short(["96"], [(passage, hit)]) is None
+
+
+def test_a_short_answer_of_ordinary_words_is_not_credited():
+    """"Yes" or "the second one" shares its words with half the collection.
+    Matching on them would credit a passage that merely uses the same
+    vocabulary — the exact failure the strict rule exists to prevent."""
+    from packages.core.answer import _attribute_short
+    from packages.shared.schema import Hit, Passage, SourceRef
+
+    hit = Hit(
+        item_id="i",
+        title="t",
+        excerpt="",
+        source=SourceRef(source="upload", locator="l"),
+        score=1.0,
+        passages=[],
+    )
+    passage = Passage(
+        chunk_id="c", ordinal=0, heading="h", text="Receipts must be filed.", score=1.0
+    )
+    assert _attribute_short(["receipts", "must", "be"], [(passage, hit)]) is None
+
+
+def test_a_passage_is_located_on_the_page_it_came_from():
+    """Passages cut by the chunker carry no page, so the same evidence showed
+    its page under vectorless and showed nothing under hybrid — two stories
+    about one passage, decided by a retrieval choice the reader never made."""
+    from packages.core import tree
+
+    body = (
+        "<!-- page 1 -->\nOpening remarks about the year.\n\n---\n\n"
+        "<!-- page 2 -->\nRevenue grew in both segments,\nwhile costs were held flat.\n\n"
+        "---\n\n<!-- page 3 -->\nGuidance is unchanged.\n"
+    )
+    # newlines flattened, exactly as a passage arrives from the chunker
+    assert tree.page_containing(body, "Revenue grew in both segments, while costs") == 2
+    assert tree.page_containing(body, "Guidance is unchanged.") == 3
+    assert tree.page_containing(body, "Opening remarks") == 1
+
+
+def test_text_that_is_not_in_the_document_has_no_page():
+    """A citation with no page shows text only, which is honest. Guessing one
+    would put the wrong picture behind a checkable-looking reference."""
+    from packages.core import tree
+
+    body = "<!-- page 1 -->\nSomething entirely different.\n"
+    assert tree.page_containing(body, "words that never appeared") is None
+    assert tree.page_containing("no page markers at all", "no page markers") is None
+    assert tree.page_containing(body, "") is None
+
+
+async def test_hybrid_citations_carry_their_page_too(db, monkeypatch):
+    """The fix, end to end: retrieval mode must not change what a citation can
+    say about where it came from.
+
+    Page one is padded so the receipts passage is cut as its own chunk. A
+    passage that straddles a page boundary reports where it BEGINS, which is
+    the only answer that is always true of it."""
+    await put_item(
+        db,
+        _doc(
+            "<!-- page 1 -->\n"
+            + "Introductory matter about the scheme and its history. " * 60
+            + "\n\n---\n\n<!-- page 2 -->\n"
+            + "Receipts must be submitted within thirty days of the expense. " * 12,
+            locator="expenses.pdf",
+        ),
+    )
+    await db.commit()
+    monkeypatch.setattr("packages.core.llm.chat", lambda *a, **k: "Within thirty days [1].")
+
+    result, _ = await answer(db, SCOPE, "receipts submitted within thirty days", mode="hybrid")
+    assert result.citations, "the answer must be cited at all"
+    # A page at all is the fix. WHICH page is exercised precisely by
+    # test_a_passage_is_located_on_the_page_it_came_from — here the chunker
+    # decides where the passage starts, and pinning that would be testing the
+    # chunker's size budget rather than this.
+    assert result.citations[0].page is not None, "a hybrid citation must know its page"

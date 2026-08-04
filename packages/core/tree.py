@@ -51,6 +51,11 @@ class Node:
     end_line: int
     text: str
     children: list[Node] = field(default_factory=list)
+    # Set when this section is literally one page of a PDF. Known exactly at
+    # that point — the marker being split on says which page it is — so it is
+    # recorded rather than re-derived later from line numbers that a fallback
+    # section does not have.
+    page: int | None = None
 
     @property
     def tokens(self) -> int:
@@ -77,6 +82,28 @@ class Node:
         opening = " ".join(lines)[:chars].strip()
         return opening + "…" if len(opening) == chars else opening
 
+    def captions(self) -> list[str]:
+        """The figures and tables this section contains, by name.
+
+        A caption is the ONE piece of text a PDF keeps about a picture, and
+        until now it was invisible: the outline showed a title and the first
+        160 characters, so page 13 of a paper read "Attention Visualizations
+        Input-Input Layer5 It is in this spirit that..." and the words "Figure
+        3" appeared nowhere in the index. Asked about Figure 3, the agent had
+        no way to find the page holding it and correctly reported that nothing
+        matched — over a document that had it.
+
+        Line starts only. Captions sit on their own line in extracted text,
+        and a sentence mid-paragraph mentioning a table is a reference to it,
+        not the place it lives.
+        """
+        found: list[str] = []
+        for match in _CAPTION.finditer(self.text):
+            name = f"{match.group(1).rstrip('.').title()} {match.group(2)}"
+            if name not in found:
+                found.append(name)
+        return found
+
     def outline(self, with_tokens: bool = True, with_preview: bool = True) -> dict[str, Any]:
         """The node WITHOUT its full text — what the model reasons over.
 
@@ -90,6 +117,13 @@ class Node:
             opening = self.preview()
             if opening:
                 entry["opens"] = opening
+        # What this section SHOWS, as opposed to says. Named separately from
+        # the preview because a figure is findable by its number and by
+        # nothing else — no amount of prose in the opening line will lead
+        # anyone to it.
+        shows = self.captions()
+        if shows:
+            entry["shows"] = shows
         if self.children:
             entry["sections"] = [c.outline(with_tokens, with_preview) for c in self.children]
         return entry
@@ -177,8 +211,15 @@ _PAGE = re.compile(r"^<!--\s*page\s+(\d+)\s*-->\s*$", re.MULTILINE)
 # Target size for a block when a document has neither headings nor pages.
 FALLBACK_CHARS = 2500
 
+# A figure or table caption, at the start of a line. The only text a PDF keeps
+# about a picture, and therefore the only way to find one.
+_CAPTION = re.compile(
+    r"^\s*(Figure|Fig\.|Table|Chart|Exhibit|Appendix)\s+([0-9]+[A-Za-z]?)\b",
+    re.MULTILINE | re.IGNORECASE,
+)
 
-def _fallback_sections(body: str) -> list[dict[str, str]]:
+
+def _fallback_sections(body: str) -> list[dict[str, Any]]:
     """Readable units for a document with no headings.
 
     Pages first: a PDF has them, they are what its own numbering refers to, and
@@ -188,13 +229,20 @@ def _fallback_sections(body: str) -> list[dict[str, str]]:
     """
     pages = list(_PAGE.finditer(body))
     if pages:
-        sections: list[dict[str, str]] = []
+        sections: list[dict[str, Any]] = []
         for index, match in enumerate(pages):
             start = match.end()
             end = pages[index + 1].start() if index + 1 < len(pages) else len(body)
             text = body[start:end].strip().strip("-").strip()
             if text:
-                sections.append({"title": f"Page {match.group(1)}", "text": text})
+                sections.append(
+                    {
+                        "title": f"Page {match.group(1)}",
+                        "text": text,
+                        "page": int(match.group(1)),
+                        "start_line": body.count("\n", 0, match.start()) + 1,
+                    }
+                )
         if sections:
             return sections
 
@@ -257,9 +305,10 @@ def build(markdown: str, title: str = "") -> Node:
                     node_id=next_id(),
                     title=section["title"],
                     level=1,
-                    start_line=1,
+                    start_line=int(section.get("start_line", 1)),
                     end_line=len(lines),
                     text=section["text"],
+                    page=section.get("page"),
                 )
             )
         if not root.children:
@@ -310,6 +359,74 @@ def build(markdown: str, title: str = "") -> Node:
     return root
 
 
+def page_containing(markdown: str, snippet: str) -> int | None:
+    """Which page a piece of text sits on, found by locating the text itself.
+
+    For passages that were cut by the chunker rather than by the page index —
+    everything hybrid retrieval returns. Those carry no page of their own, so
+    the same passage showed its page when vectorless cited it and showed
+    nothing when hybrid cited it: the same evidence, described two ways,
+    depending on a retrieval choice the reader did not make.
+
+    Matched on the opening of the snippet, which is enough to locate it and
+    short enough to survive the trimming a passage goes through on the way to
+    a citation. None when the text cannot be found or the document has no
+    pages — a citation with no page shows text only, which is honest.
+    """
+    opening = " ".join(snippet.split())[:120]
+    if not opening:
+        return None
+
+    # The body keeps its line breaks; the snippet may not. Compare on a
+    # whitespace-flattened copy and map the hit back by counting markers in the
+    # same flattened text, so both sides are measured the same way.
+    flat = " ".join(markdown.split())
+    at = flat.find(opening)
+    if at < 0:
+        return None
+
+    page: int | None = None
+    for match in _PAGE_FLAT.finditer(flat):
+        if match.start() > at:
+            break
+        page = int(match.group(1))
+    return page
+
+
+# The page marker again, without the line anchor: used against text that has
+# had its newlines flattened so a passage can be located inside it.
+_PAGE_FLAT = re.compile(r"<!--\s*page\s+(\d+)\s*-->")
+
+
+def page_of(markdown: str, node: Node) -> int | None:
+    """Which page of the original a section begins on, or None.
+
+    Both PDF paths — extracted text and a scan read with vision — write
+    `<!-- page N -->` before each page's content, so the last marker at or
+    before a section's first line is the page it starts on. That is what lets a
+    citation show the page it came off.
+
+    None for everything with no pages: pasted text, Markdown, a .docx. A
+    citation with no page shows text only, which is honest — better than an
+    empty picture frame implying something failed to load.
+    """
+    if node.page is not None:
+        # A page-fallback section IS a page and said so when it was cut. The
+        # line-scan below cannot recover that: those sections all begin at the
+        # same nominal line, so scanning would report page 1 for all fifteen
+        # pages of a paper — and a citation would show the wrong page's
+        # picture, which is worse than showing none.
+        return node.page
+
+    page: int | None = None
+    for match in _PAGE.finditer(markdown):
+        line = markdown.count("\n", 0, match.start())
+        if line > node.start_line:
+            break
+        page = int(match.group(1))
+    return page
+
+
 def find(root: Node, node_ids: list[str]) -> list[Node]:
     """The named sections, in document order.
 
@@ -355,5 +472,6 @@ __all__ = [
     "count",
     "find",
     "outline_json",
+    "page_of",
     "section_text",
 ]

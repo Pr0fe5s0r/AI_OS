@@ -9,11 +9,18 @@ from typing import Any
 
 from arq.connections import RedisSettings
 
-from packages.core import blobs, chunks, graph
+from packages.core import blobs, chunks, graph, pages
 from packages.core import chunk as chunk_module
 from packages.core.db import Session
 from packages.core.llm import embed_many
-from packages.core.normalise import Normalised, UnsupportedFormat, normalise, normalise_text
+from packages.core.normalise import (
+    Normalised,
+    ScannedDocument,
+    UnsupportedFormat,
+    normalise,
+    normalise_text,
+    title_from,
+)
 from packages.core.store import get_item, put_item, record_failure, stable_item_id
 from packages.shared.schema import Item, Scope, SourceRef
 
@@ -60,6 +67,78 @@ async def _keep_original(
         log.exception("could not store original for %s", filename)
         return None
     return {"filename": filename, "content_type": content_type, "size": len(data)}
+
+
+async def _read_scan(
+    data: bytes, filename: str, refusal: ScannedDocument
+) -> Normalised | None:
+    """A scanned PDF, read page by page with vision. None if it cannot be.
+
+    The result is deliberately shaped exactly like extracted PDF text — the
+    same `<!-- page N -->` markers, the same rules between pages — so nothing
+    downstream needs to know or care how the words were obtained. The page
+    index builds its sections the same way, passages chunk the same way,
+    citations resolve the same way.
+
+    None when there is no vision model configured, or when every page came back
+    empty. Both fall through to the failure that was recorded before this
+    existed: an item with no text looks ingested and can never be retrieved,
+    which is worse than a refusal that says why.
+    """
+    if not pages.available():
+        return None
+
+    transcribed, total = await pages.transcribe_document(data)
+    written = [
+        f"<!-- page {number} -->\n{text}"
+        for number, text in enumerate(transcribed, start=1)
+        if text.strip()
+    ]
+    if not written:
+        return None
+
+    body = "\n\n---\n\n".join(written)
+    if len(transcribed) < total:
+        # Said on the page itself, not only in metadata: a reader who searches
+        # this document and finds nothing deserves to know the back half was
+        # never read, rather than concluding it is not there.
+        body += (
+            f"\n\n---\n\n<!-- page {len(transcribed) + 1} -->\n"
+            f"*Pages {len(transcribed) + 1}–{total} of this scan were not read. "
+            f"The reading limit is {pages.max_transcribe_pages()} pages.*"
+        )
+
+    log.info("read %d/%d scanned pages of %s with vision", len(written), total, filename)
+
+    # A picture's own description makes a terrible title: the first line of it
+    # is a sentence ABOUT the file ("This image is a bar chart."), and a list
+    # of documents titled that way tells a reader nothing about which is
+    # which. An image's filename is the only name it has, so it is the name it
+    # gets. A scanned PDF keeps the usual rule, because its first line is
+    # genuinely its heading.
+    suffix = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    picture = pages.is_image("", filename)
+    if picture:
+        stem = filename.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        readable = stem.replace("_", " ").replace("-", " ").strip()
+        title = (readable[:1].upper() + readable[1:])[:200] or filename
+    else:
+        title = title_from(body, filename)
+
+    return Normalised(
+        title=title,
+        body=body,
+        metadata={
+            "pages": total,
+            "format": suffix if picture else "pdf",
+            # How this document came to have words at all. It travels with the
+            # item because a transcription is a reading of a picture, not the
+            # document's own text, and anything built on it should be able to
+            # tell the difference.
+            "read_by": "vision",
+            "pages_read": len(written),
+        },
+    )
 
 
 def _scope(workspace_id: str, collection_id: str | None) -> Scope:
@@ -130,6 +209,17 @@ async def ingest_file(
     ref = SourceRef(source=source, locator=locator, url=url, fetched_at=datetime.now())
     try:
         parsed = await asyncio.to_thread(normalise, data, filename)
+    except ScannedDocument as exc:
+        # Pages of pictures with no text layer. Refused outright until now,
+        # which meant the documents with the strongest case for being read as
+        # images were the only ones that could not get in at all.
+        read_by_eye = await _read_scan(data, filename, exc)
+        if read_by_eye is None:
+            async with Session() as session:
+                item_id = await record_failure(session, scope, ref, filename, str(exc))
+                await session.commit()
+            return {"item_id": item_id, "outcome": "failed", "reason": str(exc)}
+        parsed = read_by_eye
     except UnsupportedFormat as exc:
         # Visible and re-runnable, never silent. The item id is deterministic,
         # so a later retry lands on the same row rather than orphaning this one.

@@ -129,6 +129,43 @@ def chat_with_tools(
     return {"content": message.content or "", "tool_calls": calls}
 
 
+def look(image_png: bytes, instruction: str, *, model: str, temperature: float = 0.0) -> str:
+    """Read a picture and answer in text. One shot, no tools, no history.
+
+    Deliberately NOT a turn inside the navigator's conversation. Putting an
+    image into that loop would drag every following turn onto a vision model,
+    and a model chosen for eyes is not the one chosen for reliable tool calls —
+    the loop would get worse at the thing it exists to do in order to gain
+    something it needs twice a session.
+
+    So looking is a sub-call: the picture goes out, TEXT comes back, and the
+    navigator carries on reasoning in text about a page it never had to see.
+    What comes back is a transcription, which is checkable — the reader is
+    shown the same picture next to it.
+    """
+    import base64
+
+    client, _ = _client()
+    encoded = base64.b64encode(image_png).decode("ascii")
+    resp = client.chat.completions.create(
+        model=model,
+        temperature=temperature,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": instruction},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{encoded}"},
+                    },
+                ],
+            }
+        ],
+    )
+    return resp.choices[0].message.content or ""
+
+
 def stream_chat_with_tools(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]],

@@ -267,7 +267,10 @@ async def rename_collection(
         ),
         {"ws": workspace_id, "cid": collection_id, "name": name},
     )
-    if not result.rowcount:
+    # CursorResult carries rowcount; the base Result the stubs declare does
+    # not. Read through the cursor attribute so the check is typed rather than
+    # asserted — the value is what decides whether the collection existed.
+    if not result.rowcount:  # type: ignore[attr-defined]
         return None
     return {"collection_id": collection_id, "name": name}
 

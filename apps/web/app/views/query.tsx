@@ -21,6 +21,7 @@ type Turn = {
   mode: api.AskMode;
   answer: string;
   citations: api.Citation[];
+  steps: api.Step[];
   grounded: boolean;
   matches: Point[];
   tookMs: number;
@@ -69,6 +70,62 @@ function renderAnswer(
   return out;
 }
 
+/** The route the agent took, folded away until asked for.
+ *
+ *  Vectorless answers a question by opening sections one at a time, and until
+ *  now the only evidence of that was a trace id — a receipt number. The steps
+ *  were always recorded; they were just never shown. A reader deciding whether
+ *  to believe an answer wants to know it looked in two places and not one, and
+ *  that a section it reached for did not exist.
+ *
+ *  Collapsed by default because it is reassurance, not content: the answer and
+ *  its citations are what you came for. */
+function Trail({ steps }: { steps: api.Step[] }) {
+  if (steps.length === 0) return null;
+  const reads = steps.filter((s) => s.action === "read").length;
+
+  return (
+    <details className="mb-2 pl-8 group">
+      <summary className="inline-flex cursor-pointer list-none items-center gap-1.5 font-mono text-2xs text-subtle transition hover:text-muted">
+        <span className="transition group-open:rotate-90">▸</span>
+        how it searched · {steps.length} step{steps.length === 1 ? "" : "s"}
+        {reads > 0 && ` · ${reads} read`}
+      </summary>
+      <ol className="mt-1.5 space-y-1 border-l border-edge pl-3">
+        {steps.map((s, i) => (
+          <li key={i} className="flex items-baseline gap-2 font-mono text-2xs">
+            <span className="w-3 shrink-0 text-right text-subtle">{s.round}</span>
+            <span
+              className={cx(
+                "w-14 shrink-0",
+                // A miss is not a failure to hide. An agent that reached for a
+                // section id that was not there, then found the right one, is
+                // telling you something true about the document's shape.
+                s.action === "read"
+                  ? "text-accentSoft"
+                  : // A look is the escalation: the text was there and unusable,
+                    // so it read the page picture instead. Worth its own colour,
+                    // because "this number came off a picture" is a different
+                    // claim from "this number came out of the text".
+                    s.action === "looked"
+                    ? "text-warn"
+                    : s.action === "missed"
+                      ? "text-hot"
+                      : "text-muted"
+              )}
+            >
+              {s.action}
+            </span>
+            <span className="min-w-0 flex-1 truncate text-subtle" title={s.detail}>
+              {s.detail}
+            </span>
+          </li>
+        ))}
+      </ol>
+    </details>
+  );
+}
+
 export function Query({ active }: { active: string | null }) {
   const collectionId = active ?? undefined;
   const [question, setQuestion] = useState("");
@@ -111,6 +168,7 @@ export function Query({ active }: { active: string | null }) {
           mode: out.mode,
           answer: out.answer,
           citations: out.citations,
+          steps: out.steps,
           grounded: out.grounded,
           matches: out.matches,
           tookMs: out.tookMs,
@@ -189,6 +247,11 @@ export function Query({ active }: { active: string | null }) {
                   <p className="text-sm text-ink">{t.question}</p>
                 </div>
 
+                {/* Above the answer, not below it: it is the order the work
+                    happened in, and it reads as "here is what I did, here is
+                    what I found". */}
+                <Trail steps={t.steps} />
+
                 {/* The answer. Its citations are the whole point: a claim you
                     cannot follow back to a passage is one this store has no
                     business making. */}
@@ -220,9 +283,21 @@ export function Query({ active }: { active: string | null }) {
                               key={c.chunk_id}
                               onClick={() => setFocus(c)}
                               title={c.text.slice(0, 300)}
-                              className="max-w-[15rem] truncate rounded-md border border-accent/30 bg-accent/10 px-2 py-0.5 font-mono text-2xs text-accentSoft transition hover:border-accent/60"
+                              className={cx(
+                                "max-w-[15rem] truncate rounded-md border px-2 py-0.5 font-mono text-2xs transition",
+                                // A citation read off a page carries its own
+                                // mark. Which kind of evidence you are about to
+                                // open is worth knowing BEFORE you open it —
+                                // and it means a citation with no picture reads
+                                // as "this came from text", not as a thumbnail
+                                // that failed to load.
+                                c.page
+                                  ? "border-warn/40 bg-warn/10 text-warn hover:border-warn/70"
+                                  : "border-accent/30 bg-accent/10 text-accentSoft hover:border-accent/60"
+                              )}
                             >
-                              [{c.marker}] {c.heading || c.title}
+                              [{c.marker}] {c.page ? "▣ " : ""}
+                              {c.heading || c.title}
                             </button>
                           ))}
                         </div>
@@ -404,9 +479,41 @@ export function Query({ active }: { active: string | null }) {
                   close
                 </button>
               </div>
-              <p className="max-h-56 overflow-y-auto whitespace-pre-wrap text-xs leading-relaxed text-muted">
-                {focus.text}
-              </p>
+              <div className="flex gap-4">
+                <p className="max-h-56 min-w-0 flex-1 overflow-y-auto whitespace-pre-wrap text-xs leading-relaxed text-muted">
+                  {focus.text}
+                </p>
+
+                {/* The page it was read off, beside the words that were read
+                    off it. This is the whole argument for transcribing a table
+                    with vision: the transcription is a claim, and the page is
+                    the thing the claim can be checked against. Without this
+                    picture it would just be a more confident guess. */}
+                {focus.page ? (
+                  <figure className="hidden w-44 shrink-0 sm:block">
+                    <a
+                      href={api.pageImageUrl(focus.item_id, focus.page)}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="block overflow-hidden rounded-md border border-warn/30 transition hover:border-warn/60"
+                    >
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img
+                        src={api.pageImageUrl(focus.item_id, focus.page)}
+                        alt={`Page ${focus.page} of ${focus.title}`}
+                        // The API is a different origin and the session is a
+                        // cookie: without this the browser sends no credentials
+                        // and the page comes back 401.
+                        crossOrigin="use-credentials"
+                        className="max-h-56 w-full bg-canvas object-cover object-top"
+                      />
+                    </a>
+                    <figcaption className="mt-1 text-center font-mono text-2xs text-warn">
+                      read from page {focus.page}
+                    </figcaption>
+                  </figure>
+                ) : null}
+              </div>
             </div>
           </div>
         )}

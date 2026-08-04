@@ -122,6 +122,12 @@ class Passage(BaseModel):
     score: float
     semantic: float = 0.0
     keyword: float = 0.0
+    # The page this passage was READ OFF, when it was read from a picture
+    # rather than from extracted text. Optional and usually absent: only PDFs
+    # have pages, and only a page somebody actually looked at is rendered.
+    # Present, it means the reader can check the transcription against the page
+    # — which is the only reason transcribing a table is trustworthy at all.
+    page: int | None = None
 
 
 class Hit(BaseModel):

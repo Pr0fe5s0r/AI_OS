@@ -46,6 +46,34 @@ class UnsupportedFormat(Exception):
     """
 
 
+class ScannedDocument(UnsupportedFormat):
+    """A PDF whose pages are pictures — no text layer to extract.
+
+    Its own type rather than a message the caller has to match on, because
+    something CAN be done about this one: the pages can be read as images. That
+    recovery needs an object store and a vision model, neither of which belongs
+    in a parser, so this is raised here and handled by the pipeline.
+
+    Still an UnsupportedFormat, so any caller that only knows the old behaviour
+    keeps treating it as an honest refusal.
+    """
+
+    def __init__(self, message: str, *, page_count: int = 0) -> None:
+        super().__init__(message)
+        self.page_count = page_count
+
+
+class PictureDocument(ScannedDocument):
+    """An image file. There is no text layer because there is no text.
+
+    A subclass of ScannedDocument on purpose: a photograph of a whiteboard and
+    a scan of a page are the same problem — content that exists only as pixels
+    — and the pipeline already knows how to read one of those. Sharing the type
+    means sharing the recovery, rather than writing it twice and having the two
+    drift apart.
+    """
+
+
 # ------------------------------- helpers -------------------------------
 
 
@@ -157,9 +185,15 @@ class PdfParser:
                 pages.append(f"<!-- page {number} -->\n{text}")
 
         if not pages:
-            # A scanned PDF with no text layer. Honest failure beats an empty
-            # item that looks ingested but can never be retrieved.
-            raise UnsupportedFormat(f"no extractable text in {filename} (scanned image?)")
+            # A scanned PDF: pages of pictures with no text layer. Not a dead
+            # end any more — the pipeline can read the pages with vision — but
+            # still a refusal here, because a parser that returned an empty
+            # body would produce an item that looks ingested and can never be
+            # retrieved.
+            raise ScannedDocument(
+                f"no extractable text in {filename} (scanned image?)",
+                page_count=len(reader.pages),
+            )
 
         body = "\n\n---\n\n".join(pages)
         info: dict[str, Any] = dict(reader.metadata or {})
@@ -294,7 +328,42 @@ class DocxParser:
         )
 
 
-_REGISTRY: list[Parser] = [TextParser(), PdfParser(), DocxParser()]
+class ImageParser:
+    """Pictures: PNG, JPEG and friends.
+
+    Parses nothing and says so immediately. An image has no text to extract, so
+    the honest thing is to refuse here and let the pipeline read it with vision
+    — the same route a scanned PDF takes. Pretending to parse it, or accepting
+    it and indexing an empty body, would produce a document that looks stored
+    and can never be found.
+    """
+
+    extensions: tuple[str, ...] = (
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".webp",
+        ".gif",
+        ".bmp",
+        ".tif",
+        ".tiff",
+    )
+
+    def parse(self, data: bytes, filename: str) -> Normalised:
+        raise PictureDocument(f"{filename} is an image; its content is in the pixels", page_count=1)
+
+
+from packages.core.office import CsvParser, PptxParser, XlsxParser  # noqa: E402
+
+_REGISTRY: list[Parser] = [
+    TextParser(),
+    PdfParser(),
+    DocxParser(),
+    PptxParser(),
+    XlsxParser(),
+    CsvParser(),
+    ImageParser(),
+]
 
 
 def register(parser: Parser) -> None:
@@ -346,7 +415,10 @@ __all__ = [
     "DocxParser",
     "Normalised",
     "Parser",
+    "ImageParser",
     "PdfParser",
+    "PictureDocument",
+    "ScannedDocument",
     "TextParser",
     "UnsupportedFormat",
     "can_parse",

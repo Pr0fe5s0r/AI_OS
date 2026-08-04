@@ -167,8 +167,16 @@ export function Upload({
         <div>
           <h1 className="text-base font-semibold text-ink">Upload data</h1>
           <p className="mt-1 max-w-xl text-xs leading-relaxed text-subtle">
-            Files are read, converted to Markdown and indexed. The original is never
-            stored — the store keeps text and a link back, not a copy of your file.
+            {/* This used to say the original is never stored. It was true when
+                it was written and stopped being true the day citations began
+                showing the page they were read off — that picture is rendered
+                from the file itself. A store whose whole argument is that you
+                can check its claims cannot be wrong about where your file
+                went. */}
+            Files are read, converted to Markdown and indexed. The original file is
+            kept too, so a citation can show you the page it came from — and PDF
+            pages you ask about can be read as images when their text alone will
+            not do.
           </p>
         </div>
         <div className="flex items-center gap-2">

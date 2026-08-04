@@ -282,3 +282,236 @@ async def test_a_synthesis_is_not_credited_when_the_agent_says_it_found_nothing(
     result, _ = await compose(db, SCOPE, "parental leave?", mode="vectorless")
     assert result.grounded is False
     assert result.citations == []
+
+
+async def test_an_answer_written_without_reading_is_sent_back(db, monkeypatch):
+    """Asked for two figures out of a table, the model answered from the
+    CATALOGUE — which holds each section's title and opening line only — saw no
+    numbers there, and reported the store did not contain them. It did contain
+    them.
+
+    So a first answer written before anything was opened is refused once. Only
+    once, and only while nothing has been read: a model that has read and still
+    says no is answering, not skipping."""
+    await put_item(db, _doc())
+    await db.commit()
+    item_id = (await navigator._documents(db, SCOPE))[0]["item_id"]
+
+    monkeypatch.setattr(
+        "packages.core.llm.chat_with_tools",
+        _scripted(
+            {"content": "The documents do not cover that.", "tool_calls": []},
+            _read(item_id, "n003"),
+            _submit("Receipts go in within thirty days [1]."),
+        ),
+    )
+    outcome, _ = await navigate(db, SCOPE, "how long do I have to submit receipts?")
+
+    assert [s.action for s in outcome.steps] == ["sent back", "read", "answered"]
+    assert outcome.found is True
+
+
+async def test_a_model_that_has_read_may_still_answer_in_prose(db, monkeypatch):
+    """The push-back must not become a loop. Once something has been read, an
+    answer without a tool call is accepted as the answer — refusing content the
+    model already produced would turn a formatting slip into an empty result."""
+    await put_item(db, _doc())
+    await db.commit()
+    item_id = (await navigator._documents(db, SCOPE))[0]["item_id"]
+
+    monkeypatch.setattr(
+        "packages.core.llm.chat_with_tools",
+        _scripted(_read(item_id, "n003"), {"content": "Thirty days [1].", "tool_calls": []}),
+    )
+    outcome, _ = await navigate(db, SCOPE, "receipts?")
+
+    assert outcome.answer == "Thirty days [1]."
+    assert outcome.found is True
+
+
+def test_a_tool_call_typed_out_as_prose_is_cut_from_the_answer():
+    """Some models finish a good answer and then append the call they were
+    supposed to make. The answer above it is real; the typed call is machinery
+    landing on the reader's screen under a heading claiming it is what the store
+    found."""
+    from packages.core.navigator import _strip_pseudo_call
+
+    text = (
+        "The Nordics revenue in 2025 is 5.8 million GBP [1].\n\n"
+        'submit_answer({"answer": "5.8 million GBP", "found": true})'
+    )
+    assert _strip_pseudo_call(text) == "The Nordics revenue in 2025 is 5.8 million GBP [1]."
+    # An answer that merely mentions the tool by name is left alone.
+    plain = "Nothing here needed submit_answer at all."
+    assert _strip_pseudo_call(plain) == plain
+
+
+async def test_the_push_back_happens_once_not_every_round(db, monkeypatch):
+    """Without a guard the nudge ate the whole search: asked about a figure the
+    model said "not found", was sent back, said it again, and the trail read
+    `sent back` five times before the loop gave up. A nudge repeated is not a
+    nudge, it is a deadlock."""
+    await put_item(db, _doc())
+    await db.commit()
+
+    monkeypatch.setattr(
+        "packages.core.llm.chat_with_tools",
+        _scripted(*[_submit("Not here.", found=False, call_id=f"c{i}") for i in range(6)]),
+    )
+    outcome, _ = await navigate(db, SCOPE, "something not in the text")
+
+    sent_back = [s for s in outcome.steps if s.action == "sent back"]
+    assert len(sent_back) == 1, "the model must be pressed once, not every round"
+    assert outcome.found is False
+
+
+async def test_a_search_that_runs_out_of_rounds_still_says_something(db, monkeypatch):
+    """Five sections opened and no conclusion drawn returned an empty string,
+    which put a blank answer on screen under a heading claiming it was what the
+    store found — it reads as a broken page rather than as what it is."""
+    await put_item(db, _doc())
+    await db.commit()
+    item_id = (await navigator._documents(db, SCOPE))[0]["item_id"]
+
+    monkeypatch.setattr(
+        "packages.core.llm.chat_with_tools",
+        _scripted(*[_read(item_id, f"n00{i}", call_id=f"c{i}") for i in range(1, 7)]),
+    )
+    outcome, _ = await navigate(db, SCOPE, "keeps reading forever")
+
+    assert outcome.answer, "an exhausted search must still say what happened"
+    assert "without reaching an answer" in outcome.answer
+    assert any(s.action == "gave up" for s in outcome.steps)
+
+
+def test_a_question_about_a_picture_is_recognised():
+    """The trigger for the quiet failure: a confident answer about a figure,
+    written from prose, carrying a citation. The question is the only signal
+    available before the answer exists."""
+    from packages.core.navigator import _about_a_picture
+
+    assert _about_a_picture("In Figure 1, what sits above the decoder's output?")
+    assert _about_a_picture("what does the diagram on page 3 show?")
+    assert _about_a_picture("Describe the chart of quarterly revenue")
+    assert _about_a_picture("what is in fig. 4?")
+
+    # Not every question about a document is about a picture, and a word that
+    # fired on the wrong ones would spend a vision call on each of them.
+    assert not _about_a_picture("What was the BLEU score for English to German?")
+    assert not _about_a_picture("Summarise the training regime")
+    # Deliberately excluded: these mean other things in ordinary use.
+    assert not _about_a_picture("How is the graph database queried?")
+    assert not _about_a_picture("What is the plot of the report?")
+
+
+async def test_a_confident_answer_about_a_figure_must_look_first(db, monkeypatch):
+    """The expensive failure. Asked what sits above the decoder in Figure 1, it
+    read the prose about sub-layers, answered from THAT — naming a layer-norm
+    the figure does not have — and the answer was marked grounded, because it
+    HAD cited the section it read. A wrong answer with a citation behind it is
+    the worst thing this store can produce, and nothing caught it: the old push
+    only fired when the model admitted it could not answer."""
+    await put_item(db, _doc())
+    await db.commit()
+    item_id = (await navigator._documents(db, SCOPE))[0]["item_id"]
+
+    monkeypatch.setattr("packages.core.pages.available", lambda: True)
+
+    async def has_pages(workspace_id, item_id_, locator=""):
+        return 4
+
+    async def looked_at(workspace_id, item_id_, page, looking_for):
+        return "The figure shows Linear, then Softmax, then Output Probabilities."
+
+    monkeypatch.setattr("packages.core.pages.count", has_pages)
+    monkeypatch.setattr(navigator, "_read_page", looked_at)
+    monkeypatch.setattr(
+        "packages.core.llm.chat_with_tools",
+        _scripted(
+            _read(item_id, "n002"),
+            _submit("It is a layer norm, then a projection.", found=True),
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "c9",
+                        "name": "look_at_page",
+                        "arguments": json.dumps(
+                            {"doc": item_id, "page": 3, "looking_for": "Figure 1"}
+                        ),
+                    }
+                ],
+            },
+            _submit("Linear, then Softmax [2].", found=True, call_id="c10"),
+        ),
+    )
+    outcome, _ = await navigate(db, SCOPE, "In Figure 1, what is above the decoder output?")
+
+    actions = [s.action for s in outcome.steps]
+    assert "sent back" in actions, "a figure answer written from prose must be sent back"
+    assert "looked" in actions, "and the look must actually happen"
+    assert outcome.answer == "Linear, then Softmax [2]."
+
+
+async def test_an_ordinary_question_answered_confidently_is_not_sent_back(db, monkeypatch):
+    """The press is for pictures. A question the text genuinely answers must not
+    be pushed into a vision call it does not need — that is slower, costs more,
+    and reasons over a transcription when the real thing was right there."""
+    await put_item(db, _doc())
+    await db.commit()
+    item_id = (await navigator._documents(db, SCOPE))[0]["item_id"]
+
+    monkeypatch.setattr("packages.core.pages.available", lambda: True)
+
+    async def has_pages(workspace_id, item_id_, locator=""):
+        return 4
+
+    monkeypatch.setattr("packages.core.pages.count", has_pages)
+    monkeypatch.setattr(
+        "packages.core.llm.chat_with_tools",
+        _scripted(_read(item_id, "n003"), _submit("Within thirty days [1].", found=True)),
+    )
+    outcome, _ = await navigate(db, SCOPE, "how long do I have to submit receipts?")
+
+    assert [s.action for s in outcome.steps] == ["read", "answered"]
+    assert outcome.answer == "Within thirty days [1]."
+
+
+def test_the_agent_is_told_which_document_holds_a_named_figure():
+    """With one document a figure is findable by reading titles. With three the
+    agent guessed: asked about Figure 9 — which exists only in one of them — it
+    read pages 3 and 4 of another document, looked at two of ITS pages, found
+    neither, and reported the store could not say. Every document has a page 3;
+    only one has Figure 9."""
+    from packages.core import tree
+    from packages.core.navigator import _where_named_things_live
+
+    paper = "<!-- page 3 -->\nFigure 1: The Transformer architecture.\n"
+    review = "<!-- page 2 -->\nFigure 9: Circle and square.\nFigure 10: The shaded shape.\n"
+    documents = [
+        {"item_id": "doc-paper", "title": "Attention Is All You Need"},
+        {"item_id": "doc-review", "title": "Operations Review"},
+    ]
+    trees = {
+        "doc-paper": tree.build(paper, "Attention"),
+        "doc-review": tree.build(review, "Operations Review"),
+    }
+
+    told = _where_named_things_live("In Figure 9, is the circle inside the square?", documents, trees)
+    assert "doc-review" in told
+    assert "doc-paper" not in told, "it must not be pointed at the wrong document"
+
+    # A question naming nothing gets no such block: there is nothing to look up,
+    # and an empty heading is noise in the prompt.
+    assert _where_named_things_live("what is the training regime?", documents, trees) == ""
+
+
+def test_a_figure_that_is_in_no_document_is_not_invented():
+    """Pointing at a figure that does not exist would send the agent somewhere
+    to find nothing, which is worse than letting it search."""
+    from packages.core import tree
+    from packages.core.navigator import _where_named_things_live
+
+    documents = [{"item_id": "d1", "title": "Report"}]
+    trees = {"d1": tree.build("<!-- page 1 -->\nFigure 1: A chart.\n", "Report")}
+    assert _where_named_things_live("what does Figure 42 show?", documents, trees) == ""
