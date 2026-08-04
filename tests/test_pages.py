@@ -502,3 +502,175 @@ def test_the_page_reader_is_asked_about_shapes_not_only_text():
     assert "colour" in prompt or "color" in prompt
     assert "right angle" in prompt
     assert "largest" in prompt, "charts need a reading, not just a transcription"
+
+
+def test_both_readers_are_asked_to_map_a_legend_not_just_describe_it():
+    """Asked which elements are liquid, the store said it could not tell —
+    over an image of the periodic table where the answer is right there. The
+    description it had recorded said "the cells are colour-coded... liquids are
+    orange" and never once said WHICH element was orange.
+
+    A legend with nothing mapped to it answers no question, and the mapping is
+    the one thing a text layer can never hold. Both readers have to be told
+    that: the ingest one, which is all an image ever gets, and the mid-question
+    one, which is where a specific question is actually answered."""
+    from packages.core import pages
+    from packages.core.navigator import _LOOK_PROMPT
+
+    for prompt in (pages._DESCRIBE_IMAGE.lower(), _LOOK_PROMPT.lower()):
+        assert "colour" in prompt
+        assert "legend" in prompt or "key" in prompt
+        # The instruction that matters is the mapping, not the description.
+        assert "which items" in prompt or "name them" in prompt
+
+
+def test_neither_reader_is_allowed_to_abbreviate():
+    """Asking for the colour mapping made the reader trade completeness for it:
+    the periodic table came back with rows 4 to 84 replaced by "| ... | ... |".
+    For an image this text is the only record that will ever exist, so a row it
+    skips is a fact nobody can retrieve afterwards."""
+    from packages.core import pages
+    from packages.core.navigator import _LOOK_PROMPT
+
+    for prompt in (pages._DESCRIBE_IMAGE.lower(), _LOOK_PROMPT.lower()):
+        assert "abbreviate" in prompt
+        assert "and so on" in prompt
+
+
+async def test_a_question_about_an_image_forces_a_look_however_it_is_worded(db, monkeypatch):
+    """"Which elements are liquid at room temperature?" contains no picture
+    word, so the press did not fire — and the document was a photograph of the
+    periodic table whose stored text is a DESCRIPTION somebody wrote by looking
+    at it. The store answered that it could not tell, over an image where the
+    answer is plainly visible.
+
+    Nobody should have to know their file has no text in it. A question about a
+    document that IS a picture is a question about a picture."""
+    await put_item(
+        db,
+        Item(
+            id="",
+            scope=SCOPE,
+            title="Periodic table",
+            body="<!-- page 1 -->\n# Periodic table\n\nA colour-coded chart of the elements.",
+            source=SourceRef(source="upload", locator="table.jpg"),
+        ),
+    )
+    await db.commit()
+    item_id = (await navigator._documents(db, SCOPE))[0]["item_id"]
+
+    monkeypatch.setattr("packages.core.pages.available", lambda: True)
+
+    async def one_page(workspace_id, item_id_, locator=""):
+        return 1
+
+    async def looked_at(workspace_id, item_id_, page, looking_for):
+        return "Names printed in blue are liquids: Bromine (Br) and Mercury (Hg)."
+
+    monkeypatch.setattr("packages.core.pages.count", one_page)
+    monkeypatch.setattr(navigator, "_read_page", looked_at)
+
+    rounds = iter(
+        [
+            {"content": "", "tool_calls": [_call("read_section", doc=item_id, section="n001")]},
+            {"content": "The description does not say which elements are liquid.", "tool_calls": []},
+            {
+                "content": "",
+                "tool_calls": [
+                    _call("look_at_page", doc=item_id, page=1, looking_for="liquid elements")
+                ],
+            },
+            {"content": "Bromine and Mercury are liquid at room temperature [2].", "tool_calls": []},
+        ]
+    )
+    monkeypatch.setattr("packages.core.llm.chat_with_tools", lambda *a, **k: next(rounds))
+
+    outcome, _ = await navigator.navigate(
+        db, SCOPE, "Which elements are liquid at room temperature?"
+    )
+
+    actions = [s.action for s in outcome.steps]
+    assert "sent back" in actions, "a picture document must be looked at, not paraphrased"
+    assert "looked" in actions
+    assert "Mercury" in outcome.answer
+
+
+async def test_a_text_document_is_not_dragged_into_a_vision_call(db, monkeypatch):
+    """The rule is for documents that ARE pictures. A PDF has text of its own,
+    and pushing every question about one into a vision call would be slower,
+    dearer, and reasoning over a description when the real thing was there."""
+    item_id = await _seed(db, _TABLE_PAGE)
+    monkeypatch.setattr("packages.core.pages.available", lambda: True)
+
+    async def one_page(workspace_id, item_id_, locator=""):
+        return 1
+
+    monkeypatch.setattr("packages.core.pages.count", one_page)
+    rounds = iter(
+        [
+            {"content": "", "tool_calls": [_call("read_section", doc=item_id, section="n002")]},
+            {"content": "Revenue was 52 in 2025.", "tool_calls": []},
+        ]
+    )
+    monkeypatch.setattr("packages.core.llm.chat_with_tools", lambda *a, **k: next(rounds))
+
+    outcome, _ = await navigator.navigate(db, SCOPE, "What was revenue in 2025?")
+    assert [s.action for s in outcome.steps] == ["read", "answered"]
+
+
+def test_a_reading_says_where_on_the_page_it_came_from():
+    """A page thumbnail says "somewhere in here". A box says "this row". The
+    coordinates are pulled out of the prose because they are for drawing, not
+    for reading — leaving "REGION x=12 y=44" in a passage would put machinery
+    back on the reader's screen."""
+    from packages.core.navigator import _regions_in
+
+    text, regions = _regions_in(
+        "Mercury (Hg) and Bromine (Br) are the two liquids.\n"
+        "REGION x=71.5 y=40 w=4 h=6 | Mercury cell\n"
+        "REGION x=35 y=33 w=4 h=6 | Bromine cell\n"
+    )
+
+    assert "REGION" not in text, "coordinates must not leak into the evidence"
+    assert text.startswith("Mercury")
+    assert [r["label"] for r in regions] == ["Mercury cell", "Bromine cell"]
+    assert regions[0]["x"] == 71.5 and regions[0]["h"] == 6
+
+
+def test_a_box_round_the_whole_page_is_dropped():
+    """A box round everything tells the reader nothing they did not already
+    know, and costs them the belief that a box means something."""
+    from packages.core.navigator import _regions_in
+
+    _, regions = _regions_in("Everything.\nREGION x=0 y=0 w=100 h=100 | the page\n")
+    assert regions == []
+
+
+def test_boxes_are_clamped_to_the_page_rather_than_thrown_away():
+    """A reader that says a row runs to 104% has still pointed at the right
+    row. Discarding that would lose a good highlight over a rounding error."""
+    from packages.core.navigator import _regions_in
+
+    _, regions = _regions_in("x\nREGION x=90 y=95 w=30 h=20 | the last row\n")
+    assert len(regions) == 1
+    box = regions[0]
+    assert box["x"] + box["w"] <= 100 and box["y"] + box["h"] <= 100
+
+
+def test_nonsense_coordinates_are_ignored():
+    from packages.core.navigator import _regions_in
+
+    _, regions = _regions_in(
+        "x\nREGION x=10 y=10 w=0 h=5 | zero width\nREGION x=a y=b w=c h=d | junk\n"
+    )
+    assert regions == []
+
+
+def test_a_reading_with_no_regions_is_still_a_reading():
+    """The reader is told to leave out anything it cannot place confidently, so
+    no boxes is a correct and common outcome — the passage must survive it."""
+    from packages.core.navigator import _regions_in
+
+    text, regions = _regions_in("The table lists every element by weight.")
+    assert text == "The table lists every element by weight."
+    assert regions == []

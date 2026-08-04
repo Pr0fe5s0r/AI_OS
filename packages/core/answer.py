@@ -74,6 +74,9 @@ class Citation:
     # from text. The reader gets shown that page beside the words, which is
     # what makes a transcribed table checkable instead of merely plausible.
     page: int | None = None
+    # And where on that page, so the highlight lands on the row that was read
+    # rather than leaving the reader to search the page themselves.
+    regions: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -122,6 +125,7 @@ class Answer:
                     "text": c.text,
                     "score": c.score,
                     "page": c.page,
+                    "regions": c.regions,
                 }
                 for c in self.citations
             ],
@@ -176,6 +180,7 @@ def _resolve_citations(
             text=passage.text,
             score=passage.score,
             page=passage.page,
+            regions=passage.regions,
         )
 
     def keep(match: re.Match[str]) -> str:
@@ -245,6 +250,7 @@ def _attribute_short(
         text=passage.text,
         score=passage.score,
         page=passage.page,
+        regions=passage.regions,
     )
 
 
@@ -276,6 +282,7 @@ def _attribute(text: str, passages: list[tuple[Passage, Hit]]) -> Citation | Non
                 text=passage.text,
                 score=passage.score,
                 page=passage.page,
+                regions=passage.regions,
             )
     return None
 
@@ -413,6 +420,7 @@ async def answer(
                     text=passage.text,
                     score=passage.score,
                     page=passage.page,
+                    regions=passage.regions,
                 )
                 for index, (passage, hit) in enumerate(passages, start=1)
             ]

@@ -495,7 +495,7 @@ export function Query({ active }: { active: string | null }) {
                       href={api.pageImageUrl(focus.item_id, focus.page)}
                       target="_blank"
                       rel="noreferrer"
-                      className="block overflow-hidden rounded-md border border-warn/30 transition hover:border-warn/60"
+                      className="relative block overflow-hidden rounded-md border border-warn/30 transition hover:border-warn/60"
                     >
                       {/* eslint-disable-next-line @next/next/no-img-element */}
                       <img
@@ -507,9 +507,42 @@ export function Query({ active }: { active: string | null }) {
                         crossOrigin="use-credentials"
                         className="max-h-56 w-full bg-canvas object-cover object-top"
                       />
+
+                      {/* Where on the page the answer was read from. A page
+                          thumbnail says "somewhere in here"; the box says
+                          "this row". Positioned in percentages, which is why
+                          the reader reports them that way — the same numbers
+                          hold at any size the picture is drawn.
+
+                          Only ever drawn when the reader placed something
+                          confidently. An empty overlay is the correct result
+                          for a page it read as a whole. */}
+                      {(focus.regions || []).map((box, index) => (
+                        <span
+                          key={index}
+                          title={box.label || `read from here`}
+                          // Outline and tint only. Dimming the rest of the page
+                          // behind each box looked better with one box and
+                          // turned the page black with four, because every box
+                          // laid down its own full-page shade.
+                          className="pointer-events-none absolute rounded-[2px] border-2 border-warn bg-warn/25 ring-1 ring-canvas/70"
+                          style={{
+                            left: `${box.x}%`,
+                            top: `${box.y}%`,
+                            width: `${box.w}%`,
+                            height: `${box.h}%`,
+                          }}
+                        />
+                      ))}
                     </a>
                     <figcaption className="mt-1 text-center font-mono text-2xs text-warn">
                       read from page {focus.page}
+                      {(focus.regions?.length ?? 0) > 0 && (
+                        <span className="block text-subtle">
+                          {focus.regions!.length} highlighted{" "}
+                          {focus.regions!.length === 1 ? "area" : "areas"}
+                        </span>
+                      )}
                     </figcaption>
                   </figure>
                 ) : null}

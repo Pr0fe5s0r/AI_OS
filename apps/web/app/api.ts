@@ -481,6 +481,11 @@ export type Citation = {
    *  beside the words, which is the only thing that makes a transcribed table
    *  checkable rather than merely plausible. */
   page?: number | null;
+  /** Where on that page the reading came from, as percentages of the page.
+   *  Drawn over the thumbnail so a citation points at the row it was read
+   *  from rather than at a whole sheet of paper. Often empty — a box round
+   *  the wrong thing is worse than none. */
+  regions?: { x: number; y: number; w: number; h: number; label?: string }[];
 };
 
 /** The picture of one page, for a citation that was read with vision. */

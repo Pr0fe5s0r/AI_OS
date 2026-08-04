@@ -239,6 +239,17 @@ _DESCRIBE_IMAGE = (
     "- Shapes and diagrams: what is drawn, how many sides, colours, labels, "
     "arrangement, arrow directions, and markers such as a right-angle square.\n"
     "- People, objects and setting, if it is a photograph.\n"
+    "- ANYTHING CARRIED BY COLOUR, SHADING OR POSITION rather than by words: a "
+    "legend, a key, a highlighted row, a status dot, a category fill. Give the "
+    "legend AND then say which items actually fall under each entry, by name. "
+    "A legend with nothing mapped to it answers no question — 'liquids are "
+    "shown in blue' is worthless unless you also say WHICH items are blue. "
+    "This mapping is the one thing a text layer can never hold, so it is the "
+    "single most valuable thing you can record here.\n"
+    "\nNEVER ABBREVIATE. Do not write '...', 'and so on', or 'similarly for "
+    "the rest'. If the image holds a hundred rows, write a hundred rows. This "
+    "text is the ONLY record of the image that will ever exist — a row you "
+    "skip is a fact nobody can retrieve afterwards. Length is not a problem.\n"
     "Do not speculate about anything not visible, and do not draw conclusions."
 )
 

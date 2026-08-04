@@ -140,9 +140,31 @@ _LOOK_PROMPT = (
     "relative to each other, the direction of any arrows, and any marker such "
     "as the small square that denotes a right angle. None of this is in the "
     "text, so describing it is the whole job.\n"
+    "- If what was asked about is encoded by COLOUR, SHADING or POSITION "
+    "rather than written down — a legend, a key, a highlight, a category fill "
+    "— read the key, then work out which items it applies to and NAME THEM. "
+    "Do not stop at describing the key: 'liquids are shown in blue' answers "
+    "nothing without the list of which items are blue. That mapping is "
+    "precisely what the text could not tell us, and why this page is being "
+    "looked at instead of read.\n"
+    "- Never abbreviate with '...' or 'and so on'. A row you skip is a fact "
+    "the answer cannot use.\n"
     "- Do not answer the question or draw conclusions. Report what is there.\n"
-    "- If the page does not show what was asked for, reply with exactly: "
-    "NOT_ON_THIS_PAGE"
+    "- Reply NOT_ON_THIS_PAGE only if this page has nothing to do with what "
+    "was asked — the wrong page, or the wrong document. Information that IS "
+    "here but is not spelled out in words — because it is carried by a colour, "
+    "a legend, a position, a shape — is on the page. Read it and report it. "
+    "Saying NOT_ON_THIS_PAGE about something you can see but that is not "
+    "written down defeats the entire purpose of looking.\n\n"
+    "Finally, say WHERE on the page you read it. After your report, add up to "
+    "four lines in exactly this form and nothing else:\n"
+    "REGION x=<left> y=<top> w=<width> h=<height> | <what is there>\n"
+    "measured as percentages of the page, 0 to 100, from the top-left corner. "
+    "Mark only the parts that actually answer what was asked — the cell, the "
+    "row, the bar, the legend entry — not the whole page. A reader is shown "
+    "these boxes drawn on the page, so a box round everything tells them "
+    "nothing and a box round the wrong thing is worse than none at all. If you "
+    "cannot place something confidently, leave it out."
 )
 _NOT_ON_PAGE = "NOT_ON_THIS_PAGE"
 
@@ -241,6 +263,18 @@ _PICTURE_WORDS = re.compile(
 )
 
 
+def _is_a_picture(document: dict[str, Any]) -> bool:
+    """Is this document itself a picture, rather than a document with pictures?
+
+    A PDF has text of its own and pages that can be looked at. An image has
+    nothing but the picture, so everything indexed for it is a description —
+    and a description is the wrong thing to answer a precise question from.
+    """
+    from packages.core import pages
+
+    return pages.is_image("", document.get("locator") or "")
+
+
 def _has_pictures(document: dict[str, Any]) -> bool:
     """Can a page of this document be shown as a picture?
 
@@ -271,6 +305,49 @@ def _strip_pseudo_call(text: str) -> str:
     """
     match = _PSEUDO_CALL.search(text)
     return text[: match.start()].rstrip() if match else text
+
+
+_REGION = re.compile(
+    r"^\s*REGION\s+x=(-?[\d.]+)\s+y=(-?[\d.]+)\s+w=(-?[\d.]+)\s+h=(-?[\d.]+)\s*\|?\s*(.*)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _regions_in(text: str) -> tuple[str, list[dict[str, Any]]]:
+    """Pull the "where I read it" lines out of a page reading.
+
+    Returned separately from the prose because they are for DRAWING, not for
+    reading: the reader sees boxes on the page, not coordinates in a sentence.
+    Leaving them in the passage would put "REGION x=12 y=44" into an answer's
+    evidence, which is machinery on the reader's screen again.
+
+    Anything outside the page, inverted, or big enough to be "the whole page"
+    is dropped. A box round everything tells nobody anything, and a box round
+    the wrong thing is worse than no box: it is a confident pointer at the
+    wrong evidence.
+    """
+    found: list[dict[str, Any]] = []
+    for match in _REGION.finditer(text):
+        try:
+            x, y, w, h = (float(match.group(i)) for i in range(1, 5))
+        except ValueError:
+            continue
+        label = match.group(5).strip().strip("|").strip()
+        if w <= 0 or h <= 0:
+            continue
+        # Clamp to the page rather than discard: a model that says the row runs
+        # to 102% has still pointed at the right row.
+        x, y = max(0.0, min(x, 100.0)), max(0.0, min(y, 100.0))
+        w, h = min(w, 100.0 - x), min(h, 100.0 - y)
+        if w * h >= 8000:  # 80% of the page in both directions
+            continue
+        found.append(
+            {"x": round(x, 2), "y": round(y, 2), "w": round(w, 2), "h": round(h, 2), "label": label[:120]}
+        )
+        if len(found) >= 4:
+            break
+
+    return _REGION.sub("", text).strip(), found
 
 
 async def _read_page(
@@ -433,6 +510,20 @@ async def navigate(
     # question that touches one is forty fetches wasted.
     page_counts: dict[str, int] = {}
     looks = 0
+    # Set once a section has been read out of a document that IS a picture — a
+    # photograph, a screenshot, a scan. Its "text" is a description somebody
+    # wrote by looking at it, which is lossy by construction: asked which
+    # elements are liquid, the store had a transcription of the periodic table
+    # that listed every element and never said which ones were coloured as
+    # liquids, and answered that it could not tell.
+    #
+    # A question about such a document is a question about a picture whether or
+    # not the person happened to use the word. They should not have to know
+    # that their file has no text in it.
+    read_a_picture = False
+    # Looking at the same page twice costs a second vision call to learn
+    # exactly what the first one said.
+    looked_at: set[tuple[str, int]] = set()
     # Both push-backs are once-only. Without that guard the first of them ate
     # every round: asked about a figure, the model said "not found", was sent
     # back, said it again, and the trail read `sent back` five times before the
@@ -491,7 +582,7 @@ async def navigate(
             and looks == 0
             and not pressed_to_look
             and any(page_counts.values())
-            and _about_a_picture(question)
+            and (_about_a_picture(question) or read_a_picture)
             and round_number < MAX_ROUNDS
         ):
             # The same press as below, on the path that was skipping it.
@@ -593,7 +684,7 @@ async def navigate(
                     and not pressed_to_look
                     and any(page_counts.values())
                     and round_number < MAX_ROUNDS
-                    and (not said_found or _about_a_picture(question))
+                    and (not said_found or _about_a_picture(question) or read_a_picture)
                 ):
                     # Two ways an answer about a picture goes wrong, and only
                     # one of them announces itself.
@@ -691,6 +782,20 @@ async def navigate(
                     outcome.steps.append(Step(round_number, "missed", f"page {page_number}"))
                     continue
 
+                if (doc_id, page_number) in looked_at:
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call["id"],
+                            "content": (
+                                "You have already looked at that page. Look at a "
+                                "different one, or answer from what you have."
+                            ),
+                        }
+                    )
+                    continue
+                looked_at.add((doc_id, page_number))
+
                 looks += 1
                 wanted = str(args.get("looking_for") or question)
                 seeing = await _read_page(scope.workspace_id, doc_id, page_number, wanted)
@@ -729,6 +834,10 @@ async def navigate(
                     )
                     continue
 
+                # The coordinates come off the prose here rather than inside
+                # _read_page, so a reading is still just text to everything
+                # that does not draw.
+                seeing, regions = _regions_in(seeing)
                 marker = len(read) + 1
                 read.append(
                     (
@@ -739,6 +848,7 @@ async def navigate(
                             text=seeing,
                             score=round(1.0 - (marker - 1) * 0.05, 4),
                             page=page_number,
+                            regions=regions,
                         ),
                         doc_id,
                     )
@@ -837,6 +947,8 @@ async def navigate(
                 )
             )
             outcome.steps.append(Step(round_number, "read", f"{node.title[:60]} → [{marker}]"))
+            if _is_a_picture(by_id[doc_id]):
+                read_a_picture = True
 
             # Now that this document has been opened, find out whether it has
             # pages to fall back on — and say so only if it does. An offer of

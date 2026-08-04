@@ -128,6 +128,12 @@ class Passage(BaseModel):
     # Present, it means the reader can check the transcription against the page
     # — which is the only reason transcribing a table is trustworthy at all.
     page: int | None = None
+    # Where on that page the reading came from, as percentages of the page:
+    # {x, y, w, h, label}. Drawn over the page image so a citation points at
+    # the row or the cell rather than at a whole sheet of paper. Empty
+    # whenever the reader could not place something confidently — a box round
+    # the wrong thing is worse than no box.
+    regions: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class Hit(BaseModel):
