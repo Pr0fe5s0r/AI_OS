@@ -113,6 +113,9 @@ Everything goes through `packages/core/llm.py` (`LLM_PROVIDER` = openai |
 nebius | openrouter; `EMBEDDING_MODEL` must output 1536 dims, `CHAT_MODEL` for
 watcher reasoning).
 
+See [How MarkVector works](docs/markvector-flow.md) for the complete ingestion,
+retrieval, grounded-answer, citation, trace, file-scope, and SDK-agent flow.
+
 ## Quick start
 
 ```bash
