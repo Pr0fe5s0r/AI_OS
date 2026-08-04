@@ -7,7 +7,13 @@ import { Button, Card, Chip, Empty, Label, Mono } from "../ui/kit";
 
 type Row = {
   name: string;
-  state: "sending" | "indexing" | "done" | "failed";
+  // "working" is NOT a failure. Indexing runs in a worker, and reading a
+  // scanned document with vision is a model call per page — a minute or two
+  // is ordinary. The console used to give up after twenty seconds and stamp
+  // the row "failed", with a message underneath admitting the document might
+  // yet appear. It usually had. A real failure arrives with a reason, from
+  // the worker, and only that is a failure.
+  state: "sending" | "indexing" | "done" | "failed" | "working";
   detail?: string;
 };
 
@@ -68,10 +74,16 @@ export function Upload({
     setRows((r) => r.map((x) => (x.name === name ? { ...x, state, detail } : x)));
   }
 
-  /** Wait for a locator to actually appear in the collection. */
+  /** Wait for a locator to actually appear in the collection.
+   *
+   *  Watched for three minutes, quickly at first and then every few seconds:
+   *  a Markdown file lands in about a second, and a twenty-page scan read with
+   *  vision takes a model call per page. Polling hard for the whole window
+   *  would be a request a second for three minutes to learn nothing.
+   */
   async function settle(locator: string, name: string) {
-    for (let attempt = 0; attempt < 16; attempt++) {
-      await new Promise((r) => setTimeout(r, 1200));
+    for (let attempt = 0; attempt < 60; attempt++) {
+      await new Promise((r) => setTimeout(r, attempt < 15 ? 1200 : 4000));
       const docs = await api.documents(collectionId, 200).catch(() => []);
       const found = docs.find((d) => d.locator === locator);
 
@@ -97,8 +109,48 @@ export function Upload({
         }
       }
     }
-    mark(name, "failed", "still indexing after 20s — it may yet appear in the collection");
+    // Stopped waiting, not failed. The document is still being indexed and the
+    // worker will finish it, so the watch continues in the background rather
+    // than leaving a row that will never change and a list that will never
+    // refresh — which is what made this look broken in the first place.
+    mark(
+      name,
+      "working",
+      "still indexing — reading a document with vision takes a model call per page. This row will update when it lands."
+    );
+    keepWatching(locator, name);
     return false;
+  }
+
+  /** Carry on watching after the foreground wait gives up.
+   *
+   *  Detached on purpose: the upload has returned, the person is free to go
+   *  and do something else, and the row updates itself when the worker
+   *  finishes. Ten more minutes at five-second intervals, which comfortably
+   *  covers a long scan being read page by page.
+   */
+  function keepWatching(locator: string, name: string) {
+    let attempts = 0;
+    const timer = setInterval(async () => {
+      attempts += 1;
+      const docs = await api.documents(collectionId, 200).catch(() => []);
+      const found = docs.find((d) => d.locator === locator);
+      if (found) {
+        clearInterval(timer);
+        mark(name, "done", `v${found.version} · ${found.categories.length} categories`);
+        setLibrary(docs);
+        return;
+      }
+      const failed = (await api.failures(collectionId).catch(() => [])).find(
+        (f) => f.locator === locator
+      );
+      if (failed) {
+        clearInterval(timer);
+        mark(name, "failed", failed.reason);
+        return;
+      }
+      if (attempts >= 120) clearInterval(timer);
+    }, 5000);
   }
 
   async function send(files: FileList | null) {
@@ -258,13 +310,24 @@ export function Upload({
                   <span className="text-heat-0">✓</span>
                 ) : r.state === "failed" ? (
                   <span className="text-danger">✕</span>
+                ) : r.state === "working" ? (
+                  // Still going. A clock, not a cross: the difference between
+                  // "this is taking a while" and "this did not work" is the
+                  // whole point of the distinction.
+                  <span className="text-warn">◷</span>
                 ) : (
                   <span className="h-3 w-3 animate-spin rounded-full border-2 border-edgeStrong border-t-accent" />
                 )}
                 <Mono className="min-w-0 flex-1 truncate text-xs text-ink">{r.name}</Mono>
                 <span className="font-mono text-2xs text-subtle">
                   {r.detail ||
-                    { sending: "sending…", indexing: "indexing…", done: "", failed: "" }[r.state]}
+                    {
+                      sending: "sending…",
+                      indexing: "indexing…",
+                      done: "",
+                      failed: "",
+                      working: "",
+                    }[r.state]}
                 </span>
                 <Chip
                   tone={
@@ -272,7 +335,9 @@ export function Upload({
                       ? "text-heat-0 border-heat-0/30 bg-heat-0/10"
                       : r.state === "failed"
                         ? "text-danger border-danger/30 bg-danger/10"
-                        : "text-muted border-edgeStrong bg-elevated"
+                        : r.state === "working"
+                          ? "text-warn border-warn/30 bg-warn/10"
+                          : "text-muted border-edgeStrong bg-elevated"
                   }
                 >
                   {r.state}
