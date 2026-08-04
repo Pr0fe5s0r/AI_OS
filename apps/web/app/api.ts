@@ -519,6 +519,87 @@ export type AnswerOutcome = SearchOutcome & {
  *  Separate from `search`, which never returns generated text. */
 export type AskMode = "hybrid" | "vectorless";
 
+/** How the answer arrives. "stream" shows the work as it happens — the steps
+ *  first, then the words; "complete" waits and delivers the finished answer in
+ *  one piece. Same answer either way. */
+export type Delivery = "stream" | "complete";
+
+/** What arrives while an answer is being worked out. */
+export type AskEvent =
+  | { type: "step"; round: number; action: string; detail: string }
+  | { type: "token"; text: string }
+  /** That round was sent back — drop the prose shown so far, it is not the
+   *  answer. The tokens went out before anyone could know that. */
+  | { type: "reset" }
+  | { type: "error"; detail: string };
+
+/** Ask, and watch it happen.
+ *
+ *  The finished answer still arrives whole at the end rather than being
+ *  assembled from the tokens: the text goes through citation resolution, which
+ *  rewrites it, so a client keeping its own concatenation would end up showing
+ *  markers the store had already dropped as unresolvable. The tokens are a
+ *  preview; `done` is the answer.
+ */
+export async function askStreaming(
+  collectionId: string | undefined,
+  question: string,
+  limit = 8,
+  mode: AskMode = "vectorless",
+  onEvent: (e: AskEvent) => void
+): Promise<AnswerOutcome> {
+  const res = await fetch(
+    `${API}/api/answer/stream?q=${encodeURIComponent(question)}&limit=${limit}&mode=${mode}`,
+    {
+      credentials: "include",
+      headers: collectionId ? { "X-Collection": collectionId } : {},
+    }
+  );
+  if (!res.ok || !res.body) {
+    if (res.status === 401) onLost?.();
+    throw new ApiError(res.status, res.statusText || "Streaming failed");
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let finished: AnswerOutcome | null = null;
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    // Server-sent events are separated by a blank line; a chunk can end
+    // mid-event, so whatever is left over stays in the buffer.
+    const parts = buffer.split("\n\n");
+    buffer = parts.pop() || "";
+    for (const part of parts) {
+      const line = part.split("\n").find((l) => l.startsWith("data: "));
+      if (!line) continue;
+      const event = JSON.parse(line.slice(6));
+      if (event.type === "done") {
+        finished = {
+          answer: event.answer,
+          mode: event.mode || mode,
+          grounded: event.grounded,
+          citations: event.citations || [],
+          steps: event.steps || [],
+          traceId: event.trace_id,
+          tookMs: event.took_ms,
+          degraded: event.degraded,
+          matches: (event.results || []).map(toPoint),
+        };
+      } else {
+        onEvent(event as AskEvent);
+      }
+    }
+  }
+
+  if (!finished) throw new ApiError(500, "The answer stream ended without an answer.");
+  return finished;
+}
+
 export async function ask(
   collectionId: string | undefined,
   question: string,

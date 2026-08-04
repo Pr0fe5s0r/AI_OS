@@ -515,3 +515,81 @@ def test_a_figure_that_is_in_no_document_is_not_invented():
     documents = [{"item_id": "d1", "title": "Report"}]
     trees = {"d1": tree.build("<!-- page 1 -->\nFigure 1: A chart.\n", "Report")}
     assert _where_named_things_live("what does Figure 42 show?", documents, trees) == ""
+
+
+async def test_steps_are_handed_over_as_they_happen(db, monkeypatch):
+    """Most of the wait is spent READING, not writing — opening a section,
+    looking at a page. So the steps arriving live are worth more than the words
+    are, and they have to arrive while the work is still going on rather than
+    all at once at the end."""
+    await put_item(db, _doc())
+    await db.commit()
+    item_id = (await navigator._documents(db, SCOPE))[0]["item_id"]
+
+    seen: list[str] = []
+    monkeypatch.setattr(
+        "packages.core.llm.chat_with_tools",
+        _scripted(_read(item_id, "n002"), _submit("Leave accrues monthly [1].")),
+    )
+    outcome, _ = await navigate(
+        db, SCOPE, "how does leave accrue?", on_step=lambda s: seen.append(s.action)
+    )
+
+    assert seen == [s.action for s in outcome.steps], "every step must be handed over"
+    assert seen and seen[0] == "read", "and in the order they happened"
+
+
+async def test_prose_is_streamed_when_someone_is_watching(db, monkeypatch):
+    """The words as they are written. Same answer as the unwatched path — the
+    streaming call returns the same shape, so the loop does not branch on how a
+    round was fetched, only on what came back."""
+    await put_item(db, _doc())
+    await db.commit()
+    item_id = (await navigator._documents(db, SCOPE))[0]["item_id"]
+
+    def fake_stream(messages, tools, **kwargs):
+        if any(m.get("role") == "tool" for m in messages):
+            for piece in ("Within ", "thirty ", "days [1]."):
+                yield {"type": "text", "delta": piece}
+            yield {"type": "done", "content": "Within thirty days [1].", "tool_calls": []}
+        else:
+            yield {
+                "type": "done",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "name": "read_section",
+                        "arguments": json.dumps({"doc": item_id, "section": "n003"}),
+                    }
+                ],
+            }
+
+    monkeypatch.setattr("packages.core.llm.stream_chat_with_tools", fake_stream)
+
+    tokens: list[str] = []
+    outcome, _ = await navigate(
+        db, SCOPE, "receipts?", on_token=lambda t: tokens.append(t)
+    )
+
+    assert "".join(tokens) == "Within thirty days [1]."
+    assert outcome.answer == "Within thirty days [1]."
+
+
+async def test_the_unwatched_path_never_streams(db, monkeypatch):
+    """Streaming costs a different provider call. A caller that did not ask to
+    watch must not pay for it."""
+    await put_item(db, _doc())
+    await db.commit()
+    item_id = (await navigator._documents(db, SCOPE))[0]["item_id"]
+
+    def explode(*a, **k):
+        raise AssertionError("must not stream when nobody is watching")
+
+    monkeypatch.setattr("packages.core.llm.stream_chat_with_tools", explode)
+    monkeypatch.setattr(
+        "packages.core.llm.chat_with_tools",
+        _scripted(_read(item_id, "n003"), _submit("Thirty days [1].")),
+    )
+    outcome, _ = await navigate(db, SCOPE, "receipts?")
+    assert outcome.answer == "Thirty days [1]."

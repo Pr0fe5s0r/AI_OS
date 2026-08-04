@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -350,6 +351,32 @@ def _regions_in(text: str) -> tuple[str, list[dict[str, Any]]]:
     return _REGION.sub("", text).strip(), found
 
 
+def _stream_round(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    on_token: Callable[[str], None],
+) -> dict[str, Any]:
+    """One round, with its prose handed over as it arrives.
+
+    Returns exactly what the non-streaming call returns, so the loop above does
+    not branch on how the round was fetched — only on what came back.
+
+    Tokens from a round that turns out NOT to be the answer are still sent:
+    there is no way to know in advance, since a round becomes an answer only by
+    ending without a tool call. The caller is told to discard what it has shown
+    when that happens, which is why a reset exists at all.
+    """
+    from packages.core.llm import stream_chat_with_tools
+
+    done: dict[str, Any] = {"content": "", "tool_calls": []}
+    for event in stream_chat_with_tools(messages, tools, temperature=0.0):
+        if event["type"] == "text":
+            on_token(event["delta"])
+        elif event["type"] == "done":
+            done = {"content": event["content"], "tool_calls": event["tool_calls"]}
+    return done
+
+
 async def _read_page(
     workspace_id: str, item_id: str, page: int, looking_for: str
 ) -> str | None:
@@ -465,9 +492,23 @@ def _catalogue(documents: list[dict[str, Any]], trees: dict[str, tree.Node]) -> 
 
 
 async def navigate(
-    session: AsyncSession, scope: Scope, question: str
+    session: AsyncSession,
+    scope: Scope,
+    question: str,
+    on_step: Callable[[Step], None] | None = None,
+    on_token: Callable[[str], None] | None = None,
 ) -> tuple[Outcome, Trace]:
-    """Let the model read its way to an answer, and record every step."""
+    """Let the model read its way to an answer, and record every step.
+
+    The two callbacks are for watching it happen rather than waiting for it.
+    Most of the time here is spent READING, not writing — opening a section,
+    looking at a page — so the steps arriving live are worth more than the
+    words arriving live, and both are offered.
+
+    ``on_token`` is called from a worker thread, because the provider client is
+    blocking. A caller that touches an event loop from it must hop back to the
+    loop itself; that is the caller's business and not something to hide here.
+    """
     started = time.perf_counter()
     outcome = Outcome()
     trace = Trace(
@@ -476,6 +517,12 @@ async def navigate(
         config={"retrieval": "vectorless", "max_rounds": MAX_ROUNDS},
         filters={"workspace_id": scope.workspace_id, "collection_id": scope.collection_id},
     )
+
+    def record(step: Step) -> None:
+        """Keep a step and, if anyone is watching, hand it over at once."""
+        outcome.steps.append(step)
+        if on_step is not None:
+            on_step(step)
 
     documents = await _documents(session, scope)
     if not documents:
@@ -542,7 +589,12 @@ async def navigate(
         if looks < MAX_LOOKS and any(page_counts.values()):
             tools = [*_TOOLS, _LOOK_TOOL]
         try:
-            reply = await asyncio.to_thread(chat_with_tools, messages, tools, temperature=0.0)
+            if on_token is not None:
+                reply = await asyncio.to_thread(_stream_round, messages, tools, on_token)
+            else:
+                reply = await asyncio.to_thread(
+                    chat_with_tools, messages, tools, temperature=0.0
+                )
         except Exception as exc:
             outcome.degraded = f"navigation unavailable: {type(exc).__name__}"
             trace.degraded = outcome.degraded
@@ -573,7 +625,7 @@ async def navigate(
                 }
             )
             pressed_to_read = True
-            outcome.steps.append(Step(round_number, "sent back", "answered without reading"))
+            record(Step(round_number, "sent back", "answered without reading"))
             continue
 
         if (
@@ -610,7 +662,7 @@ async def navigate(
                 }
             )
             pressed_to_look = True
-            outcome.steps.append(
+            record(
                 Step(round_number, "sent back", "answered about a picture from text alone")
             )
             continue
@@ -623,7 +675,7 @@ async def navigate(
             if reply.get("content"):
                 outcome.answer = _strip_pseudo_call(reply["content"].strip())
                 outcome.found = bool(read)
-                outcome.steps.append(Step(round_number, "answered", "without submit_answer"))
+                record(Step(round_number, "answered", "without submit_answer"))
             break
 
         messages.append(
@@ -673,7 +725,7 @@ async def navigate(
                         }
                     )
                     pressed_to_read = True
-                    outcome.steps.append(
+                    record(
                         Step(round_number, "sent back", "said not found without reading")
                     )
                     continue
@@ -728,7 +780,7 @@ async def navigate(
                             ),
                         }
                     )
-                    outcome.steps.append(
+                    record(
                         Step(
                             round_number,
                             "sent back",
@@ -741,7 +793,7 @@ async def navigate(
 
                 outcome.answer = str(args.get("answer") or "").strip()
                 outcome.found = said_found and bool(read)
-                outcome.steps.append(
+                record(
                     Step(round_number, "answered", "found" if outcome.found else "not found")
                 )
                 finished = True
@@ -779,7 +831,7 @@ async def navigate(
                             ),
                         }
                     )
-                    outcome.steps.append(Step(round_number, "missed", f"page {page_number}"))
+                    record(Step(round_number, "missed", f"page {page_number}"))
                     continue
 
                 if (doc_id, page_number) in looked_at:
@@ -810,7 +862,7 @@ async def navigate(
                             ),
                         }
                     )
-                    outcome.steps.append(
+                    record(
                         Step(round_number, "missed", f"page {page_number} (unreadable)")
                     )
                     continue
@@ -829,7 +881,7 @@ async def navigate(
                     # Recorded, not hidden: a look that came back empty is the
                     # reader's evidence that the page was checked and did not
                     # hold the answer.
-                    outcome.steps.append(
+                    record(
                         Step(round_number, "looked", f"page {page_number} — not there")
                     )
                     continue
@@ -853,7 +905,7 @@ async def navigate(
                         doc_id,
                     )
                 )
-                outcome.steps.append(
+                record(
                     Step(round_number, "looked", f"page {page_number} → [{marker}]")
                 )
                 messages.append(
@@ -902,7 +954,7 @@ async def navigate(
                         ),
                     }
                 )
-                outcome.steps.append(Step(round_number, "missed", node_id))
+                record(Step(round_number, "missed", node_id))
                 continue
 
             node = nodes[0]
@@ -946,7 +998,7 @@ async def navigate(
                     doc_id,
                 )
             )
-            outcome.steps.append(Step(round_number, "read", f"{node.title[:60]} → [{marker}]"))
+            record(Step(round_number, "read", f"{node.title[:60]} → [{marker}]"))
             if _is_a_picture(by_id[doc_id]):
                 read_a_picture = True
 
@@ -1002,7 +1054,7 @@ async def navigate(
             "I read " + str(len(read)) + " section(s) without reaching an answer. "
             "The passages below are what was opened."
         )
-        outcome.steps.append(Step(outcome.rounds, "gave up", "out of rounds"))
+        record(Step(outcome.rounds, "gave up", "out of rounds"))
 
     trace.timings_ms["navigate"] = int((time.perf_counter() - mark) * 1000)
 

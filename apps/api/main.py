@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -8,7 +10,7 @@ from typing import Any
 from arq import create_pool
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -308,6 +310,104 @@ async def answer_question(
             {**h.model_dump(), "classes": tagged.get(h.item_id, [])} for h in result.hits
         ],
     }
+
+
+@app.get("/api/answer/stream")
+async def answer_streaming(
+    q: str = Query(min_length=1),
+    limit: int = Query(8, ge=1, le=20),
+    mode: str = Query("vectorless", pattern="^(hybrid|vectorless)$"),
+    sources: list[str] | None = Query(None),
+    scope: Scope = Depends(workspace_scope),
+    principal: dict[str, Any] = Depends(resolve_caller),
+) -> StreamingResponse:
+    """The same answer, delivered as it happens rather than when it is done.
+
+    Most of the wait is spent READING — opening a section, looking at a page —
+    not writing, so the steps arriving live are worth more than the words are.
+    Both are sent, in the order they occur:
+
+        step    the agent opened, missed, looked at or was sent back
+        token   a fragment of prose as it is written
+        reset   discard the prose shown so far: that round was sent back and
+                its words are not the answer
+        done    the finished answer, its citations and its trace id
+
+    `done` carries the whole answer again rather than asking the client to
+    reassemble it from tokens. The tokens are a preview; the finished text has
+    been through citation resolution, which rewrites it — a client that kept
+    its own concatenation would show markers that were dropped as unresolvable.
+    """
+    queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    def push(event: dict[str, Any]) -> None:
+        # Both callbacks fire on a worker thread, because the provider client
+        # blocks. This is the hop back onto the loop.
+        loop.call_soon_threadsafe(queue.put_nowait, event)
+
+    def on_step(step: Any) -> None:
+        push({"type": "step", "round": step.round, "action": step.action, "detail": step.detail})
+        # A round that is sent back had its prose streamed before anyone could
+        # know it would be rejected. Tell the client to drop what it showed.
+        if step.action == "sent back":
+            push({"type": "reset"})
+
+    async def run() -> None:
+        try:
+            async with Session() as session:
+                cfg = RetrievalConfig(limit=limit, sources=tuple(sources or ()))
+                result, trace = await answer(
+                    session,
+                    scope,
+                    q,
+                    cfg,
+                    mode=mode,
+                    on_step=on_step,
+                    on_token=lambda text: push({"type": "token", "text": text}),
+                )
+                await record(
+                    session,
+                    scope,
+                    trace,
+                    via=trace_via(principal),
+                    actor=str(principal.get("email") or ""),
+                )
+                await session.commit()
+                tagged = await classes_for(session, scope, [h.item_id for h in result.hits])
+            await queue.put(
+                {
+                    "type": "done",
+                    **result.as_dict(),
+                    "results": [
+                        {**h.model_dump(), "classes": tagged.get(h.item_id, [])}
+                        for h in result.hits
+                    ],
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 - the client is owed a reason
+            await queue.put({"type": "error", "detail": f"{type(exc).__name__}: {exc}"})
+        finally:
+            await queue.put(None)
+
+    async def events() -> Any:
+        task = asyncio.create_task(run())
+        try:
+            while True:
+                event = await queue.get()
+                if event is None:
+                    break
+                yield f"data: {json.dumps(event)}\n\n"
+        finally:
+            # A reader who closes the tab should not leave the agent running.
+            if not task.done():
+                task.cancel()
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # --------------------------------- traces ---------------------------------

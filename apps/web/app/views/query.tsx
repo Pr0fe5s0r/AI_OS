@@ -137,11 +137,25 @@ export function Query({ active }: { active: string | null }) {
   // standing choice about how you want the store to work, not a per-question
   // one. Vectorless is the default until someone says otherwise.
   const [mode, setMode] = useState<api.AskMode>("vectorless");
+  // How the answer arrives. Remembered like the retrieval choice: watching the
+  // work happen or waiting for the finished piece is a standing preference,
+  // not a per-question one.
+  const [delivery, setDelivery] = useState<api.Delivery>("stream");
+  // What has arrived so far on a streaming answer, shown until the finished
+  // one replaces it.
+  const [live, setLive] = useState<{ text: string; steps: api.Step[] } | null>(null);
 
   useEffect(() => {
     const saved = localStorage.getItem("retrieval-mode");
     if (saved === "hybrid" || saved === "vectorless") setMode(saved);
+    const how = localStorage.getItem("answer-delivery");
+    if (how === "stream" || how === "complete") setDelivery(how);
   }, []);
+
+  function chooseDelivery(next: api.Delivery) {
+    setDelivery(next);
+    localStorage.setItem("answer-delivery", next);
+  }
 
   function choose(next: api.AskMode) {
     setMode(next);
@@ -160,7 +174,28 @@ export function Query({ active }: { active: string | null }) {
     setError(null);
     setQuestion("");
     try {
-      const out = await api.ask(collectionId, q, 8, mode);
+      const out =
+        delivery === "stream"
+          ? await api.askStreaming(collectionId, q, 8, mode, (event) => {
+              setLive((current) => {
+                const now = current ?? { text: "", steps: [] };
+                if (event.type === "token") return { ...now, text: now.text + event.text };
+                if (event.type === "step")
+                  return {
+                    ...now,
+                    steps: [
+                      ...now.steps,
+                      { round: event.round, action: event.action, detail: event.detail },
+                    ],
+                  };
+                // A round that got sent back: the words it produced were
+                // streamed before anyone could know they were not the answer.
+                if (event.type === "reset") return { ...now, text: "" };
+                return now;
+              });
+            })
+          : await api.ask(collectionId, q, 8, mode);
+      setLive(null);
       setTurns((t) => [
         ...t,
         {
@@ -179,6 +214,7 @@ export function Query({ active }: { active: string | null }) {
     } catch (e) {
       setError((e as Error).message);
     } finally {
+      setLive(null);
       setBusy(false);
     }
   }
@@ -188,9 +224,13 @@ export function Query({ active }: { active: string | null }) {
   return (
     <div className="relative flex h-full min-h-0">
       <div className="flex min-w-0 flex-1 flex-col">
-        <header className="flex shrink-0 items-center gap-3 border-b border-edge px-6 py-3">
-          <h1 className="text-sm font-semibold text-ink">Query &amp; chat</h1>
-          <div className="ml-auto flex items-center gap-3">
+        {/* Three control groups now, and on a narrow pane they squeezed the
+            title into three wrapped lines. The controls wrap instead. */}
+        <header className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 border-b border-edge px-6 py-3">
+          <h1 className="shrink-0 whitespace-nowrap text-sm font-semibold text-ink">
+            Query &amp; chat
+          </h1>
+          <div className="ml-auto flex flex-wrap items-center gap-x-3 gap-y-2">
             {/* Two ways of finding the evidence. Neither is strictly better,
                 so it is a choice rather than a setting with a right answer. */}
             <div className="flex items-center gap-1.5">
@@ -211,6 +251,30 @@ export function Query({ active }: { active: string | null }) {
                     )}
                   >
                     {m}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {/* How the answer arrives. Same answer either way — this is only
+                about whether you watch it being worked out. */}
+            <div className="flex items-center gap-1.5">
+              <Label>answer</Label>
+              <div className="flex gap-1 rounded-lg border border-edge bg-elevated p-0.5">
+                {(["stream", "complete"] as const).map((how) => (
+                  <button
+                    key={how}
+                    onClick={() => chooseDelivery(how)}
+                    title={
+                      how === "stream"
+                        ? "Show the work as it happens: each section opened or page looked at, then the words as they are written."
+                        : "Wait, and deliver the finished answer in one piece."
+                    }
+                    className={cx(
+                      "rounded-md px-2.5 py-1 font-mono text-2xs transition",
+                      delivery === how ? "bg-accent/15 text-ink" : "text-subtle hover:text-muted"
+                    )}
+                  >
+                    {how}
                   </button>
                 ))}
               </div>
@@ -416,9 +480,58 @@ export function Query({ active }: { active: string | null }) {
             ))}
 
             {busy && (
-              <div className="flex items-center gap-2 pl-8 font-mono text-2xs text-subtle">
-                <span className="h-3 w-3 animate-spin rounded-full border-2 border-edgeStrong border-t-accent" />
-                embedding and searching…
+              <div className="animate-rise">
+                {/* Streaming: the steps as they land, then the prose. This is
+                    the same trail the finished answer keeps, shown open while
+                    it is still being written — watching it read is the part
+                    worth watching, since most of the wait is reading. */}
+                {live && live.steps.length > 0 && (
+                  <ol className="mb-2 space-y-1 border-l border-edge pl-3 ml-8">
+                    {live.steps.map((s, i) => (
+                      <li key={i} className="flex items-baseline gap-2 font-mono text-2xs">
+                        <span className="w-3 shrink-0 text-right text-subtle">{s.round}</span>
+                        <span
+                          className={cx(
+                            "w-14 shrink-0",
+                            s.action === "read"
+                              ? "text-accentSoft"
+                              : s.action === "looked"
+                                ? "text-warn"
+                                : s.action === "missed"
+                                  ? "text-hot"
+                                  : "text-muted"
+                          )}
+                        >
+                          {s.action}
+                        </span>
+                        <span className="min-w-0 flex-1 truncate text-subtle">{s.detail}</span>
+                      </li>
+                    ))}
+                  </ol>
+                )}
+
+                {live && live.text && (
+                  <div className="mb-2 pl-8">
+                    <div className="rounded-xl border border-edge bg-elevated/50 p-4">
+                      <p className="whitespace-pre-wrap text-sm leading-relaxed text-ink">
+                        {live.text}
+                        {/* The markers are not clickable yet: they only resolve
+                            once the finished answer has been through citation
+                            resolution, and a marker that does nothing when
+                            clicked is worse than one that is plainly still
+                            being written. */}
+                        <span className="ml-0.5 inline-block h-3.5 w-1.5 animate-pulse bg-accent align-middle" />
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                <div className="flex items-center gap-2 pl-8 font-mono text-2xs text-subtle">
+                  <span className="h-3 w-3 animate-spin rounded-full border-2 border-edgeStrong border-t-accent" />
+                  {live?.steps.length
+                    ? `${live.steps[live.steps.length - 1].action}…`
+                    : "searching…"}
+                </div>
               </div>
             )}
             {error && (

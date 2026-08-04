@@ -255,7 +255,7 @@ async def test_vectorless_is_the_default_retrieval(db, monkeypatch):
     changing this line, not discovering the change in production."""
     seen: list[str] = []
 
-    async def spy(session, scope, question):
+    async def spy(session, scope, question, **watching):
         seen.append("vectorless")
         from packages.core.navigator import Outcome
         from packages.core.search import Trace, new_trace_id
@@ -275,7 +275,7 @@ async def test_the_route_the_agent_took_travels_with_the_answer(db, monkeypatch)
     sections and still came back empty is the case where the route matters
     most, and an "answer only" field is exactly what would drop it."""
 
-    async def walked(session, scope, question):
+    async def walked(session, scope, question, **watching):
         from packages.core.navigator import Outcome, Step
         from packages.core.search import Trace, new_trace_id
 
@@ -311,7 +311,7 @@ async def test_an_empty_vectorless_result_says_so_in_its_own_terms(db, monkeypat
     """"Nothing in this collection" and "no section looks like it answers that"
     are different claims. The one shown should match the retrieval that ran."""
 
-    async def nothing(session, scope, question):
+    async def nothing(session, scope, question, **watching):
         from packages.core.navigator import Outcome
         from packages.core.search import Trace, new_trace_id
 

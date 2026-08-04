@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -332,6 +333,8 @@ async def answer(
     question: str,
     cfg: RetrievalConfig = DEFAULT,
     mode: str = "vectorless",
+    on_step: Callable[[Any], None] | None = None,
+    on_token: Callable[[str], None] | None = None,
 ) -> tuple[Answer, Trace]:
     """Retrieve, then write an answer from what was retrieved.
 
@@ -367,7 +370,9 @@ async def answer(
         # any content, and when it chose nothing the store looked empty.
         from packages.core.navigator import navigate
 
-        walk, trace = await navigate(session, scope, question)
+        walk, trace = await navigate(
+            session, scope, question, on_step=on_step, on_token=on_token
+        )
         result = Answer(
             question=question,
             text=walk.answer,
@@ -457,17 +462,31 @@ async def answer(
         result.took_ms = int((time.perf_counter() - started) * 1000)
         return result, trace
 
-    from packages.core.llm import chat
+    from packages.core.llm import chat, stream_chat_with_tools
+
+    written = [
+        {"role": "system", "content": _SYSTEM},
+        {"role": "user", "content": _prompt(question, passages)},
+    ]
+
+    def _stream() -> str:
+        """Hybrid has no route to narrate — it ranks and hands over — so the
+        only thing to stream is the writing itself."""
+        out: list[str] = []
+        for event in stream_chat_with_tools(written, [], temperature=0.0):
+            if event["type"] == "text":
+                out.append(event["delta"])
+                if on_token is not None:
+                    on_token(event["delta"])
+            elif event["type"] == "done" and not out:
+                out.append(event["content"])
+        return "".join(out)
 
     try:
-        raw = await asyncio.to_thread(
-            chat,
-            [
-                {"role": "system", "content": _SYSTEM},
-                {"role": "user", "content": _prompt(question, passages)},
-            ],
-            temperature=0.0,
-        )
+        if on_token is not None:
+            raw = await asyncio.to_thread(_stream)
+        else:
+            raw = await asyncio.to_thread(chat, written, temperature=0.0)
     except Exception as exc:
         # The passages are still worth having. Saying the answer is missing is
         # far better than quietly returning search results as though they were
