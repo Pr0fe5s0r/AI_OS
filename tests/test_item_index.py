@@ -3,6 +3,7 @@ from __future__ import annotations
 from sqlalchemy import text
 
 from packages.core.store import (
+    edit_item,
     get_item,
     item_versions,
     list_items,
@@ -102,6 +103,39 @@ async def test_lineage_is_traceable(db):
     history = await item_versions(db, SCOPE, latest.item.id)
     assert [h.version for h in history] == [2, 1]
     assert [h.body for h in history] == ["final", "draft"]
+
+
+async def test_editing_title_or_body_creates_a_searchable_new_version(db):
+    created = await put_item(db, item("old body", title="Old title"))
+    await db.commit()
+
+    edited, needs_embedding = await edit_item(
+        db, SCOPE, created.item.id, title="New title", body="new body"
+    )
+    await db.commit()
+
+    assert edited.id == created.item.id
+    assert edited.version == 2
+    assert edited.title == "New title"
+    assert edited.body == "new body"
+    assert needs_embedding is True
+    history = await item_versions(db, SCOPE, edited.id)
+    assert [entry.version for entry in history] == [2, 1]
+
+
+async def test_metadata_edit_merges_without_creating_a_content_version(db):
+    created = await put_item(db, item("body"))
+    await db.commit()
+
+    edited, needs_embedding = await edit_item(
+        db, SCOPE, created.item.id, metadata={"owner": "operations"}
+    )
+    await db.commit()
+
+    assert edited.version == 1
+    assert edited.metadata["owner"] == "operations"
+    assert needs_embedding is False
+    assert len(await item_versions(db, SCOPE, edited.id)) == 1
 
 
 async def test_a_point_in_time_read_returns_the_old_version(db):

@@ -312,7 +312,7 @@ type RawDoc = {
   created_at: string | null;
   source: { source: string; locator: string; url?: string | null };
   classes?: Category[];
-  metadata?: { original?: RawOriginal | null } | null;
+  metadata?: ({ original?: RawOriginal | null } & Record<string, unknown>) | null;
 };
 
 const toDoc = (d: RawDoc): Document => {
@@ -327,9 +327,23 @@ const toDoc = (d: RawDoc): Document => {
     status: d.status,
     createdAt: d.created_at,
     categories: d.classes || [],
+    metadata: d.metadata || {},
     original: o ? { filename: o.filename, contentType: o.content_type, size: o.size } : null,
   };
 };
+
+export async function updateDocument(
+  itemId: string,
+  collectionId: string | undefined,
+  changes: { title?: string; body?: string; metadata?: Record<string, unknown> }
+): Promise<Document> {
+  const payload = await call<RawDoc>(`/api/items/${encodeURIComponent(itemId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(changes),
+    collection: collectionId,
+  });
+  return toDoc(payload);
+}
 
 export async function documents(
   collectionId: string | undefined,
@@ -517,112 +531,27 @@ export type AnswerOutcome = SearchOutcome & {
 
 /** Retrieval plus a written answer built only from what was retrieved.
  *  Separate from `search`, which never returns generated text. */
-export type AskMode = "hybrid" | "vectorless";
+export type AskMode = "hybrid" | "vectorless" | "agentic";
 
-/** How the answer arrives. "stream" shows the work as it happens — the steps
- *  first, then the words; "complete" waits and delivers the finished answer in
- *  one piece. Same answer either way. */
-export type Delivery = "stream" | "complete";
+/** The JSON both /api/answer and the stream's terminal `done` event carry. */
+type RawAnswer = {
+  answer: string;
+  grounded: boolean;
+  citations: Citation[];
+  trace_id: string;
+  took_ms: number;
+  degraded: string | null;
+  mode: AskMode;
+  /** The route the navigator took. Empty for hybrid, which ranks rather than
+   *  navigates. */
+  steps?: Step[];
+  results: RawResult[];
+};
 
-/** What arrives while an answer is being worked out. */
-export type AskEvent =
-  | { type: "step"; round: number; action: string; detail: string }
-  | { type: "token"; text: string }
-  /** That round was sent back — drop the prose shown so far, it is not the
-   *  answer. The tokens went out before anyone could know that. */
-  | { type: "reset" }
-  | { type: "error"; detail: string };
-
-/** Ask, and watch it happen.
- *
- *  The finished answer still arrives whole at the end rather than being
- *  assembled from the tokens: the text goes through citation resolution, which
- *  rewrites it, so a client keeping its own concatenation would end up showing
- *  markers the store had already dropped as unresolvable. The tokens are a
- *  preview; `done` is the answer.
- */
-export async function askStreaming(
-  collectionId: string | undefined,
-  question: string,
-  limit = 8,
-  mode: AskMode = "vectorless",
-  onEvent: (e: AskEvent) => void
-): Promise<AnswerOutcome> {
-  const res = await fetch(
-    `${API}/api/answer/stream?q=${encodeURIComponent(question)}&limit=${limit}&mode=${mode}`,
-    {
-      credentials: "include",
-      headers: collectionId ? { "X-Collection": collectionId } : {},
-    }
-  );
-  if (!res.ok || !res.body) {
-    if (res.status === 401) onLost?.();
-    throw new ApiError(res.status, res.statusText || "Streaming failed");
-  }
-
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let finished: AnswerOutcome | null = null;
-
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-
-    // Server-sent events are separated by a blank line; a chunk can end
-    // mid-event, so whatever is left over stays in the buffer.
-    const parts = buffer.split("\n\n");
-    buffer = parts.pop() || "";
-    for (const part of parts) {
-      const line = part.split("\n").find((l) => l.startsWith("data: "));
-      if (!line) continue;
-      const event = JSON.parse(line.slice(6));
-      if (event.type === "done") {
-        finished = {
-          answer: event.answer,
-          mode: event.mode || mode,
-          grounded: event.grounded,
-          citations: event.citations || [],
-          steps: event.steps || [],
-          traceId: event.trace_id,
-          tookMs: event.took_ms,
-          degraded: event.degraded,
-          matches: (event.results || []).map(toPoint),
-        };
-      } else {
-        onEvent(event as AskEvent);
-      }
-    }
-  }
-
-  if (!finished) throw new ApiError(500, "The answer stream ended without an answer.");
-  return finished;
-}
-
-export async function ask(
-  collectionId: string | undefined,
-  question: string,
-  limit = 8,
-  mode: AskMode = "hybrid"
-): Promise<AnswerOutcome> {
-  const payload = await call<{
-    answer: string;
-    grounded: boolean;
-    citations: Citation[];
-    trace_id: string;
-    took_ms: number;
-    degraded: string | null;
-    mode: AskMode;
-    steps?: Step[];
-    results: RawResult[];
-  }>(`/api/answer?q=${encodeURIComponent(question)}&limit=${limit}&mode=${mode}`, {
-    collection: collectionId,
-  });
-
+function toAnswerOutcome(payload: RawAnswer, fallbackMode: AskMode): AnswerOutcome {
   return {
     answer: payload.answer,
-    mode: payload.mode || mode,
+    mode: payload.mode || fallbackMode,
     grounded: payload.grounded,
     citations: payload.citations || [],
     steps: payload.steps || [],
@@ -631,6 +560,99 @@ export async function ask(
     degraded: payload.degraded,
     matches: (payload.results || []).map(toPoint),
   };
+}
+
+export async function ask(
+  collectionId: string | undefined,
+  question: string,
+  limit = 8,
+  mode: AskMode = "hybrid"
+): Promise<AnswerOutcome> {
+  const payload = await call<RawAnswer>(
+    `/api/answer?q=${encodeURIComponent(question)}&limit=${limit}&mode=${mode}`,
+    { collection: collectionId }
+  );
+  return toAnswerOutcome(payload, mode);
+}
+
+/** One step the store reports while it works, as it happens. `done` carries the
+ *  same answer /api/answer returns; everything before it is the work. */
+export type StreamEvent =
+  | { type: "start"; mode: AskMode; documents?: number; sections?: number }
+  | { type: "thinking"; delta: string; round?: number }
+  | { type: "tool_call"; tool: string; args: Record<string, unknown>; round?: number }
+  | {
+      type: "tool_result";
+      tool: string;
+      ok: boolean;
+      detail?: string;
+      heading?: string;
+      title?: string;
+      marker?: number;
+      count?: number;
+      headings?: string[];
+    }
+  | { type: "retrieved"; documents: number; passages: number }
+  | { type: "token"; delta: string }
+  | { type: "answer"; text: string; found: boolean }
+  | { type: "degraded"; reason: string }
+  | { type: "done"; answer: RawAnswer }
+  | { type: "error"; message: string };
+
+/** Ask, and watch it work. `onEvent` fires for every step as the server
+ *  produces it; the promise resolves with the finished answer, the same shape
+ *  `ask` returns. A fetch + stream reader rather than EventSource because the
+ *  session travels as a cookie and the collection as a header, neither of which
+ *  EventSource can send. */
+export async function askStream(
+  collectionId: string | undefined,
+  question: string,
+  limit: number,
+  mode: AskMode,
+  onEvent: (event: StreamEvent) => void
+): Promise<AnswerOutcome> {
+  const params = new URLSearchParams({ q: question, limit: String(limit), mode });
+  const res = await fetch(`${API}/api/answer/stream?${params}`, {
+    credentials: "include",
+    headers: collectionId ? { "X-Collection": collectionId } : {},
+  });
+  if (!res.ok || !res.body) {
+    let detail = res.statusText;
+    try {
+      detail = (await res.json()).detail || detail;
+    } catch {
+      /* not a JSON error body */
+    }
+    if (res.status === 401) onLost?.();
+    throw new ApiError(res.status, detail);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let outcome: AnswerOutcome | null = null;
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    // SSE frames are separated by a blank line; a frame may span reads, so only
+    // whole frames are parsed and the remainder stays in the buffer.
+    let boundary: number;
+    while ((boundary = buffer.indexOf("\n\n")) !== -1) {
+      const frame = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      const dataLine = frame.split("\n").find((line) => line.startsWith("data:"));
+      if (!dataLine) continue;
+      const event = JSON.parse(dataLine.slice(5).trim()) as StreamEvent;
+      if (event.type === "error") throw new ApiError(500, event.message);
+      if (event.type === "done") outcome = toAnswerOutcome(event.answer, mode);
+      onEvent(event);
+    }
+  }
+
+  if (!outcome) throw new ApiError(500, "the stream ended before an answer arrived");
+  return outcome;
 }
 
 export type ChunkDetail = {

@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import * as api from "../api";
 import { Collection, Trace, ms, num, statusTone, traceStatus } from "../data";
-import { Button, Card, Chip, HeatLegend, Label, Mono, Stat, VectorField } from "../ui/kit";
+import { Button, Card, Chip, Label, Mono, Stat } from "../ui/kit";
 
 type Section = "overview" | "upload" | "query" | "keys" | "sdk" | "playground" | "traces";
 
@@ -28,10 +28,9 @@ export function Overview({
   }, []);
 
   const documents = collections.reduce((sum, c) => sum + c.items, 0);
-  const empty = documents === 0;
 
   return (
-    <div className="px-6 py-6">
+    <div className="mx-auto max-w-[1600px] px-6 py-6">
       <div className="mb-5 flex flex-wrap items-start justify-between gap-4">
         <div>
           <h1 className="text-base font-semibold text-ink">Overview</h1>
@@ -53,24 +52,27 @@ export function Overview({
         </div>
       </div>
 
-      <div className="grid gap-4 lg:grid-cols-3">
-        <div className="space-y-4 lg:col-span-2">
-          <Card className="flex flex-wrap gap-x-10 gap-y-4 p-4">
-            <Stat value={num(documents)} label="documents" />
-            <Stat value={stats ? num(stats.queries) : "—"} label="queries · 24h" />
-            <Stat
-              value={stats ? ms(stats.p95_ms) : "—"}
-              label="p95 latency"
-              tone={stats && stats.p95_ms >= 2000 ? "text-warn" : undefined}
-            />
-            <Stat
-              value={stats ? num(stats.degraded) : "—"}
-              label="degraded"
-              tone={stats && stats.degraded ? "text-hot" : undefined}
-            />
-          </Card>
+      <Card className="mb-5 grid grid-cols-2 divide-x-0 divide-y divide-edge/60 p-0 sm:grid-cols-4 sm:divide-x sm:divide-y-0">
+        <div className="p-4 sm:p-5"><Stat value={num(documents)} label="documents" /></div>
+        <div className="p-4 sm:p-5"><Stat value={stats ? num(stats.queries) : "—"} label="queries · 24h" /></div>
+        <div className="p-4 sm:p-5">
+          <Stat
+            value={stats ? ms(stats.p95_ms) : "—"}
+            label="p95 latency"
+            tone={stats && stats.p95_ms >= 2000 ? "text-warn" : undefined}
+          />
+        </div>
+        <div className="p-4 sm:p-5">
+          <Stat
+            value={stats ? num(stats.degraded) : "—"}
+            label="degraded"
+            tone={stats && stats.degraded ? "text-hot" : undefined}
+          />
+        </div>
+      </Card>
 
-          <div>
+      <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_20rem]">
+        <div>
             <div className="mb-2 flex items-center justify-between">
               <Label>recent queries</Label>
               <button
@@ -99,25 +101,24 @@ export function Overview({
                 ))}
               </Card>
             )}
-          </div>
         </div>
 
         <div className="space-y-4">
-          <Card className="overflow-hidden p-0">
-            <div className="px-4 pt-4">
-              <Label>retrieval space</Label>
-            </div>
-            <VectorField height={210} />
-            <div className="px-4 pb-4">
-              <HeatLegend />
-              <p className="mt-2 text-2xs leading-relaxed text-subtle">
-                {empty
-                  ? "Nothing indexed yet — this is the shape, not your data."
-                  : "Run a query to light the nearest neighbours."}
-              </p>
+          <Card className="p-4">
+            <Label className="mb-2 block">next step</Label>
+            <p className="text-xs leading-relaxed text-muted">
+              {documents === 0
+                ? "Add your first document to make this collection searchable."
+                : recent.length === 0
+                  ? "Your documents are ready. Ask a question to create the first trace."
+                  : "Continue querying, or open Traces to inspect how each answer was produced."}
+            </p>
+            <div className="mt-3">
+              <Button variant="primary" onClick={() => go(documents === 0 ? "upload" : "query")}>
+                {documents === 0 ? "Upload a document" : "Ask a question"}
+              </Button>
             </div>
           </Card>
-
           <Card className="p-4">
             <Label className="mb-2 block">connect</Label>
             <p className="text-2xs leading-relaxed text-subtle">

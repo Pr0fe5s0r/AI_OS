@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -11,6 +11,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.search import DEFAULT, RetrievalConfig, Trace, search_traced
 from packages.shared.schema import Hit, Passage, Scope
+
+# A progress sink, matching the navigator's: one event dict per step, awaited so
+# it can be an SSE queue. None means nobody is watching and nothing is emitted.
+EmitFn = Callable[[dict[str, Any]], Awaitable[None]]
 
 # ---------------------------------------------------------------------------
 # ANSWERING — retrieval, then a written answer built only from what it found.
@@ -327,22 +331,61 @@ async def _attach_pages(
             citation.page = tree.page_containing(body, citation.text)
 
 
+async def _write(
+    question: str,
+    passages: list[tuple[Passage, Hit]],
+    emit: EmitFn | None,
+) -> str:
+    """Write the grounded answer from the passages.
+
+    When someone is watching, the answer is streamed token by token as the
+    model produces it and the full text is returned all the same, so the
+    citation resolution downstream is identical either way. Unwatched, it is the
+    one blocking call it always was. The prompt and rules do not change — only
+    whether the writing is shown as it happens.
+    """
+    messages = [
+        {"role": "system", "content": _SYSTEM},
+        {"role": "user", "content": _prompt(question, passages)},
+    ]
+    if emit is None:
+        from packages.core.llm import chat
+
+        return await asyncio.to_thread(chat, messages, temperature=0.0)
+
+    from packages.core.llm import astream_chat_with_tools
+
+    parts: list[str] = []
+    async for event in astream_chat_with_tools(messages, [], temperature=0.0):
+        if event["type"] == "text":
+            parts.append(event["delta"])
+            await emit({"type": "token", "delta": event["delta"]})
+        elif event["type"] == "error":
+            raise RuntimeError(event["error"])
+        elif event["type"] == "done" and not parts:
+            # Some providers deliver the whole message in the final frame with no
+            # incremental text; take it so a non-incremental provider still works.
+            parts.append(event["content"])
+    return "".join(parts)
+
+
 async def answer(
     session: AsyncSession,
     scope: Scope,
     question: str,
     cfg: RetrievalConfig = DEFAULT,
     mode: str = "vectorless",
-    on_step: Callable[[Any], None] | None = None,
-    on_token: Callable[[str], None] | None = None,
+    emit: EmitFn | None = None,
 ) -> tuple[Answer, Trace]:
     """Retrieve, then write an answer from what was retrieved.
 
-    Two ways of retrieving, and the writing is identical either way:
+    Three ways of retrieving, and the writing is identical for each:
 
       vectorless  reason over each document's table of contents and open the
                   sections that look like they answer the question (default)
       hybrid      passage embeddings and keyword matching, fused
+      agentic     the vectorless loop plus a hybrid_search tool, the agent
+                  choosing between structure and search per question
 
     Vectorless is the default because on the material this store actually
     holds — long documents with headings their authors wrote on purpose — it
@@ -363,15 +406,20 @@ async def answer(
     """
     started = time.perf_counter()
 
-    if mode == "vectorless":
+    if mode in ("vectorless", "agentic"):
         # The navigator answers as it reads, so there is no second pass here.
         # Splitting "choose sections" from "write an answer" is what made the
         # old version brittle: the choosing step had to commit before seeing
         # any content, and when it chose nothing the store looked empty.
+        #
+        # Agentic is the same loop with one more tool: the agent reasons over
+        # the table of contents AND may run hybrid search to locate a figure a
+        # heading would never advertise. The post-processing below is identical
+        # either way — evidence is credited by what the loop actually read.
         from packages.core.navigator import navigate
 
         walk, trace = await navigate(
-            session, scope, question, on_step=on_step, on_token=on_token
+            session, scope, question, hybrid=(mode == "agentic"), emit=emit
         )
         result = Answer(
             question=question,
@@ -436,6 +484,8 @@ async def answer(
         result.took_ms = int((time.perf_counter() - started) * 1000)
         return result, trace
     else:
+        if emit is not None:
+            await emit({"type": "start", "mode": mode})
         hits, trace = await search_traced(session, scope, question, cfg)
         degraded = trace.degraded
 
@@ -449,6 +499,16 @@ async def answer(
     )
 
     passages = _gather(hits)
+    if emit is not None:
+        # What the fusion returned, before a word is written — the evidence the
+        # answer is about to be built from, shown as it is found.
+        await emit(
+            {
+                "type": "retrieved",
+                "documents": len({hit.item_id for _, hit in passages}),
+                "passages": len(passages),
+            }
+        )
     if not passages:
         # An empty context is where a language model invents most confidently,
         # so it is not asked at all.
@@ -462,31 +522,8 @@ async def answer(
         result.took_ms = int((time.perf_counter() - started) * 1000)
         return result, trace
 
-    from packages.core.llm import chat, stream_chat_with_tools
-
-    written = [
-        {"role": "system", "content": _SYSTEM},
-        {"role": "user", "content": _prompt(question, passages)},
-    ]
-
-    def _stream() -> str:
-        """Hybrid has no route to narrate — it ranks and hands over — so the
-        only thing to stream is the writing itself."""
-        out: list[str] = []
-        for event in stream_chat_with_tools(written, [], temperature=0.0):
-            if event["type"] == "text":
-                out.append(event["delta"])
-                if on_token is not None:
-                    on_token(event["delta"])
-            elif event["type"] == "done" and not out:
-                out.append(event["content"])
-        return "".join(out)
-
     try:
-        if on_token is not None:
-            raw = await asyncio.to_thread(_stream)
-        else:
-            raw = await asyncio.to_thread(chat, written, temperature=0.0)
+        raw = await _write(question, passages, emit)
     except Exception as exc:
         # The passages are still worth having. Saying the answer is missing is
         # far better than quietly returning search results as though they were

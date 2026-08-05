@@ -1,10 +1,10 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import * as api from "../api";
 import { cx, num } from "../data";
 import { CollectionGraph } from "../ui/graph";
-import { Button, Card, Chip, Empty, Label, Mono, Stat } from "../ui/kit";
+import { Button, Card, Chip, Empty, Label, Stat } from "../ui/kit";
 
 type Mode = "graph" | "map";
 
@@ -20,10 +20,13 @@ export function IndexGraph({
 }) {
   const [shape, setShape] = useState<api.CollectionShape | null>(null);
   const [mode, setMode] = useState<Mode>("graph");
-  const [k, setK] = useState(3);
+  const [k, setK] = useState(5);
   const [error, setError] = useState<string | null>(null);
   const [opened, setOpened] = useState<api.ChunkDetail | null>(null);
   const [opening, setOpening] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [search, setSearch] = useState("");
+  const openRequest = useRef(0);
 
   useEffect(() => {
     let live = true;
@@ -31,6 +34,7 @@ export function IndexGraph({
     setError(null);
     setOpened(null);
     setOpening(null);
+    setSelectedId(null);
     if (!active) return () => {
       live = false;
     };
@@ -58,19 +62,52 @@ export function IndexGraph({
   }, [active, k]);
 
   async function openPassage(chunkId: string) {
+    const request = ++openRequest.current;
     setOpening(chunkId);
     setOpened(null);
     try {
-      setOpened(await api.chunk(chunkId));
+      const detail = await api.chunk(chunkId);
+      if (request === openRequest.current) setOpened(detail);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "That passage could not be opened.");
+      if (request === openRequest.current) {
+        setError(cause instanceof Error ? cause.message : "That passage could not be opened.");
+      }
     } finally {
+      if (request === openRequest.current) setOpening(null);
+    }
+  }
+
+  const visible = useMemo(() => {
+    if (!shape) return { nodes: [], edges: [] };
+    const needle = search.trim().toLowerCase();
+    const nodes = needle
+      ? shape.nodes.filter((node) =>
+          [node.title, node.document, node.categoryName, node.source]
+            .filter(Boolean)
+            .join(" ")
+            .toLowerCase()
+            .includes(needle)
+        )
+      : shape.nodes;
+    const ids = new Set(nodes.map((node) => node.id));
+    return { nodes, edges: shape.edges.filter((edge) => ids.has(edge.src) && ids.has(edge.dst)) };
+  }, [shape, search]);
+
+  const selected = shape?.nodes.find((node) => node.id === selectedId) ?? null;
+
+  function selectNode(id: string | null) {
+    setSelectedId(id);
+    if (id === null) {
+      openRequest.current += 1;
       setOpening(null);
+      setOpened(null);
+    } else {
+      openPassage(id);
     }
   }
 
   return (
-    <div className="px-5 py-6 sm:px-6">
+    <div className="mx-auto max-w-[1700px] px-5 py-6 sm:px-6">
       <header className="mb-5 flex flex-wrap items-start justify-between gap-4">
         <div>
           <h1 className="text-base font-semibold text-ink">Index graph</h1>
@@ -113,6 +150,15 @@ export function IndexGraph({
             </div>
 
             <div className="flex flex-wrap items-center gap-3">
+              <input
+                value={search}
+                onChange={(event) => {
+                  setSearch(event.target.value);
+                  selectNode(null);
+                }}
+                placeholder="Find a passage or document"
+                className="w-56 rounded-lg border border-edge bg-canvas px-3 py-2 text-xs text-ink outline-none transition placeholder:text-subtle focus:border-accent/60"
+              />
               <div className="flex items-center gap-1.5">
                 <Label>Neighbours</Label>
                 {[2, 3, 5].map((value) => (
@@ -139,12 +185,68 @@ export function IndexGraph({
             </div>
           </div>
 
-          <CollectionGraph
-            nodes={shape.nodes}
-            edges={shape.edges}
-            mode={mode}
-            onOpen={openPassage}
-          />
+          <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_18rem]">
+            <CollectionGraph
+              nodes={visible.nodes}
+              edges={visible.edges}
+              mode={mode}
+              selectedId={selectedId}
+              onSelect={selectNode}
+            />
+            <Card className="h-fit p-4 xl:sticky xl:top-4">
+              {selected ? (
+                <>
+                  <div className="flex items-center justify-between gap-2">
+                    <Label>passage details</Label>
+                    <button
+                      type="button"
+                      onClick={() => selectNode(null)}
+                      className="rounded-md border border-edge px-2 py-1 font-mono text-2xs text-subtle transition hover:text-ink"
+                    >
+                      Clear
+                    </button>
+                  </div>
+                  <h2 className="mt-2 text-sm font-medium leading-5 text-ink">
+                    {selected.title || `Passage ${(selected.ordinal ?? 0) + 1}`}
+                  </h2>
+                  {selected.document && (
+                    <p className="mt-1 break-words font-mono text-2xs text-muted">{selected.document}</p>
+                  )}
+                  <div className="mt-3 flex flex-wrap gap-1.5">
+                    <Chip>{selected.degree} neighbours</Chip>
+                    {selected.categoryName && <Chip>{selected.categoryName}</Chip>}
+                    {selected.nodeType === "summary" && (
+                      <Chip tone="border-warn/30 bg-warn/10 text-warn">generated summary</Chip>
+                    )}
+                  </div>
+                  <div className="mt-4 border-t border-edge pt-4">
+                    {opening === selected.id ? (
+                      <div className="flex items-center gap-2 font-mono text-2xs text-subtle">
+                        <span className="h-3 w-3 animate-spin rounded-full border-2 border-edgeStrong border-t-accent" />
+                        Loading passage…
+                      </div>
+                    ) : opened?.chunk_id === selected.id ? (
+                      <p className="max-h-72 overflow-y-auto whitespace-pre-wrap text-xs leading-5 text-muted">
+                        {opened.text}
+                      </p>
+                    ) : (
+                      <p className="text-xs text-danger">The passage could not be loaded.</p>
+                    )}
+                  </div>
+                </>
+              ) : (
+                <>
+                  <Label>passage details</Label>
+                  <p className="mt-2 text-xs leading-5 text-subtle">
+                    Select a node to inspect it. Click the same node, the canvas background, or press Escape to clear it.
+                  </p>
+                  <div className="mt-4 border-t border-edge pt-3 font-mono text-2xs text-subtle">
+                    {visible.nodes.length} visible nodes · {visible.edges.length} connections
+                  </div>
+                </>
+              )}
+            </Card>
+          </div>
 
           <p className="mt-2 text-2xs leading-5 text-subtle">
             {mode === "graph" ? (
@@ -167,40 +269,6 @@ export function IndexGraph({
             {shape.truncated && " Showing the first 400 passages."}
           </p>
 
-          {(opening || opened) && (
-            <Card className="mt-4 p-4">
-              {opening ? (
-                <p className="font-mono text-2xs text-subtle">Opening passage…</p>
-              ) : opened ? (
-                <>
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <h2 className="truncate text-sm font-medium text-ink">
-                        {opened.heading || `Passage ${opened.ordinal + 1}`}
-                      </h2>
-                      <div className="mt-1 flex flex-wrap items-center gap-2">
-                        {opened.document && <Mono className="text-2xs text-subtle">{opened.document}</Mono>}
-                        <Chip>passage {opened.ordinal + 1}</Chip>
-                        {opened.node_type === "summary" && (
-                          <Chip tone="border-warn/30 bg-warn/10 text-warn">generated summary</Chip>
-                        )}
-                      </div>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => setOpened(null)}
-                      className="rounded-md border border-edge px-2 py-1 text-2xs text-subtle transition hover:text-ink"
-                    >
-                      Close
-                    </button>
-                  </div>
-                  <p className="mt-3 max-h-56 overflow-y-auto whitespace-pre-wrap text-xs leading-5 text-muted">
-                    {opened.text}
-                  </p>
-                </>
-              ) : null}
-            </Card>
-          )}
         </>
       )}
     </div>

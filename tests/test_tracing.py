@@ -8,7 +8,7 @@ from packages.core.search import RetrievalConfig, search_traced
 from packages.core.store import put_item
 from packages.core.tracing import get_trace, list_traces, record, stats
 from packages.shared.schema import Item, Scope, SourceRef
-from tests.conftest import SCOPE, WORKSPACE
+from tests.conftest import COLL_A, COLL_B, SCOPE, WORKSPACE
 
 pytestmark = pytest.mark.needs_db
 
@@ -49,6 +49,10 @@ async def test_a_trace_records_both_arms_and_what_came_back(db, monkeypatch):
     assert trace.keyword and trace.keyword[0]["rank"] > 0
     # Fusion is shown per candidate, so a surprising ranking can be read back.
     assert trace.fused and "score" in trace.fused[0]
+    # A fused row names the document, not just its id — a trace of bare hashes
+    # is one nobody can read.
+    assert trace.fused[0]["title"] == "Doc"
+    assert trace.fused[0]["source"] == "upload"
     assert trace.timings_ms["total"] >= 0
 
 
@@ -168,3 +172,22 @@ async def test_stats_summarise_the_window(db):
     assert summary["queries"] == 3
     assert summary["empty"] == 1
     assert summary["avg_ms"] >= 0
+
+
+async def test_stats_are_scoped_to_the_selected_collection(db):
+    """A collection's header must count that collection's queries — not the
+    whole workspace, or every collection reads identically."""
+    for scope, queries in ((COLL_A, ("alpha", "alpha two")), (COLL_B, ("beta",))):
+        for q in queries:
+            _, trace = await search_traced(db, scope, q)
+            await record(db, scope, trace)
+    await db.commit()
+
+    a = await stats(db, COLL_A, hours=1)
+    b = await stats(db, COLL_B, hours=1)
+    workspace = await stats(db, SCOPE, hours=1)
+
+    assert a["queries"] == 2
+    assert b["queries"] == 1
+    # The unscoped header still sums both collections.
+    assert workspace["queries"] == 3

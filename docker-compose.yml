@@ -156,7 +156,7 @@ services:
       # absent on a laptop. It reported this API as unhealthy while it was
       # serving 200s, which then blocked the worker from starting at all: every
       # upload returned 202 and sat in a queue with nothing to run it.
-      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/api/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
       interval: 3s
       timeout: 3s
       retries: 20

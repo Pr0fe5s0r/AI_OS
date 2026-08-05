@@ -363,6 +363,11 @@ async def search_traced(
         winner = ranked_passages[0] if ranked_passages else None
         detail = {
             "item_id": row.item_id,
+            # The title is what makes a fused row legible: a trace listing bare
+            # item ids is a list of hashes nobody can read. Carried here so the
+            # console names the document, not its primary key.
+            "title": row.title,
+            "source": row.source,
             "chunk_id": winner.chunk_id if winner else None,
             "heading": winner.heading if winner else None,
             "score": round(score, 4),

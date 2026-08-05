@@ -242,6 +242,121 @@ async def get_item(
     return _row_to_item(row) if row else None
 
 
+async def edit_item(
+    session: AsyncSession,
+    scope: Scope,
+    item_id: str,
+    *,
+    title: str | None = None,
+    body: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> tuple[Item, bool]:
+    """Edit one active document without changing its stable identity.
+
+    Title/body edits create a new version and rebuild passages. Metadata-only
+    edits stay on the current version because they do not change retrievable
+    content. The row is locked so two editors cannot both mint the same next
+    version.
+    """
+    clauses = ["workspace_id = :workspace", "item_id = :item_id", "status = :active"]
+    params: dict[str, Any] = {
+        "workspace": scope.workspace_id,
+        "item_id": item_id,
+        "active": Lifecycle.ACTIVE,
+    }
+    if scope.collection_id is not None:
+        clauses.append("collection_id = :collection")
+        params["collection"] = scope.collection_id
+
+    row = (
+        await session.execute(
+            text(
+                f"{_SELECT} WHERE {' AND '.join(clauses)} "
+                "ORDER BY version DESC LIMIT 1 FOR UPDATE"
+            ),
+            params,
+        )
+    ).first()
+    if row is None:
+        raise LookupError(item_id)
+
+    current = _row_to_item(row)
+    next_title = current.title if title is None else title.strip()
+    next_body = current.body if body is None else body
+    next_metadata = dict(current.metadata)
+    if metadata is not None:
+        next_metadata.update(metadata)
+
+    content_changed = next_title != current.title or next_body != current.body
+    metadata_changed = next_metadata != current.metadata
+    if not content_changed and not metadata_changed:
+        return current, False
+
+    if not content_changed:
+        await session.execute(
+            text(
+                "UPDATE kb_items SET metadata = CAST(:metadata AS jsonb), updated_at = now() "
+                "WHERE workspace_id = :workspace AND item_id = :item_id "
+                "AND version = :version AND status = :active"
+            ),
+            {
+                **params,
+                "version": current.version,
+                "metadata": json.dumps(next_metadata),
+            },
+        )
+        return current.model_copy(update={"metadata": next_metadata}), False
+
+    version = current.version + 1
+    supersedes = f"{item_id}@{current.version}"
+    updated = current.model_copy(
+        update={
+            "title": next_title,
+            "body": next_body,
+            "hash": content_hash(next_body),
+            "version": version,
+            "supersedes": supersedes,
+            "status": Lifecycle.ACTIVE,
+            "metadata": next_metadata,
+        }
+    )
+    await session.execute(
+        _SUPERSEDE,
+        {
+            "workspace": scope.workspace_id,
+            "item_id": item_id,
+            "version": version,
+            "active": Lifecycle.ACTIVE,
+            "superseded": Lifecycle.SUPERSEDED,
+        },
+    )
+    await session.execute(
+        _INSERT,
+        {
+            "item_id": item_id,
+            "version": version,
+            "workspace": updated.scope.workspace_id,
+            "collection": updated.scope.collection_id,
+            "title": updated.title,
+            "body": updated.body,
+            "source": updated.source.source,
+            "locator": updated.source.locator,
+            "url": updated.source.url,
+            "hash": updated.hash,
+            "supersedes": supersedes,
+            "status": Lifecycle.ACTIVE,
+            "created_at": updated.created_at,
+            "period_start": updated.period_start,
+            "period_end": updated.period_end,
+            "metadata": json.dumps(updated.metadata),
+        },
+    )
+    from packages.core import chunks
+
+    await chunks.rebuild(session, scope, item_id, version, updated.title, updated.body)
+    return updated, True
+
+
 async def get_items_by_ids(
     session: AsyncSession, scope: Scope, item_ids: list[str]
 ) -> list[Item]:
@@ -400,6 +515,7 @@ __all__ = [
     "content_hash",
     "get_item",
     "get_items_by_ids",
+    "edit_item",
     "item_versions",
     "list_items",
     "mark_failed",

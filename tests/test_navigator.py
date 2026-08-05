@@ -53,6 +53,41 @@ def _scripted(*turns):
     return fake
 
 
+def _astreamed(*turns):
+    """A streaming model: each turn yields its prose as one text frame, then a
+    `done` frame carrying the same {content, tool_calls} the blocking call
+    returns — the shape astream_chat_with_tools produces."""
+    calls = {"n": 0}
+
+    async def fake(messages, tools, **kwargs):
+        index = calls["n"]
+        calls["n"] += 1
+        turn = turns[index] if index < len(turns) else {"content": "Done.", "tool_calls": []}
+        if turn.get("content"):
+            yield {"type": "text", "delta": turn["content"]}
+        yield {
+            "type": "done",
+            "content": turn.get("content", ""),
+            "tool_calls": turn.get("tool_calls", []),
+        }
+
+    fake.calls = calls
+    return fake
+
+
+def _search(query: str, call_id: str = "s1"):
+    return {
+        "content": "",
+        "tool_calls": [
+            {
+                "id": call_id,
+                "name": "hybrid_search",
+                "arguments": json.dumps({"query": query}),
+            }
+        ],
+    }
+
+
 def _read(doc: str, section: str, call_id: str = "c1"):
     return {
         "content": "",
@@ -593,3 +628,78 @@ async def test_the_unwatched_path_never_streams(db, monkeypatch):
     )
     outcome, _ = await navigate(db, SCOPE, "receipts?")
     assert outcome.answer == "Thirty days [1]."
+
+
+async def test_agentic_mode_searches_and_cites_a_found_passage(db, monkeypatch):
+    """Agentic gives the same loop a hybrid_search tool. A passage it surfaces
+    is numbered like a section read and becomes the citation — one uniform
+    shape whichever way the evidence was found."""
+    await put_item(db, _doc())
+    await db.commit()
+
+    monkeypatch.setattr(
+        "packages.core.llm.chat_with_tools",
+        _scripted(_search("receipts thirty days"), _submit("Within thirty days [1].")),
+    )
+    outcome, trace = await navigate(db, SCOPE, "how long to submit receipts?", hybrid=True)
+
+    assert outcome.found is True
+    assert outcome.hits and outcome.hits[0].passages, "the searched passage is the evidence"
+    assert any(step.action == "searched" for step in outcome.steps)
+    assert trace.config["retrieval"] == "agentic"
+
+
+async def test_hybrid_search_is_absent_without_agentic(db, monkeypatch):
+    """The tool is only offered in agentic mode. A model that calls it in plain
+    vectorless is told there is no such tool rather than served a search."""
+    await put_item(db, _doc())
+    await db.commit()
+
+    seen: list[str] = []
+
+    def fake(messages, tools, **kwargs):
+        assert all(t["function"]["name"] != "hybrid_search" for t in tools)
+        for m in messages:
+            if m.get("role") == "tool":
+                seen.append(str(m.get("content")))
+        if not seen:
+            return _search("anything")
+        return _submit("Nothing found.", found=False)
+
+    monkeypatch.setattr("packages.core.llm.chat_with_tools", fake)
+    outcome, _ = await navigate(db, SCOPE, "anything", hybrid=False)
+
+    assert any("No such tool" in s for s in seen)
+    assert not any(step.action == "searched" for step in outcome.steps)
+
+
+async def test_streaming_emits_the_work_as_it_happens(db, monkeypatch):
+    """With an emitter the loop reports every step live — the model's reasoning,
+    each tool call, what it returned, and the answer — without changing the
+    outcome. The events ARE the streaming process the console shows."""
+    await put_item(db, _doc())
+    await db.commit()
+    item_id = (await navigator._documents(db, SCOPE))[0]["item_id"]
+
+    monkeypatch.setattr(
+        "packages.core.llm.astream_chat_with_tools",
+        _astreamed(
+            {**_read(item_id, "n002"), "content": "Let me check the leave section."},
+            _submit("Leave accrues monthly [1]."),
+        ),
+    )
+
+    events: list[dict] = []
+
+    async def emit(event):
+        events.append(event)
+
+    outcome, _ = await navigate(db, SCOPE, "how does leave accrue?", emit=emit)
+
+    kinds = [event["type"] for event in events]
+    assert kinds[0] == "start"
+    assert "thinking" in kinds, "the model's reasoning is streamed"
+    assert any(e["type"] == "tool_call" and e["tool"] == "read_section" for e in events)
+    assert any(e["type"] == "tool_result" and e.get("ok") for e in events)
+    assert any(e["type"] == "answer" for e in events)
+    assert outcome.found is True and outcome.hits

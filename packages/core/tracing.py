@@ -161,11 +161,24 @@ async def get_trace(
 
 
 async def stats(session: AsyncSession, scope: Scope, hours: int = 24) -> dict[str, Any]:
-    """How retrieval has been behaving — the numbers a console header shows."""
+    """How retrieval has been behaving — the numbers a console header shows.
+
+    Scoped to the collection when one is selected, the same way ``list_traces``
+    is: without it, every collection reports the workspace-wide totals and the
+    header reads identically no matter what is picked.
+    """
+    clauses = [
+        "workspace_id = :ws",
+        "created_at > now() - make_interval(hours => :hours)",
+    ]
+    params: dict[str, Any] = {"ws": scope.workspace_id, "hours": hours}
+    if scope.collection_id is not None:
+        clauses.append("collection_id = :coll")
+        params["coll"] = scope.collection_id
     row = (
         await session.execute(
             text(
-                """
+                f"""
                 SELECT count(*) AS queries,
                        COALESCE(avg(duration_ms), 0) AS avg_ms,
                        COALESCE(
@@ -174,11 +187,10 @@ async def stats(session: AsyncSession, scope: Scope, hours: int = 24) -> dict[st
                        count(*) FILTER (WHERE result_count = 0) AS empty,
                        count(*) FILTER (WHERE degraded IS NOT NULL) AS degraded
                 FROM query_traces
-                WHERE workspace_id = :ws
-                  AND created_at > now() - make_interval(hours => :hours)
+                WHERE {" AND ".join(clauses)}
                 """
             ),
-            {"ws": scope.workspace_id, "hours": hours},
+            params,
         )
     ).one()
     return {

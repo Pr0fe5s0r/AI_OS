@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import os
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from functools import lru_cache
 from typing import Any
 
@@ -225,3 +226,54 @@ def stream_chat_with_tools(
             {**calls[i], "arguments": calls[i]["arguments"] or "{}"} for i in sorted(calls)
         ],
     }
+
+
+async def astream_chat_with_tools(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    *,
+    model: str | None = None,
+    temperature: float = 0.0,
+    tool_choice: str = "auto",
+) -> AsyncIterator[dict[str, Any]]:
+    """Async view of ``stream_chat_with_tools``.
+
+    The provider client is synchronous, so the blocking generator is pumped on
+    a worker thread and its chunks are handed back to the running loop through a
+    queue. Callers that live on the event loop — the streaming API endpoint,
+    the navigator when it is reporting progress — can then ``async for`` over
+    the same ``{"type": "text"|"done"}`` events without a thread of their own,
+    and without turning llm.py into anything other than THE provider caller.
+
+    A failure inside the thread arrives as ``{"type": "error", "error": str}``
+    rather than vanishing with the thread, so the caller can surface it.
+    """
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+
+    def pump() -> None:
+        try:
+            for event in stream_chat_with_tools(
+                messages,
+                tools,
+                model=model,
+                temperature=temperature,
+                tool_choice=tool_choice,
+            ):
+                loop.call_soon_threadsafe(queue.put_nowait, event)
+        except Exception as exc:  # surfaced to the consumer, not swallowed
+            loop.call_soon_threadsafe(
+                queue.put_nowait, {"type": "error", "error": f"{type(exc).__name__}: {exc}"}
+            )
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, None)
+
+    task = loop.run_in_executor(None, pump)
+    try:
+        while True:
+            event = await queue.get()
+            if event is None:
+                break
+            yield event
+    finally:
+        await task

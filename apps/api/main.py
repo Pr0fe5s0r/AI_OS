@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
@@ -18,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from apps.api.auth_routes import router as auth_router
 from apps.common.consolidation import enabled as consolidation_enabled
 from apps.common.consolidation import interval_seconds as consolidation_interval
-from packages.core import blobs, graph, pages, tree
+from packages.core import audit, blobs, graph, pages, tree
 from packages.core.answer import answer
 from packages.core.chunks import by_ids as chunks_by_ids
 from packages.core.chunks import for_item as chunks_for_item
@@ -49,7 +50,7 @@ from packages.core.normalise import can_parse, supported
 from packages.core.pipeline import redis_settings
 from packages.core.search import RetrievalConfig, search_traced
 from packages.core.snippets import build as build_snippets
-from packages.core.store import get_item, get_items_by_ids, item_versions, list_items
+from packages.core.store import edit_item, get_item, get_items_by_ids, item_versions, list_items
 from packages.core.tenancy import (
     enforce_binding,
     require_write,
@@ -260,7 +261,7 @@ async def retrieve(
 async def answer_question(
     q: str = Query(min_length=1),
     limit: int = Query(8, ge=1, le=20),
-    mode: str = Query("vectorless", pattern="^(hybrid|vectorless)$"),
+    mode: str = Query("vectorless", pattern="^(hybrid|vectorless|agentic)$"),
     sources: list[str] | None = Query(None),
     scope: Scope = Depends(workspace_scope),
     principal: dict[str, Any] = Depends(resolve_caller),
@@ -284,6 +285,9 @@ async def answer_question(
       vectorless  reason over each document's table of contents and open the
                   sections that look like they answer it (default)
       hybrid      passage embeddings and keyword matching, fused
+      agentic     one agent with both: it reasons over the tables of contents
+                  and may run hybrid search to locate a figure or identifier no
+                  heading advertises, then reads the section it lands in
 
     Neither is a strict improvement on the other, so this is a choice rather
     than a migration. The mode comes back on the response, because two answers
@@ -313,59 +317,38 @@ async def answer_question(
 
 
 @app.get("/api/answer/stream")
-async def answer_streaming(
+async def answer_stream(
     q: str = Query(min_length=1),
     limit: int = Query(8, ge=1, le=20),
-    mode: str = Query("vectorless", pattern="^(hybrid|vectorless)$"),
+    mode: str = Query("vectorless", pattern="^(hybrid|vectorless|agentic)$"),
     sources: list[str] | None = Query(None),
     scope: Scope = Depends(workspace_scope),
     principal: dict[str, Any] = Depends(resolve_caller),
+    session: AsyncSession = Depends(db),
 ) -> StreamingResponse:
-    """The same answer, delivered as it happens rather than when it is done.
+    """The same answer as ``/api/answer``, streamed as it is produced.
 
-    Most of the wait is spent READING — opening a section, looking at a page —
-    not writing, so the steps arriving live are worth more than the words are.
-    Both are sent, in the order they occur:
-
-        step    the agent opened, missed, looked at or was sent back
-        token   a fragment of prose as it is written
-        reset   discard the prose shown so far: that round was sent back and
-                its words are not the answer
-        done    the finished answer, its citations and its trace id
-
-    `done` carries the whole answer again rather than asking the client to
-    reassemble it from tokens. The tokens are a preview; the finished text has
-    been through citation resolution, which rewrites it — a client that kept
-    its own concatenation would show markers that were dropped as unresolvable.
+    Server-Sent Events: one ``data:`` line per step — the agent's reasoning as
+    it arrives (``thinking``), each ``tool_call`` and its ``tool_result``, and a
+    terminal ``done`` carrying exactly the payload the non-streaming route
+    returns. A caller that only wants the answer keeps using ``/api/answer``;
+    this exists to show the work. The trace is recorded once, at the end, under
+    the retrieval that produced it — identical to the blocking route.
     """
-    queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
-    loop = asyncio.get_running_loop()
+    cfg = RetrievalConfig(limit=limit, sources=tuple(sources or ()))
 
-    def push(event: dict[str, Any]) -> None:
-        # Both callbacks fire on a worker thread, because the provider client
-        # blocks. This is the hop back onto the loop.
-        loop.call_soon_threadsafe(queue.put_nowait, event)
+    async def events() -> AsyncIterator[str]:
+        queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
 
-    def on_step(step: Any) -> None:
-        push({"type": "step", "round": step.round, "action": step.action, "detail": step.detail})
-        # A round that is sent back had its prose streamed before anyone could
-        # know it would be rejected. Tell the client to drop what it showed.
-        if step.action == "sent back":
-            push({"type": "reset"})
+        async def emit(event: dict[str, Any]) -> None:
+            await queue.put(event)
 
-    async def run() -> None:
-        try:
-            async with Session() as session:
-                cfg = RetrievalConfig(limit=limit, sources=tuple(sources or ()))
-                result, trace = await answer(
-                    session,
-                    scope,
-                    q,
-                    cfg,
-                    mode=mode,
-                    on_step=on_step,
-                    on_token=lambda text: push({"type": "token", "text": text}),
-                )
+        async def run() -> None:
+            # The work runs as its own task and reports through the queue; this
+            # coroutine only drains it. They share the session, but only this
+            # one touches the database, so there is a single writer throughout.
+            try:
+                result, trace = await answer(session, scope, q, cfg, mode=mode, emit=emit)
                 await record(
                     session,
                     scope,
@@ -375,38 +358,42 @@ async def answer_streaming(
                 )
                 await session.commit()
                 tagged = await classes_for(session, scope, [h.item_id for h in result.hits])
-            await queue.put(
-                {
-                    "type": "done",
-                    **result.as_dict(),
-                    "results": [
-                        {**h.model_dump(), "classes": tagged.get(h.item_id, [])}
-                        for h in result.hits
-                    ],
-                }
-            )
-        except Exception as exc:  # noqa: BLE001 - the client is owed a reason
-            await queue.put({"type": "error", "detail": f"{type(exc).__name__}: {exc}"})
-        finally:
-            await queue.put(None)
+                await queue.put(
+                    {
+                        "type": "done",
+                        "answer": {
+                            **result.as_dict(),
+                            "results": [
+                                {**h.model_dump(), "classes": tagged.get(h.item_id, [])}
+                                for h in result.hits
+                            ],
+                        },
+                    }
+                )
+            except Exception as exc:
+                await queue.put({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
+            finally:
+                await queue.put(None)
 
-    async def events() -> Any:
         task = asyncio.create_task(run())
         try:
             while True:
                 event = await queue.get()
                 if event is None:
                     break
-                yield f"data: {json.dumps(event)}\n\n"
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
         finally:
-            # A reader who closes the tab should not leave the agent running.
-            if not task.done():
-                task.cancel()
+            await task
 
     return StreamingResponse(
         events(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        headers={
+            "Cache-Control": "no-cache",
+            # Tell nginx / any reverse proxy not to buffer — buffering an event
+            # stream defeats the point, turning it back into one late response.
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
@@ -482,6 +469,67 @@ async def catalogue(
             {**i.model_dump(), "classes": tagged.get(i.id, [])} for i in items
         ],
     }
+
+
+class ItemEditIn(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=500)
+    body: str | None = None
+    metadata: dict[str, Any] | None = None
+
+
+@app.patch("/api/items/{item_id}")
+async def update_item(
+    item_id: str,
+    payload: ItemEditIn,
+    scope: Scope = Depends(workspace_scope),
+    session: AsyncSession = Depends(db),
+    principal: dict[str, Any] = Depends(resolve_caller),
+) -> dict[str, Any]:
+    """Edit user-owned document information while keeping version history."""
+    if payload.title is None and payload.body is None and payload.metadata is None:
+        raise HTTPException(400, "Provide a title, document text, or metadata to update.")
+    try:
+        item, needs_embedding = await edit_item(
+            session,
+            scope,
+            item_id,
+            title=payload.title,
+            body=payload.body,
+            metadata=payload.metadata,
+        )
+    except LookupError:
+        raise HTTPException(404, "No such item.") from None
+
+    actor = str(principal.get("email") or principal.get("user_id") or "unknown")
+    await audit.record(
+        session,
+        scope.workspace_id,
+        actor,
+        "item.edited",
+        item_id,
+        {
+            "version": item.version,
+            "fields": [
+                name
+                for name, value in (
+                    ("title", payload.title),
+                    ("body", payload.body),
+                    ("metadata", payload.metadata),
+                )
+                if value is not None
+            ],
+        },
+    )
+    await session.commit()
+    if needs_embedding:
+        await app.state.queue.enqueue_job(
+            "embed_item", scope.workspace_id, scope.collection_id, item_id
+        )
+        await app.state.queue.enqueue_job(
+            "classify_new_item", scope.workspace_id, scope.collection_id, item_id, None
+        )
+    tagged = await classes_for(session, scope, [item.id])
+    return {**item.model_dump(), "classes": tagged.get(item.id, [])}
 
 
 @app.get("/api/facets")

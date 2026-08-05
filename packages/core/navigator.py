@@ -4,7 +4,7 @@ import asyncio
 import json
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -12,8 +12,12 @@ from sqlalchemy import text as sql
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core import tree
-from packages.core.search import Trace, new_trace_id
+from packages.core.search import RetrievalConfig, Trace, new_trace_id, search_traced
 from packages.shared.schema import Hit, Lifecycle, Passage, Scope, SourceRef
+
+# A progress sink: the navigator calls it with one event dict per step when a
+# caller wants to watch the loop work. Async so the sink can be an SSE queue.
+EmitFn = Callable[[dict[str, Any]], Awaitable[None]]
 
 # ---------------------------------------------------------------------------
 # THE NAVIGATOR — an agent that reads its way to an answer.
@@ -60,6 +64,10 @@ MAX_SECTION_CHARS = 4000
 # Looking at a page costs a second model call on a bigger model. Two is enough
 # to check a table and the page after it; more than that is the agent browsing.
 MAX_LOOKS = 2
+# How many passages a single hybrid_search call surfaces to the agent. Enough
+# to cover a figure that appears in two or three places, few enough that the
+# agent still reads rather than dumps.
+MAX_HYBRID_HITS = 4
 
 _SYSTEM = (
     "You answer questions from a document store by navigating it, like a person "
@@ -119,6 +127,42 @@ _LOOK_TOOL = {
                 },
             },
             "required": ["doc", "page", "looking_for"],
+        },
+    },
+}
+
+# Appended to the system prompt only in agentic mode, where the agent also has
+# hybrid_search. The catalogue tells it where structure lives; hybrid_search is
+# for what structure hides — a figure or identifier buried mid-section that no
+# heading advertises. It reasons over the outline first and reaches for search
+# when a title cannot tell it where a value is.
+_HYBRID_NOTE = (
+    "\n\nYou also have hybrid_search, which finds passages by meaning and by "
+    "exact wording across the whole store. Use the table of contents to reason "
+    "about where an answer lives, and hybrid_search when the answer is a "
+    "specific figure, name or identifier that no heading would announce. "
+    "Passages it returns are numbered exactly like sections you read, and you "
+    "cite them the same way."
+)
+
+_HYBRID_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "hybrid_search",
+        "description": (
+            "Find passages anywhere in the store by meaning and exact wording. "
+            "Best for a specific figure, name or identifier that no section "
+            "title would announce. Returns passages already numbered for citing."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "What to search for — a phrase, figure or identifier.",
+                }
+            },
+            "required": ["query"],
         },
     },
 }
@@ -497,24 +541,39 @@ async def navigate(
     question: str,
     on_step: Callable[[Step], None] | None = None,
     on_token: Callable[[str], None] | None = None,
+    hybrid: bool = False,
+    emit: EmitFn | None = None,
 ) -> tuple[Outcome, Trace]:
     """Let the model read its way to an answer, and record every step.
 
-    The two callbacks are for watching it happen rather than waiting for it.
-    Most of the time here is spent READING, not writing — opening a section,
-    looking at a page — so the steps arriving live are worth more than the
-    words arriving live, and both are offered.
+    The callbacks are for watching it happen rather than waiting for it. Most of
+    the time here is spent READING, not writing — opening a section, looking at
+    a page — so the steps arriving live are worth more than the words arriving
+    live, and both are offered.
 
-    ``on_token`` is called from a worker thread, because the provider client is
-    blocking. A caller that touches an event loop from it must hop back to the
-    loop itself; that is the caller's business and not something to hide here.
+    ``on_token``/``on_step`` are the synchronous callbacks, called from a worker
+    thread because the provider client is blocking; a caller that touches an
+    event loop from them must hop back to the loop itself. ``emit`` is the async
+    equivalent — one event dict per step, awaited so it can be an SSE queue —
+    and is what the streaming route uses.
+
+    With ``hybrid`` the same agent also gets a hybrid_search tool — it reasons
+    over each document's table of contents AND can fall back to embedding and
+    keyword search to locate a specific figure or identifier, then read the
+    section it lands in. This is the "agentic" retrieval mode: one loop, both
+    ways of finding evidence, the agent choosing per question. The outcome is
+    identical whether or not anyone was watching, which is why the unwatched
+    path still makes the identical blocking call the tests pin.
     """
     started = time.perf_counter()
     outcome = Outcome()
     trace = Trace(
         trace_id=new_trace_id(),
         query=question,
-        config={"retrieval": "vectorless", "max_rounds": MAX_ROUNDS},
+        config={
+            "retrieval": "agentic" if hybrid else "vectorless",
+            "max_rounds": MAX_ROUNDS,
+        },
         filters={"workspace_id": scope.workspace_id, "collection_id": scope.collection_id},
     )
 
@@ -534,10 +593,21 @@ async def navigate(
     outcome.documents_considered = len(documents)
     outcome.sections_available = sum(tree.count(t) for t in trees.values())
 
-    from packages.core.llm import chat_with_tools
+    if emit is not None:
+        await emit(
+            {
+                "type": "start",
+                "mode": "agentic" if hybrid else "vectorless",
+                "documents": outcome.documents_considered,
+                "sections": outcome.sections_available,
+            }
+        )
 
+    from packages.core.llm import astream_chat_with_tools, chat_with_tools
+
+    _system = _SYSTEM + _HYBRID_NOTE if hybrid else _SYSTEM
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": _SYSTEM},
+        {"role": "system", "content": _system},
         {
             "role": "user",
             "content": (
@@ -581,15 +651,40 @@ async def navigate(
     mark = time.perf_counter()
     for round_number in range(1, MAX_ROUNDS + 1):
         outcome.rounds = round_number
-        # Looking is offered only once reading has happened and only for a
+        # read_section, [hybrid_search], submit_answer — search sits between
+        # reading and answering because that is the order the agent uses them
+        # in. Looking is offered only once reading has happened and only for a
         # document that actually has pages. Before that the tool does not exist
         # as far as the model is concerned, which is a stronger guarantee than
         # telling it not to.
-        tools = _TOOLS
+        tools = [_TOOLS[0], _HYBRID_TOOL, _TOOLS[1]] if hybrid else list(_TOOLS)
         if looks < MAX_LOOKS and any(page_counts.values()):
-            tools = [*_TOOLS, _LOOK_TOOL]
+            tools = [*tools, _LOOK_TOOL]
         try:
-            if on_token is not None:
+            if emit is not None:
+                # Same turn, reported live: the model's reasoning is forwarded
+                # token by token as it arrives, and the reassembled tool calls
+                # come back in exactly the shape the blocking call returns.
+                reply = {"content": "", "tool_calls": []}
+                async for event in astream_chat_with_tools(
+                    messages, tools, temperature=0.0
+                ):
+                    if event["type"] == "text":
+                        await emit(
+                            {
+                                "type": "thinking",
+                                "delta": event["delta"],
+                                "round": round_number,
+                            }
+                        )
+                    elif event["type"] == "error":
+                        raise RuntimeError(event["error"])
+                    elif event["type"] == "done":
+                        reply = {
+                            "content": event["content"],
+                            "tool_calls": event["tool_calls"],
+                        }
+            elif on_token is not None:
                 reply = await asyncio.to_thread(_stream_round, messages, tools, on_token)
             else:
                 reply = await asyncio.to_thread(
@@ -598,6 +693,8 @@ async def navigate(
         except Exception as exc:
             outcome.degraded = f"navigation unavailable: {type(exc).__name__}"
             trace.degraded = outcome.degraded
+            if emit is not None:
+                await emit({"type": "degraded", "reason": outcome.degraded})
             break
 
         calls = reply.get("tool_calls") or []
@@ -700,6 +797,18 @@ async def navigate(
             except json.JSONDecodeError:
                 args = {}
 
+            # The decision itself, before it is carried out. submit_answer is
+            # reported as the answer instead, below, so it is not doubled here.
+            if emit is not None and call["name"] != "submit_answer":
+                await emit(
+                    {
+                        "type": "tool_call",
+                        "tool": call["name"],
+                        "args": args,
+                        "round": round_number,
+                    }
+                )
+
             if call["name"] == "submit_answer":
                 said_found = bool(args.get("found"))
 
@@ -796,6 +905,10 @@ async def navigate(
                 record(
                     Step(round_number, "answered", "found" if outcome.found else "not found")
                 )
+                if emit is not None:
+                    await emit(
+                        {"type": "answer", "text": outcome.answer, "found": outcome.found}
+                    )
                 finished = True
                 break
 
@@ -921,6 +1034,119 @@ async def navigate(
                 )
                 continue
 
+            if call["name"] == "hybrid_search" and hybrid:
+                found_query = str(args.get("query") or "").strip()
+                if not found_query:
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call["id"],
+                            "content": "Provide a non-empty query.",
+                        }
+                    )
+                    continue
+                # Real hybrid retrieval — embeddings + keyword, fused. Its own
+                # trace is discarded; the navigator's is the record. The best
+                # passages across the returned documents become citable reads,
+                # numbered in the same sequence as sections, so downstream sees
+                # one uniform shape however the evidence was found.
+                hybrid_hits, _ = await search_traced(
+                    session, scope, found_query, RetrievalConfig(limit=5)
+                )
+                pairs = [(p, h) for h in hybrid_hits for p in h.passages]
+                pairs.sort(key=lambda pr: pr[0].score, reverse=True)
+                surfaced: list[str] = []
+                surfaced_headings: list[str] = []
+                for passage, hit in pairs[:MAX_HYBRID_HITS]:
+                    key = (hit.item_id, passage.chunk_id)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    # A hybrid hit may point at a document outside the top-N
+                    # catalogue, so register its metadata for the final rollup.
+                    by_id.setdefault(
+                        hit.item_id,
+                        {
+                            "item_id": hit.item_id,
+                            "title": hit.title,
+                            "body": "",
+                            "source": hit.source.source,
+                            "locator": hit.source.locator,
+                            "url": hit.source.url,
+                        },
+                    )
+                    marker = len(read) + 1
+                    body = passage.text[:MAX_SECTION_CHARS]
+                    read.append(
+                        (
+                            Passage(
+                                chunk_id=passage.chunk_id,
+                                ordinal=marker - 1,
+                                heading=passage.heading,
+                                text=body,
+                                score=passage.score,
+                            ),
+                            hit.item_id,
+                        )
+                    )
+                    surfaced.append(
+                        f"[{marker}] {hit.title} > {passage.heading}\n\n{body}\n\n"
+                        f"(Cite this as [{marker}].)"
+                    )
+                    surfaced_headings.append(passage.heading or hit.title)
+                    record(
+                        Step(round_number, "searched", f"{passage.heading[:50]} → [{marker}]")
+                    )
+                if surfaced:
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call["id"],
+                            "content": "\n\n".join(surfaced),
+                        }
+                    )
+                    if emit is not None:
+                        await emit(
+                            {
+                                "type": "tool_result",
+                                "tool": "hybrid_search",
+                                "ok": True,
+                                "count": len(surfaced),
+                                "headings": surfaced_headings,
+                            }
+                        )
+                    if len(read) >= MAX_READS:
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": "That is enough reading. Answer now with submit_answer.",
+                            }
+                        )
+                else:
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call["id"],
+                            "content": (
+                                f"hybrid_search for {found_query!r} surfaced nothing new. "
+                                "Try different wording, or answer from what you have."
+                            ),
+                        }
+                    )
+                    record(
+                        Step(round_number, "searched", f"{found_query[:50]} → nothing")
+                    )
+                    if emit is not None:
+                        await emit(
+                            {
+                                "type": "tool_result",
+                                "tool": "hybrid_search",
+                                "ok": False,
+                                "count": 0,
+                            }
+                        )
+                continue
+
             if call["name"] != "read_section":
                 messages.append(
                     {
@@ -955,6 +1181,15 @@ async def navigate(
                     }
                 )
                 record(Step(round_number, "missed", node_id))
+                if emit is not None:
+                    await emit(
+                        {
+                            "type": "tool_result",
+                            "tool": "read_section",
+                            "ok": False,
+                            "detail": f"no section {node_id!r}",
+                        }
+                    )
                 continue
 
             node = nodes[0]
@@ -966,6 +1201,15 @@ async def navigate(
                         "content": "Already read. Read a different section, or answer.",
                     }
                 )
+                if emit is not None:
+                    await emit(
+                        {
+                            "type": "tool_result",
+                            "tool": "read_section",
+                            "ok": False,
+                            "detail": "already read",
+                        }
+                    )
                 continue
             seen.add((doc_id, node_id))
 
@@ -999,6 +1243,17 @@ async def navigate(
                 )
             )
             record(Step(round_number, "read", f"{node.title[:60]} → [{marker}]"))
+            if emit is not None:
+                await emit(
+                    {
+                        "type": "tool_result",
+                        "tool": "read_section",
+                        "ok": True,
+                        "heading": node.title,
+                        "title": by_id[doc_id]["title"],
+                        "marker": marker,
+                    }
+                )
             if _is_a_picture(by_id[doc_id]):
                 read_a_picture = True
 
@@ -1088,6 +1343,8 @@ async def navigate(
     trace.fused = [
         {
             "item_id": doc_id,
+            # Name the document, not its id — a trace of bare hashes is unreadable.
+            "title": by_id[doc_id]["title"],
             "chunk_id": p.chunk_id,
             "heading": p.heading,
             "score": p.score,

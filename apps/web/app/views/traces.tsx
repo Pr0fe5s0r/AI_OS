@@ -258,8 +258,13 @@ export function Traces({ active }: { active: string | null }) {
 function TracePanel({ trace, onClose }: { trace: TraceDetail; onClose: () => void }) {
   const timings = Object.entries(trace.timings_ms).filter(([k]) => k !== "total");
   const total = trace.timings_ms.total || 1;
+  // Agentic runs the navigator loop too, so its trace is a decision path, not
+  // a candidate list — render it the same way, not as a fusion table.
   const navigation =
-    trace.retrieval === "vectorless" || trace.config.retrieval === "vectorless";
+    trace.retrieval === "vectorless" ||
+    trace.retrieval === "agentic" ||
+    trace.config.retrieval === "vectorless" ||
+    trace.config.retrieval === "agentic";
   const steps = trace.semantic.filter(isNavigationStep);
 
   useEffect(() => {
@@ -413,9 +418,12 @@ function NavigationTrace({
                 className="grid gap-1 border-b border-edge/70 px-3 py-2.5 last:border-0 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center"
               >
                 <div className="min-w-0">
-                  <p className="truncate text-xs text-ink">
-                    {candidate.heading || "Untitled section"}
+                  <p className="truncate text-xs text-ink" title={candidate.title || undefined}>
+                    {candidate.title || candidate.heading || "Untitled section"}
                   </p>
+                  {candidate.heading && candidate.title && (
+                    <p className="truncate text-2xs text-muted">{candidate.heading}</p>
+                  )}
                   <Mono className="mt-0.5 block truncate text-2xs text-subtle">
                     {candidate.item_id} · {candidate.chunk_id || "section id unavailable"}
                   </Mono>
@@ -486,10 +494,14 @@ function HybridTrace({ trace }: { trace: TraceDetail }) {
                     )}
                   >
                     <td className="max-w-[17rem] py-2 pl-3 pr-3">
-                      <p className="truncate text-2xs text-muted">
-                        {candidate.heading || candidate.item_id}
+                      <p className="truncate text-2xs text-ink" title={candidate.title || undefined}>
+                        {candidate.title || candidate.heading || "Untitled document"}
                       </p>
+                      {candidate.heading && candidate.title && (
+                        <p className="truncate text-[10px] text-muted">{candidate.heading}</p>
+                      )}
                       <Mono className="block truncate text-[10px] text-subtle">
+                        {candidate.source ? `${candidate.source} · ` : ""}
                         {candidate.item_id}
                       </Mono>
                       {!candidate.kept && (
@@ -566,6 +578,7 @@ function isSemanticCandidate(
 
 function navigationTone(action: string): string {
   if (action === "read") return "border-accent/30 bg-accent/10 text-accentSoft";
+  if (action === "searched") return "border-heat-2/30 bg-heat-2/10 text-heat-2";
   if (action === "answered") return "border-success/30 bg-success/10 text-success";
   if (action === "missed") return "border-warn/30 bg-warn/10 text-warn";
   return "border-edgeStrong bg-elevated text-muted";

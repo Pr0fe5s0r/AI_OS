@@ -5,6 +5,12 @@ import * as api from "../api";
 import { Point, cx, ms } from "../data";
 import { Card, Chip, HeatLegend, Label, Mono, ScoreBar, VectorField } from "../ui/kit";
 
+const STARTER_QUESTIONS = [
+  "Summarize the main topics in this collection",
+  "Which documents discuss a specific topic?",
+  "Compare what the sources say about a topic",
+];
+
 /** Query & chat.
  *
  *  Asks the store a question, writes an answer from what it found, and shows
@@ -21,7 +27,6 @@ type Turn = {
   mode: api.AskMode;
   answer: string;
   citations: api.Citation[];
-  steps: api.Step[];
   grounded: boolean;
   matches: Point[];
   tookMs: number;
@@ -70,60 +75,81 @@ function renderAnswer(
   return out;
 }
 
-/** The route the agent took, folded away until asked for.
- *
- *  Vectorless answers a question by opening sections one at a time, and until
- *  now the only evidence of that was a trace id — a receipt number. The steps
- *  were always recorded; they were just never shown. A reader deciding whether
- *  to believe an answer wants to know it looked in two places and not one, and
- *  that a section it reached for did not exist.
- *
- *  Collapsed by default because it is reassurance, not content: the answer and
- *  its citations are what you came for. */
-function Trail({ steps }: { steps: api.Step[] }) {
-  if (steps.length === 0) return null;
-  const reads = steps.filter((s) => s.action === "read").length;
+/** One line in the live activity trail while an answer is being produced. */
+type Activity = { kind: "status" | "tool"; text: string; ok?: boolean };
 
-  return (
-    <details className="mb-2 pl-8 group">
-      <summary className="inline-flex cursor-pointer list-none items-center gap-1.5 font-mono text-2xs text-subtle transition hover:text-muted">
-        <span className="transition group-open:rotate-90">▸</span>
-        how it searched · {steps.length} step{steps.length === 1 ? "" : "s"}
-        {reads > 0 && ` · ${reads} read`}
-      </summary>
-      <ol className="mt-1.5 space-y-1 border-l border-edge pl-3">
-        {steps.map((s, i) => (
-          <li key={i} className="flex items-baseline gap-2 font-mono text-2xs">
-            <span className="w-3 shrink-0 text-right text-subtle">{s.round}</span>
-            <span
-              className={cx(
-                "w-14 shrink-0",
-                // A miss is not a failure to hide. An agent that reached for a
-                // section id that was not there, then found the right one, is
-                // telling you something true about the document's shape.
-                s.action === "read"
-                  ? "text-accentSoft"
-                  : // A look is the escalation: the text was there and unusable,
-                    // so it read the page picture instead. Worth its own colour,
-                    // because "this number came off a picture" is a different
-                    // claim from "this number came out of the text".
-                    s.action === "looked"
-                    ? "text-warn"
-                    : s.action === "missed"
-                      ? "text-hot"
-                      : "text-muted"
-              )}
-            >
-              {s.action}
-            </span>
-            <span className="min-w-0 flex-1 truncate text-subtle" title={s.detail}>
-              {s.detail}
-            </span>
-          </li>
-        ))}
-      </ol>
-    </details>
-  );
+/** Everything the current in-flight turn has reported so far. */
+type Live = { activity: Activity[]; reasoning: string; draft: string };
+
+const EMPTY_LIVE: Live = { activity: [], reasoning: "", draft: "" };
+
+function describeCall(event: Extract<api.StreamEvent, { type: "tool_call" }>): string {
+  if (event.tool === "read_section") return `Reading section ${event.args.section ?? ""}`.trim();
+  if (event.tool === "hybrid_search") return `Searching “${event.args.query ?? ""}”`;
+  return `Calling ${event.tool}`;
+}
+
+function describeResult(event: Extract<api.StreamEvent, { type: "tool_result" }>): string {
+  if (event.tool === "read_section") {
+    if (!event.ok) return event.detail || "section not found";
+    const where = event.title ? `${event.title} › ${event.heading}` : event.heading || "";
+    return `${where} [${event.marker}]`;
+  }
+  if (event.tool === "hybrid_search") {
+    if (!event.ok) return "nothing new";
+    const heads = event.headings?.length ? `: ${event.headings.join(", ")}` : "";
+    return `found ${event.count} passage${event.count === 1 ? "" : "s"}${heads}`;
+  }
+  return "";
+}
+
+/** Fold one streamed event into the running live state. Pure, so the reducer
+ *  reads as the event schema does and the render stays a plain projection. */
+function reduceLive(cur: Live, event: api.StreamEvent): Live {
+  switch (event.type) {
+    case "start":
+      return {
+        ...cur,
+        activity: [
+          ...cur.activity,
+          {
+            kind: "status",
+            text:
+              event.mode === "hybrid"
+                ? "Searching passages…"
+                : `Reading ${event.documents ?? 0} document${event.documents === 1 ? "" : "s"} · ${event.sections ?? 0} sections`,
+          },
+        ],
+      };
+    case "retrieved":
+      return {
+        ...cur,
+        activity: [
+          ...cur.activity,
+          {
+            kind: "status",
+            text: `${event.documents} document${event.documents === 1 ? "" : "s"}, ${event.passages} passage${event.passages === 1 ? "" : "s"}`,
+          },
+        ],
+      };
+    case "thinking":
+      return { ...cur, reasoning: cur.reasoning + event.delta };
+    case "tool_call":
+      return { ...cur, activity: [...cur.activity, { kind: "tool", text: describeCall(event) }] };
+    case "tool_result":
+      return {
+        ...cur,
+        activity: [...cur.activity, { kind: "tool", ok: event.ok, text: describeResult(event) }],
+      };
+    case "token":
+      return { ...cur, draft: cur.draft + event.delta };
+    case "answer":
+      return { ...cur, draft: event.text };
+    case "degraded":
+      return { ...cur, activity: [...cur.activity, { kind: "status", text: event.reason }] };
+    default:
+      return cur;
+  }
 }
 
 export function Query({ active }: { active: string | null }) {
@@ -133,39 +159,31 @@ export function Query({ active }: { active: string | null }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [focus, setFocus] = useState<api.Citation | null>(null);
+  // The in-flight turn's live trail, and the question that started it — shown
+  // while the answer is produced, cleared when it lands as a finished turn.
+  const [live, setLive] = useState<Live | null>(null);
+  const [pending, setPending] = useState<string | null>(null);
   // Remembered rather than reset every visit: a retrieval preference is a
   // standing choice about how you want the store to work, not a per-question
   // one. Vectorless is the default until someone says otherwise.
   const [mode, setMode] = useState<api.AskMode>("vectorless");
-  // How the answer arrives. Remembered like the retrieval choice: watching the
-  // work happen or waiting for the finished piece is a standing preference,
-  // not a per-question one.
-  const [delivery, setDelivery] = useState<api.Delivery>("stream");
-  // What has arrived so far on a streaming answer, shown until the finished
-  // one replaces it.
-  const [live, setLive] = useState<{ text: string; steps: api.Step[] } | null>(null);
 
   useEffect(() => {
     const saved = localStorage.getItem("retrieval-mode");
-    if (saved === "hybrid" || saved === "vectorless") setMode(saved);
-    const how = localStorage.getItem("answer-delivery");
-    if (how === "stream" || how === "complete") setDelivery(how);
+    if (saved === "hybrid" || saved === "vectorless" || saved === "agentic") setMode(saved);
   }, []);
-
-  function chooseDelivery(next: api.Delivery) {
-    setDelivery(next);
-    localStorage.setItem("answer-delivery", next);
-  }
 
   function choose(next: api.AskMode) {
     setMode(next);
     localStorage.setItem("retrieval-mode", next);
   }
+  // The most recent turn, for the retrieval-space aside on the right.
+  const latest = turns[turns.length - 1];
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [turns, busy]);
+  }, [turns, busy, live]);
 
   async function ask(text?: string) {
     const q = (text ?? question).trim();
@@ -173,29 +191,14 @@ export function Query({ active }: { active: string | null }) {
     setBusy(true);
     setError(null);
     setQuestion("");
+    setPending(q);
+    setLive(EMPTY_LIVE);
     try {
-      const out =
-        delivery === "stream"
-          ? await api.askStreaming(collectionId, q, 8, mode, (event) => {
-              setLive((current) => {
-                const now = current ?? { text: "", steps: [] };
-                if (event.type === "token") return { ...now, text: now.text + event.text };
-                if (event.type === "step")
-                  return {
-                    ...now,
-                    steps: [
-                      ...now.steps,
-                      { round: event.round, action: event.action, detail: event.detail },
-                    ],
-                  };
-                // A round that got sent back: the words it produced were
-                // streamed before anyone could know they were not the answer.
-                if (event.type === "reset") return { ...now, text: "" };
-                return now;
-              });
-            })
-          : await api.ask(collectionId, q, 8, mode);
-      setLive(null);
+      // Streamed: every step lands in `live` as it happens, and the resolved
+      // outcome is the same shape the non-streaming ask returned.
+      const out = await api.askStream(collectionId, q, 8, mode, (event) =>
+        setLive((cur) => reduceLive(cur ?? EMPTY_LIVE, event))
+      );
       setTurns((t) => [
         ...t,
         {
@@ -203,7 +206,6 @@ export function Query({ active }: { active: string | null }) {
           mode: out.mode,
           answer: out.answer,
           citations: out.citations,
-          steps: out.steps,
           grounded: out.grounded,
           matches: out.matches,
           tookMs: out.tookMs,
@@ -214,36 +216,38 @@ export function Query({ active }: { active: string | null }) {
     } catch (e) {
       setError((e as Error).message);
     } finally {
-      setLive(null);
       setBusy(false);
+      setLive(null);
+      setPending(null);
     }
   }
-
-  const latest = turns[turns.length - 1];
 
   return (
     <div className="relative flex h-full min-h-0">
       <div className="flex min-w-0 flex-1 flex-col">
-        {/* Three control groups now, and on a narrow pane they squeezed the
-            title into three wrapped lines. The controls wrap instead. */}
-        <header className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 border-b border-edge px-6 py-3">
-          <h1 className="shrink-0 whitespace-nowrap text-sm font-semibold text-ink">
-            Query &amp; chat
-          </h1>
-          <div className="ml-auto flex flex-wrap items-center gap-x-3 gap-y-2">
+        <header className="flex shrink-0 flex-wrap items-center gap-3 border-b border-edge px-6 py-3">
+          <div>
+            <h1 className="text-base font-semibold text-ink">Query &amp; chat</h1>
+            <p className="mt-0.5 text-2xs text-subtle">
+              Answers stay linked to the passages they came from.
+            </p>
+          </div>
+          <div className="ml-auto flex items-center gap-3">
             {/* Two ways of finding the evidence. Neither is strictly better,
                 so it is a choice rather than a setting with a right answer. */}
             <div className="flex items-center gap-1.5">
               <Label>retrieval</Label>
               <div className="flex gap-1 rounded-lg border border-edge bg-elevated p-0.5">
-                {(["vectorless", "hybrid"] as const).map((m) => (
+                {(["vectorless", "hybrid", "agentic"] as const).map((m) => (
                   <button
                     key={m}
                     onClick={() => choose(m)}
                     title={
                       m === "hybrid"
                         ? "Match passages by meaning and by wording, then fuse. Better at finding a specific figure or identifier anywhere in a collection."
-                        : "Read each document's table of contents and reason about which sections answer the question. No embeddings. Better on long structured documents. (default)"
+                        : m === "agentic"
+                          ? "One agent with both: it reasons over the tables of contents and runs hybrid search to locate a figure or identifier no heading advertises, then reads that section. Best on mixed questions over structured documents."
+                          : "Read each document's table of contents and reason about which sections answer the question. No embeddings. Better on long structured documents. (default)"
                     }
                     className={cx(
                       "rounded-md px-2.5 py-1 font-mono text-2xs transition",
@@ -255,53 +259,40 @@ export function Query({ active }: { active: string | null }) {
                 ))}
               </div>
             </div>
-            {/* How the answer arrives. Same answer either way — this is only
-                about whether you watch it being worked out. */}
-            <div className="flex items-center gap-1.5">
-              <Label>answer</Label>
-              <div className="flex gap-1 rounded-lg border border-edge bg-elevated p-0.5">
-                {(["stream", "complete"] as const).map((how) => (
-                  <button
-                    key={how}
-                    onClick={() => chooseDelivery(how)}
-                    title={
-                      how === "stream"
-                        ? "Show the work as it happens: each section opened or page looked at, then the words as they are written."
-                        : "Wait, and deliver the finished answer in one piece."
-                    }
-                    className={cx(
-                      "rounded-md px-2.5 py-1 font-mono text-2xs transition",
-                      delivery === how ? "bg-accent/15 text-ink" : "text-subtle hover:text-muted"
-                    )}
-                  >
-                    {how}
-                  </button>
-                ))}
-              </div>
-            </div>
-            <Label>scope</Label>
-            <Chip tone={collectionId ? "text-accentSoft border-accent/40 bg-accent/10" : undefined}>
-              {collectionId || "all collections"}
-            </Chip>
           </div>
         </header>
 
         <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5">
           {turns.length === 0 && !busy && (
-            <div className="mx-auto max-w-lg py-16 text-center">
-              <h2 className="text-sm text-ink">Ask your data a question</h2>
-              <p className="mt-2 text-xs leading-relaxed text-subtle">
-                <span className="text-muted">hybrid</span> matches passages by meaning and
-                by exact wording together. <span className="text-muted">vectorless</span>{" "}
-                reads each document&rsquo;s table of contents and reasons about which sections
-                answer you — no embeddings at all. Either way the answer is written only from
-                what came back, every claim carries a number you can click to see the passage
-                behind it, and an answer with nothing behind it is labelled as such.
+            <div className="mx-auto flex min-h-[55vh] max-w-2xl flex-col items-center justify-center py-16 text-center">
+              <span className="flex h-10 w-10 items-center justify-center rounded-xl border border-accent/30 bg-accent/10 text-lg text-accentSoft">
+                ?
+              </span>
+              <h2 className="mt-4 text-lg font-semibold text-ink">Ask your collection</h2>
+              <p className="mt-2 max-w-md text-sm leading-relaxed text-muted">
+                {mode === "vectorless"
+                  ? "Reads document structure to find relevant sections without embeddings."
+                  : mode === "agentic"
+                    ? "Navigates document structure and searches passages when the answer needs both."
+                    : "Combines semantic meaning with exact wording to find relevant passages."}{" "}
+                Every answer includes evidence you can open and verify.
               </p>
+              <div className="mt-6 grid w-full gap-2 sm:grid-cols-3">
+                {STARTER_QUESTIONS.map((starter) => (
+                  <button
+                    key={starter}
+                    type="button"
+                    onClick={() => setQuestion(starter)}
+                    className="rounded-xl border border-edge bg-elevated/50 px-3 py-3 text-left text-xs leading-relaxed text-muted transition hover:border-accent/40 hover:bg-accent/5 hover:text-ink"
+                  >
+                    {starter}
+                  </button>
+                ))}
+              </div>
             </div>
           )}
 
-          <div className="mx-auto max-w-2xl space-y-6">
+          <div className="mx-auto max-w-3xl space-y-6">
             {turns.map((t, i) => (
               <div key={i} className="animate-rise">
                 <div className="mb-3 flex items-start gap-2.5">
@@ -310,11 +301,6 @@ export function Query({ active }: { active: string | null }) {
                   </span>
                   <p className="text-sm text-ink">{t.question}</p>
                 </div>
-
-                {/* Above the answer, not below it: it is the order the work
-                    happened in, and it reads as "here is what I did, here is
-                    what I found". */}
-                <Trail steps={t.steps} />
 
                 {/* The answer. Its citations are the whole point: a claim you
                     cannot follow back to a passage is one this store has no
@@ -347,21 +333,9 @@ export function Query({ active }: { active: string | null }) {
                               key={c.chunk_id}
                               onClick={() => setFocus(c)}
                               title={c.text.slice(0, 300)}
-                              className={cx(
-                                "max-w-[15rem] truncate rounded-md border px-2 py-0.5 font-mono text-2xs transition",
-                                // A citation read off a page carries its own
-                                // mark. Which kind of evidence you are about to
-                                // open is worth knowing BEFORE you open it —
-                                // and it means a citation with no picture reads
-                                // as "this came from text", not as a thumbnail
-                                // that failed to load.
-                                c.page
-                                  ? "border-warn/40 bg-warn/10 text-warn hover:border-warn/70"
-                                  : "border-accent/30 bg-accent/10 text-accentSoft hover:border-accent/60"
-                              )}
+                              className="max-w-[15rem] truncate rounded-md border border-accent/30 bg-accent/10 px-2 py-0.5 font-mono text-2xs text-accentSoft transition hover:border-accent/60"
                             >
-                              [{c.marker}] {c.page ? "▣ " : ""}
-                              {c.heading || c.title}
+                              [{c.marker}] {c.heading || c.title}
                             </button>
                           ))}
                         </div>
@@ -402,9 +376,9 @@ export function Query({ active }: { active: string | null }) {
                         reads a table of contents. Saying the wrong thing about
                         how an answer was reached is a small lie in the one
                         place this store claims to be honest. */}
-                    {t.mode === "vectorless"
-                      ? "No section of these documents looked relevant. The trace records the structure it considered."
-                      : "Nothing in this collection matched. The trace records what each arm looked at."}
+                    {t.mode === "hybrid"
+                      ? "Nothing in this collection matched. The trace records what each arm looked at."
+                      : "No section of these documents looked relevant. The trace records the structure it considered."}
                   </p>
                 ) : (
                   <div className="space-y-2 pl-8">
@@ -481,56 +455,59 @@ export function Query({ active }: { active: string | null }) {
 
             {busy && (
               <div className="animate-rise">
-                {/* Streaming: the steps as they land, then the prose. This is
-                    the same trail the finished answer keeps, shown open while
-                    it is still being written — watching it read is the part
-                    worth watching, since most of the wait is reading. */}
-                {live && live.steps.length > 0 && (
-                  <ol className="mb-2 space-y-1 border-l border-edge pl-3 ml-8">
-                    {live.steps.map((s, i) => (
-                      <li key={i} className="flex items-baseline gap-2 font-mono text-2xs">
-                        <span className="w-3 shrink-0 text-right text-subtle">{s.round}</span>
-                        <span
-                          className={cx(
-                            "w-14 shrink-0",
-                            s.action === "read"
-                              ? "text-accentSoft"
-                              : s.action === "looked"
-                                ? "text-warn"
-                                : s.action === "missed"
-                                  ? "text-hot"
-                                  : "text-muted"
-                          )}
-                        >
-                          {s.action}
-                        </span>
-                        <span className="min-w-0 flex-1 truncate text-subtle">{s.detail}</span>
-                      </li>
-                    ))}
-                  </ol>
-                )}
-
-                {live && live.text && (
-                  <div className="mb-2 pl-8">
-                    <div className="rounded-xl border border-edge bg-elevated/50 p-4">
-                      <p className="whitespace-pre-wrap text-sm leading-relaxed text-ink">
-                        {live.text}
-                        {/* The markers are not clickable yet: they only resolve
-                            once the finished answer has been through citation
-                            resolution, and a marker that does nothing when
-                            clicked is worse than one that is plainly still
-                            being written. */}
-                        <span className="ml-0.5 inline-block h-3.5 w-1.5 animate-pulse bg-accent align-middle" />
-                      </p>
-                    </div>
+                {pending && (
+                  <div className="mb-3 flex items-start gap-2.5">
+                    <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md bg-accent/20 font-mono text-2xs text-accentSoft">
+                      ?
+                    </span>
+                    <p className="text-sm text-ink">{pending}</p>
                   </div>
                 )}
+                <div className="pl-8">
+                  <div className="rounded-xl border border-edge bg-elevated/40 p-3.5">
+                    <div className="mb-2 flex items-center gap-2 font-mono text-2xs text-subtle">
+                      <span className="h-3 w-3 animate-spin rounded-full border-2 border-edgeStrong border-t-accent" />
+                      {mode === "vectorless"
+                        ? "reading document structure…"
+                        : mode === "agentic"
+                          ? "navigating structure and searching…"
+                          : "embedding and searching…"}
+                    </div>
 
-                <div className="flex items-center gap-2 pl-8 font-mono text-2xs text-subtle">
-                  <span className="h-3 w-3 animate-spin rounded-full border-2 border-edgeStrong border-t-accent" />
-                  {live?.steps.length
-                    ? `${live.steps[live.steps.length - 1].action}…`
-                    : "searching…"}
+                    {live && live.activity.length > 0 && (
+                      <ol className="space-y-1 border-l border-edge pl-3">
+                        {live.activity.map((step, i) => (
+                          <li
+                            key={i}
+                            className={cx(
+                              "font-mono text-2xs leading-relaxed",
+                              step.kind === "status"
+                                ? "text-subtle"
+                                : step.ok === false
+                                  ? "text-warn"
+                                  : "text-accentSoft"
+                            )}
+                          >
+                            {step.kind === "tool" ? "› " : ""}
+                            {step.text}
+                          </li>
+                        ))}
+                      </ol>
+                    )}
+
+                    {live?.reasoning && (
+                      <p className="mt-2 line-clamp-3 whitespace-pre-wrap text-2xs italic leading-relaxed text-subtle">
+                        {live.reasoning}
+                      </p>
+                    )}
+
+                    {live?.draft && (
+                      <p className="mt-2.5 whitespace-pre-wrap border-t border-edge pt-2.5 text-sm leading-relaxed text-ink">
+                        {live.draft}
+                        <span className="ml-0.5 inline-block h-3.5 w-1.5 animate-pulse bg-accent/60 align-middle" />
+                      </p>
+                    )}
+                  </div>
                 </div>
               </div>
             )}
@@ -543,30 +520,45 @@ export function Query({ active }: { active: string | null }) {
           </div>
         </div>
 
-        <div className="shrink-0 border-t border-edge px-6 py-3">
+        <div className="shrink-0 border-t border-edge bg-canvas/95 px-6 py-3 backdrop-blur">
           <form
             onSubmit={(e) => {
               e.preventDefault();
               ask();
             }}
-            className="mx-auto flex max-w-2xl gap-2"
+            className="mx-auto max-w-3xl"
           >
-            <input
-              autoFocus
-              value={question}
-              onChange={(e) => setQuestion(e.target.value)}
-              placeholder={
-                collectionId ? `Ask ${collectionId} anything…` : "Ask across all collections…"
-              }
-              className="flex-1 rounded-lg border border-edge bg-canvas px-3.5 py-2.5 text-sm text-ink outline-none transition placeholder:text-subtle focus:border-accent/60"
-            />
-            <button
-              type="submit"
-              disabled={busy || !question.trim()}
-              className="rounded-lg border border-accent bg-accent px-4 text-xs font-semibold text-canvas transition hover:bg-accentSoft disabled:opacity-40"
-            >
-              Ask
-            </button>
+            <div className="flex items-end gap-2 rounded-xl border border-edge bg-elevated/40 p-2 transition focus-within:border-accent/60">
+              <textarea
+                autoFocus
+                rows={1}
+                value={question}
+                onChange={(e) => setQuestion(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    ask();
+                  }
+                }}
+                placeholder={
+                  collectionId ? `Ask ${collectionId} anything…` : "Ask across all collections…"
+                }
+                className="max-h-36 min-h-10 flex-1 resize-none bg-transparent px-2 py-2 text-sm leading-relaxed text-ink outline-none [field-sizing:content] placeholder:text-subtle"
+              />
+              <button
+                type="submit"
+                disabled={busy || !question.trim()}
+                className="h-10 rounded-lg border border-accent bg-accent px-4 text-xs font-semibold text-canvas transition hover:bg-accentSoft disabled:cursor-not-allowed disabled:border-edge disabled:bg-edge disabled:text-subtle"
+              >
+                Ask
+              </button>
+            </div>
+            <div className="mt-1.5 flex flex-col gap-0.5 px-1 font-mono text-2xs text-subtle sm:flex-row sm:items-center sm:justify-between">
+              <span>
+                {mode === "vectorless" ? "Vectorless" : mode === "agentic" ? "Agentic" : "Hybrid"} retrieval · citations included
+              </span>
+              <span>Enter to ask · Shift + Enter for a new line</span>
+            </div>
           </form>
         </div>
 
@@ -575,7 +567,7 @@ export function Query({ active }: { active: string | null }) {
             reachable without leaving the answer. */}
         {focus && (
           <div className="absolute inset-x-0 bottom-0 z-10 border-t border-edgeStrong bg-raised/97 backdrop-blur">
-            <div className="mx-auto max-w-2xl px-6 py-4">
+            <div className="mx-auto max-w-3xl px-6 py-4">
               <div className="mb-2 flex items-start justify-between gap-3">
                 <div className="min-w-0">
                   <div className="truncate text-xs font-medium text-ink">{focus.title}</div>

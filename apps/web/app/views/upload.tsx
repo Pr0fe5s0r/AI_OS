@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as api from "../api";
 import { Collection, Document, ago, bytes, cx } from "../data";
 import { Button, Card, Chip, Empty, Label, Mono } from "../ui/kit";
@@ -46,6 +46,9 @@ export function Upload({
   // read — its text and the passages it was split into.
   const [library, setLibrary] = useState<Document[] | null>(null);
   const [openDoc, setOpenDoc] = useState<Document | null>(null);
+  const [search, setSearch] = useState("");
+  const [sourceFilter, setSourceFilter] = useState("all");
+  const [sort, setSort] = useState<"newest" | "oldest" | "title">("newest");
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -199,6 +202,28 @@ export function Upload({
     }
   }
 
+  const visibleDocuments = useMemo(() => {
+    const needle = search.trim().toLowerCase();
+    const next = (library ?? []).filter((doc) => {
+      const matchesSource = sourceFilter === "all" || doc.source === sourceFilter;
+      const haystack = [doc.title, doc.locator, doc.source, ...doc.categories.map((c) => c.name)]
+        .join(" ")
+        .toLowerCase();
+      return matchesSource && (!needle || haystack.includes(needle));
+    });
+    return [...next].sort((a, b) => {
+      if (sort === "title") return a.title.localeCompare(b.title);
+      const left = a.createdAt ? Date.parse(a.createdAt) : 0;
+      const right = b.createdAt ? Date.parse(b.createdAt) : 0;
+      return sort === "oldest" ? left - right : right - left;
+    });
+  }, [library, search, sourceFilter, sort]);
+
+  const sources = useMemo(
+    () => [...new Set((library ?? []).map((doc) => doc.source).filter(Boolean))].sort(),
+    [library]
+  );
+
   return (
     <div
       className="px-6 py-6"
@@ -350,21 +375,45 @@ export function Upload({
 
       {collectionId && (
         <div className="mt-6">
-          <div className="mb-2 flex items-center justify-between">
-            <Label>
-              in this collection
-              {library && library.length > 0 && (
-                <span className="ml-2 normal-case tracking-normal text-subtle">
-                  {library.length} document{library.length === 1 ? "" : "s"}
-                </span>
-              )}
-            </Label>
+          <div className="mb-3 flex items-start justify-between gap-3">
+            <div>
+              <h2 className="text-base font-semibold text-ink">Documents</h2>
+              <p className="mt-0.5 text-xs text-muted">
+                {library?.length ?? 0} document{library?.length === 1 ? "" : "s"} in this collection
+              </p>
+            </div>
             <button
               onClick={loadLibrary}
               className="font-mono text-2xs text-subtle transition hover:text-ink"
             >
-              refresh
+              Refresh
             </button>
+          </div>
+
+          <div className="mb-3 grid gap-2 md:grid-cols-[minmax(16rem,1fr)_11rem_11rem]">
+            <input
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder="Search by title, file, source, or category"
+              className="rounded-lg border border-edge bg-canvas px-3 py-2.5 text-xs text-ink outline-none transition placeholder:text-subtle focus:border-accent/60"
+            />
+            <select
+              value={sourceFilter}
+              onChange={(event) => setSourceFilter(event.target.value)}
+              className="rounded-lg border border-edge bg-canvas px-3 py-2.5 text-xs text-muted outline-none focus:border-accent/60"
+            >
+              <option value="all">All sources</option>
+              {sources.map((source) => <option key={source} value={source}>{source}</option>)}
+            </select>
+            <select
+              value={sort}
+              onChange={(event) => setSort(event.target.value as typeof sort)}
+              className="rounded-lg border border-edge bg-canvas px-3 py-2.5 text-xs text-muted outline-none focus:border-accent/60"
+            >
+              <option value="newest">Newest first</option>
+              <option value="oldest">Oldest first</option>
+              <option value="title">Title A–Z</option>
+            </select>
           </div>
 
           {library === null ? (
@@ -374,9 +423,11 @@ export function Upload({
               title="Nothing uploaded yet"
               hint="Drop a file or paste text above. Once it is indexed it shows here, and you can open it to read the text and the passages it was split into."
             />
+          ) : visibleDocuments.length === 0 ? (
+            <Empty title="No matching documents" hint="Try a broader search or clear the source filter." />
           ) : (
             <Card className="divide-y divide-edge/60">
-              {library.map((d) => (
+              {visibleDocuments.map((d) => (
                 <button
                   key={d.id}
                   onClick={() => setOpenDoc(d)}
@@ -414,7 +465,15 @@ export function Upload({
       )}
 
       {openDoc && (
-        <DocPanel doc={openDoc} collectionId={collectionId} onClose={() => setOpenDoc(null)} />
+        <DocPanel
+          doc={openDoc}
+          collectionId={collectionId}
+          onClose={() => setOpenDoc(null)}
+          onSaved={(updated) => {
+            setOpenDoc(updated);
+            setLibrary((current) => current?.map((doc) => doc.id === updated.id ? updated : doc) ?? null);
+          }}
+        />
       )}
     </div>
   );
@@ -431,19 +490,69 @@ function DocPanel({
   doc,
   collectionId,
   onClose,
+  onSaved,
 }: {
   doc: Document;
   collectionId: string | undefined;
   onClose: () => void;
+  onSaved: (doc: Document) => void;
 }) {
   const [chunks, setChunks] = useState<api.DocChunk[] | null>(null);
   // The original file opens first when there is one; otherwise the panel lands
   // on the converted text.
-  const [tab, setTab] = useState<"original" | "text" | "chunks">(
+  const [tab, setTab] = useState<"original" | "text" | "chunks" | "edit">(
     doc.original ? "original" : "text"
   );
   const [orig, setOrig] = useState<{ url: string; contentType: string } | null>(null);
   const [origError, setOrigError] = useState<string | null>(null);
+  const [draftTitle, setDraftTitle] = useState(doc.title);
+  const [draftBody, setDraftBody] = useState(doc.body);
+  const [draftMetadata, setDraftMetadata] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const editableMetadata = Object.fromEntries(
+      Object.entries(doc.metadata).filter(([key]) => key !== "original")
+    );
+    setDraftTitle(doc.title);
+    setDraftBody(doc.body);
+    setDraftMetadata(JSON.stringify(editableMetadata, null, 2));
+    setSaveError(null);
+  }, [doc]);
+
+  async function save() {
+    if (!draftTitle.trim()) {
+      setSaveError("Title cannot be empty.");
+      return;
+    }
+    let metadata: Record<string, unknown>;
+    try {
+      const parsed: unknown = draftMetadata.trim() ? JSON.parse(draftMetadata) : {};
+      if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") {
+        throw new Error("Metadata must be a JSON object.");
+      }
+      metadata = parsed as Record<string, unknown>;
+    } catch (cause) {
+      setSaveError(cause instanceof Error ? cause.message : "Metadata is not valid JSON.");
+      return;
+    }
+    setSaving(true);
+    setSaveError(null);
+    try {
+      const updated = await api.updateDocument(doc.id, collectionId, {
+        title: draftTitle.trim(),
+        body: draftBody,
+        metadata,
+      });
+      onSaved(updated);
+      setTab("text");
+    } catch (cause) {
+      setSaveError(cause instanceof Error ? cause.message : "The document could not be saved.");
+    } finally {
+      setSaving(false);
+    }
+  }
 
   useEffect(() => {
     let live = true;
@@ -521,8 +630,8 @@ function DocPanel({
 
           <div className="mt-3 flex gap-1 rounded-lg border border-edge bg-elevated p-0.5">
             {((doc.original
-              ? ["original", "text", "chunks"]
-              : ["text", "chunks"]) as ("original" | "text" | "chunks")[]).map((t) => (
+              ? ["original", "text", "chunks", "edit"]
+              : ["text", "chunks", "edit"]) as ("original" | "text" | "chunks" | "edit")[]).map((t) => (
               <button
                 key={t}
                 onClick={() => setTab(t)}
@@ -535,7 +644,9 @@ function DocPanel({
                   ? "original file"
                   : t === "text"
                     ? "document text"
-                    : `chunks${chunks ? ` (${chunks.length})` : ""}`}
+                    : t === "chunks"
+                      ? `chunks${chunks ? ` (${chunks.length})` : ""}`
+                      : "edit info"}
               </button>
             ))}
           </div>
@@ -548,6 +659,51 @@ function DocPanel({
               blob={orig}
               error={origError}
             />
+          ) : tab === "edit" ? (
+            <div className="mx-auto max-w-2xl space-y-4">
+              <div>
+                <label className="mb-1.5 block text-xs font-medium text-ink">Title</label>
+                <input
+                  value={draftTitle}
+                  onChange={(event) => setDraftTitle(event.target.value)}
+                  className="w-full rounded-lg border border-edge bg-canvas px-3 py-2.5 text-sm text-ink outline-none focus:border-accent/60"
+                />
+              </div>
+              <div>
+                <label className="mb-1.5 block text-xs font-medium text-ink">Document text</label>
+                <textarea
+                  value={draftBody}
+                  onChange={(event) => setDraftBody(event.target.value)}
+                  rows={14}
+                  className="w-full resize-y rounded-lg border border-edge bg-canvas px-3 py-2.5 font-mono text-xs leading-relaxed text-ink outline-none focus:border-accent/60"
+                />
+                <p className="mt-1 text-2xs leading-relaxed text-subtle">
+                  Changing searchable text creates a new document version and rebuilds its passages.
+                </p>
+              </div>
+              <div>
+                <label className="mb-1.5 block text-xs font-medium text-ink">Custom metadata</label>
+                <textarea
+                  value={draftMetadata}
+                  onChange={(event) => setDraftMetadata(event.target.value)}
+                  rows={7}
+                  spellCheck={false}
+                  className="w-full resize-y rounded-lg border border-edge bg-canvas px-3 py-2.5 font-mono text-xs leading-relaxed text-ink outline-none focus:border-accent/60"
+                />
+                <p className="mt-1 text-2xs text-subtle">JSON object · stored with the document</p>
+              </div>
+              {saveError && (
+                <p role="alert" className="rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger">
+                  {saveError}
+                </p>
+              )}
+              <div className="flex justify-end gap-2 border-t border-edge pt-4">
+                <Button onClick={() => setTab(doc.original ? "original" : "text")}>Cancel</Button>
+                <Button variant="primary" onClick={save} disabled={saving || !draftTitle.trim()}>
+                  {saving ? "Saving…" : "Save changes"}
+                </Button>
+              </div>
+            </div>
           ) : tab === "text" ? (
             doc.body.trim() ? (
               <pre className="whitespace-pre-wrap break-words font-mono text-xs leading-relaxed text-muted">

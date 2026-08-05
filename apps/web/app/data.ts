@@ -83,12 +83,14 @@ export type Trace = {
   via: string;
   actor: string | null;
   createdAt: string;
-  retrieval: "hybrid" | "vectorless" | "unknown";
+  retrieval: "hybrid" | "vectorless" | "agentic" | "unknown";
 };
 
 /** One fused candidate inside a trace — the per-result derivation. */
 export type Candidate = {
   item_id: string;
+  title?: string | null;
+  source?: string | null;
   chunk_id?: string | null;
   heading?: string | null;
   score: number;
@@ -161,6 +163,7 @@ export type Document = {
   status: string;
   createdAt: string | null;
   categories: Category[];
+  metadata: Record<string, unknown>;
   /** The file as uploaded, when the store kept it. null for text pasted
    *  directly, older uploads, or files over the size cap. */
   original: { filename: string; contentType: string; size: number } | null;
