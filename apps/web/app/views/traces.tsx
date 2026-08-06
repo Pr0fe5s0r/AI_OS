@@ -31,6 +31,9 @@ export function Traces({ active }: { active: string | null }) {
   const [open, setOpen] = useState<TraceDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [opening, setOpening] = useState<string | null>(null);
+  // The table is paged 10 at a time — a busy store produces hundreds of traces,
+  // and a wall of rows is not something anybody reads.
+  const [page, setPage] = useState(0);
 
   const load = useCallback(async () => {
     setError(null);
@@ -68,7 +71,16 @@ export function Traces({ active }: { active: string | null }) {
     load();
   }, [load]);
 
+  // A new list (reload or a changed filter) starts back at the first page.
+  useEffect(() => {
+    setPage(0);
+  }, [rows, filter]);
+
   const maxMs = Math.max(1, ...(rows || []).map((r) => r.durationMs));
+  const PAGE_SIZE = 10;
+  const total = rows?.length ?? 0;
+  const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const pageRows = rows ? rows.slice(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE) : [];
 
   return (
     <div className="px-6 py-6">
@@ -184,7 +196,7 @@ export function Traces({ active }: { active: string | null }) {
               </tr>
             </thead>
             <tbody>
-              {rows.map((t) => {
+              {pageRows.map((t) => {
                 const status = traceStatus(t);
                 return (
                   <tr
@@ -247,6 +259,33 @@ export function Traces({ active }: { active: string | null }) {
             </tbody>
           </table>
         </Card>
+      )}
+
+      {rows && total > PAGE_SIZE && (
+        <div className="mt-3 flex items-center justify-between font-mono text-2xs text-subtle">
+          <span>
+            {page * PAGE_SIZE + 1}–{Math.min((page + 1) * PAGE_SIZE, total)} of {num(total)}
+          </span>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setPage((p) => Math.max(0, p - 1))}
+              disabled={page === 0}
+              className="rounded-md border border-edge px-2.5 py-1 text-muted transition hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              prev
+            </button>
+            <span className="tabular-nums">
+              page {page + 1} / {pageCount}
+            </span>
+            <button
+              onClick={() => setPage((p) => Math.min(pageCount - 1, p + 1))}
+              disabled={page >= pageCount - 1}
+              className="rounded-md border border-edge px-2.5 py-1 text-muted transition hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              next
+            </button>
+          </div>
+        </div>
       )}
 
       {open && <TracePanel trace={open} onClose={() => setOpen(null)} />}
@@ -415,22 +454,28 @@ function NavigationTrace({
             {trace.fused.map((candidate, index) => (
               <div
                 key={`${candidate.chunk_id || candidate.item_id}-${index}`}
-                className="grid gap-1 border-b border-edge/70 px-3 py-2.5 last:border-0 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center"
+                className="border-b border-edge/70 px-3 py-2.5 last:border-0"
               >
-                <div className="min-w-0">
-                  <p className="truncate text-xs text-ink" title={candidate.title || undefined}>
-                    {candidate.title || candidate.heading || "Untitled section"}
-                  </p>
-                  {candidate.heading && candidate.title && (
-                    <p className="truncate text-2xs text-muted">{candidate.heading}</p>
-                  )}
-                  <Mono className="mt-0.5 block truncate text-2xs text-subtle">
-                    {candidate.item_id} · {candidate.chunk_id || "section id unavailable"}
+                <div className="grid gap-1 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
+                  <div className="min-w-0">
+                    <p className="truncate text-xs text-ink" title={candidate.title || undefined}>
+                      {candidate.title || candidate.heading || "Untitled section"}
+                    </p>
+                    {candidate.heading && candidate.title && (
+                      <p className="truncate text-2xs text-muted">{candidate.heading}</p>
+                    )}
+                    <Mono className="mt-0.5 block truncate text-2xs text-subtle">
+                      {candidate.item_id} · {candidate.chunk_id || "section id unavailable"}
+                    </Mono>
+                  </div>
+                  <Mono className="text-2xs tabular-nums text-muted">
+                    read order {index + 1} · {safeScore(candidate.score, 2)}
                   </Mono>
                 </div>
-                <Mono className="text-2xs tabular-nums text-muted">
-                  read order {index + 1} · {safeScore(candidate.score, 2)}
-                </Mono>
+                <SourcePeek
+                  chunkId={candidate.chunk_id}
+                  heading={candidate.heading || candidate.title}
+                />
               </div>
             ))}
           </div>
@@ -486,33 +531,11 @@ function HybridTrace({ trace }: { trace: TraceDetail }) {
               </thead>
               <tbody>
                 {trace.fused.map((candidate, index) => (
-                  <tr
+                  <FusionRow
                     key={`${candidate.item_id}-${candidate.chunk_id || index}`}
-                    className={cx(
-                      "border-b border-edge/60 last:border-0",
-                      !candidate.kept && "opacity-50"
-                    )}
-                  >
-                    <td className="max-w-[17rem] py-2 pl-3 pr-3">
-                      <p className="truncate text-2xs text-ink" title={candidate.title || undefined}>
-                        {candidate.title || candidate.heading || "Untitled document"}
-                      </p>
-                      {candidate.heading && candidate.title && (
-                        <p className="truncate text-[10px] text-muted">{candidate.heading}</p>
-                      )}
-                      <Mono className="block truncate text-[10px] text-subtle">
-                        {candidate.source ? `${candidate.source} · ` : ""}
-                        {candidate.item_id}
-                      </Mono>
-                      {!candidate.kept && (
-                        <span className="font-mono text-[10px] text-warn">below score floor</span>
-                      )}
-                    </td>
-                    <ScoreCell value={candidate.score} digits={4} tone="text-ink" />
-                    <ScoreCell value={candidate.semantic} digits={3} />
-                    <ScoreCell value={candidate.keyword} digits={4} />
-                    <ScoreCell value={candidate.recency} digits={3} end />
-                  </tr>
+                    candidate={candidate}
+                    index={index}
+                  />
                 ))}
               </tbody>
             </table>
@@ -523,6 +546,142 @@ function HybridTrace({ trace }: { trace: TraceDetail }) {
           </p>
         )}
       </section>
+    </>
+  );
+}
+
+/** Reveal the actual passage behind a candidate, fetched on demand — so a trace
+ *  shows the SOURCE, not only an id. Some navigator section ids are not stored
+ *  passages; those say so plainly rather than pretending. */
+function SourcePeek({ chunkId, heading }: { chunkId?: string | null; heading?: string | null }) {
+  const [shown, setShown] = useState(false);
+  const [text, setText] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [failed, setFailed] = useState(false);
+
+  async function toggle() {
+    if (shown) {
+      setShown(false);
+      return;
+    }
+    setShown(true);
+    if (text === null && !failed && chunkId) {
+      setLoading(true);
+      try {
+        const detail = await api.chunk(chunkId);
+        setText(detail.text || "(this passage has no text)");
+      } catch {
+        setFailed(true);
+      } finally {
+        setLoading(false);
+      }
+    }
+  }
+
+  if (!chunkId) return null;
+  return (
+    <div className="mt-1.5">
+      <button
+        type="button"
+        onClick={toggle}
+        className="font-mono text-2xs text-accentSoft underline-offset-2 hover:underline"
+      >
+        {shown ? "hide source" : "view source"}
+      </button>
+      {shown && (
+        <div className="mt-1 rounded-md border border-edge bg-canvas px-3 py-2">
+          {heading && <p className="mb-1 font-mono text-[10px] text-subtle">{heading}</p>}
+          <p className="max-h-56 overflow-y-auto whitespace-pre-wrap text-2xs leading-relaxed text-muted">
+            {loading
+              ? "loading source…"
+              : failed
+                ? "This id is a navigator section, not a stored passage — open the document to read it."
+                : text}
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** One fusion candidate as a table row you can press to read its passage. */
+function FusionRow({
+  candidate,
+  index,
+}: {
+  candidate: TraceDetail["fused"][number];
+  index: number;
+}) {
+  const [open, setOpen] = useState(false);
+  const [text, setText] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [failed, setFailed] = useState(false);
+
+  async function toggle() {
+    if (!candidate.chunk_id) return;
+    const next = !open;
+    setOpen(next);
+    if (next && text === null && !failed) {
+      setLoading(true);
+      try {
+        const detail = await api.chunk(candidate.chunk_id);
+        setText(detail.text || "(this passage has no text)");
+      } catch {
+        setFailed(true);
+      } finally {
+        setLoading(false);
+      }
+    }
+  }
+
+  return (
+    <>
+      <tr
+        onClick={toggle}
+        className={cx(
+          "border-b border-edge/60 last:border-0",
+          !candidate.kept && "opacity-50",
+          candidate.chunk_id && "cursor-pointer hover:bg-elevated"
+        )}
+      >
+        <td className="max-w-[17rem] py-2 pl-3 pr-3">
+          <p className="truncate text-2xs text-ink" title={candidate.title || undefined}>
+            {candidate.title || candidate.heading || "Untitled document"}
+          </p>
+          {candidate.heading && candidate.title && (
+            <p className="truncate text-[10px] text-muted">{candidate.heading}</p>
+          )}
+          <Mono className="block truncate text-[10px] text-subtle">
+            {candidate.source ? `${candidate.source} · ` : ""}
+            {candidate.item_id}
+          </Mono>
+          {candidate.chunk_id ? (
+            <span className="font-mono text-[10px] text-accentSoft">
+              {open ? "hide source" : "view source"}
+            </span>
+          ) : null}
+          {!candidate.kept && (
+            <span className="ml-2 font-mono text-[10px] text-warn">below score floor</span>
+          )}
+        </td>
+        <ScoreCell value={candidate.score} digits={4} tone="text-ink" />
+        <ScoreCell value={candidate.semantic} digits={3} />
+        <ScoreCell value={candidate.keyword} digits={4} />
+        <ScoreCell value={candidate.recency} digits={3} end />
+      </tr>
+      {open && (
+        <tr>
+          <td colSpan={5} className="px-3 pb-3">
+            <p className="max-h-56 overflow-y-auto whitespace-pre-wrap rounded-md border border-edge bg-canvas px-3 py-2 text-2xs leading-relaxed text-muted">
+              {loading
+                ? "loading source…"
+                : failed
+                  ? "The source passage could not be loaded."
+                  : text}
+            </p>
+          </td>
+        </tr>
+      )}
     </>
   );
 }

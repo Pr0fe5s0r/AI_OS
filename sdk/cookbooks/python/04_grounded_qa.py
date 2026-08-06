@@ -30,9 +30,11 @@ def ask(docs, question: str, mode: str) -> None:
 def main(question: str) -> None:
     with Markvector() as mv:
         docs = mv.collection("cookbook")
-        # vectorless (default): reason over each document's heading tree.
-        ask(docs, question, mode="vectorless")
-        # hybrid: passage embeddings + keyword, fused. Try both on hard questions.
+        # agentic (default): an agent reasons over the heading trees, searches
+        # passages, and hops the similarity graph — reaching the whole collection.
+        ask(docs, question, mode="agentic")
+        # hybrid: passage embeddings + keyword, fused. Fast and deterministic;
+        # try both on hard questions.
         ask(docs, question, mode="hybrid")
 
 

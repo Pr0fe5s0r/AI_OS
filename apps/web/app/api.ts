@@ -530,7 +530,11 @@ export type AnswerOutcome = SearchOutcome & {
 };
 
 /** Retrieval plus a written answer built only from what was retrieved.
- *  Separate from `search`, which never returns generated text. */
+ *  Separate from `search`, which never returns generated text.
+ *
+ *  The two live modes are "agentic" (default) and "hybrid". "vectorless" is
+ *  retired as a choice but kept in the union because historical turns and
+ *  traces still carry it — it is a value we may receive, never one we send. */
 export type AskMode = "hybrid" | "vectorless" | "agentic";
 
 /** The JSON both /api/answer and the stream's terminal `done` event carry. */
@@ -566,7 +570,7 @@ export async function ask(
   collectionId: string | undefined,
   question: string,
   limit = 8,
-  mode: AskMode = "hybrid"
+  mode: AskMode = "agentic"
 ): Promise<AnswerOutcome> {
   const payload = await call<RawAnswer>(
     `/api/answer?q=${encodeURIComponent(question)}&limit=${limit}&mode=${mode}`,
@@ -582,16 +586,16 @@ export type StreamEvent =
   | { type: "thinking"; delta: string; round?: number }
   | { type: "tool_call"; tool: string; args: Record<string, unknown>; round?: number }
   | {
-      type: "tool_result";
-      tool: string;
-      ok: boolean;
-      detail?: string;
-      heading?: string;
-      title?: string;
-      marker?: number;
-      count?: number;
-      headings?: string[];
-    }
+    type: "tool_result";
+    tool: string;
+    ok: boolean;
+    detail?: string;
+    heading?: string;
+    title?: string;
+    marker?: number;
+    count?: number;
+    headings?: string[];
+  }
   | { type: "retrieved"; documents: number; passages: number }
   | { type: "token"; delta: string }
   | { type: "answer"; text: string; found: boolean }
@@ -632,7 +636,7 @@ export async function askStream(
   let buffer = "";
   let outcome: AnswerOutcome | null = null;
 
-  for (;;) {
+  for (; ;) {
     const { done, value } = await reader.read();
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
@@ -766,3 +770,51 @@ export type Snippets = {
 
 export const snippets = (collectionId: string) =>
   call<Snippets>(`/api/snippets?collection=${encodeURIComponent(collectionId)}`);
+
+// -------------------------------- summaries --------------------------------
+
+export type IndexSummary = {
+  chunk_id: string;
+  node_type: string | null;
+  item_id: string | null;
+  heading: string | null;
+  text: string | null;
+  covers: number;
+  generated_by: string | null;
+  probe_question: string | null;
+};
+
+export type MapperRun = {
+  id: number;
+  question: string | null;
+  chunks_mapped: number;
+  error: string | null;
+  created_at: string | null;
+};
+
+export type MappingProgress = {
+  total: number;
+  mapped: number;
+  unmapped: number;
+  runs: MapperRun[];
+};
+
+export async function fetchSummaries(collectionId: string): Promise<IndexSummary[]> {
+  const payload = await call<{ summaries: IndexSummary[] }>(
+    `/api/collections/${encodeURIComponent(collectionId)}/summaries`
+  );
+  return payload.summaries;
+}
+
+export async function fetchMapping(collectionId: string): Promise<MappingProgress> {
+  return call<MappingProgress>(
+    `/api/collections/${encodeURIComponent(collectionId)}/mapping`
+  );
+}
+
+export const triggerSummarize = (collectionId: string) =>
+  call<{ documents: number; queued: number }>(
+    `/api/collections/${encodeURIComponent(collectionId)}/summarize`,
+    { method: "POST" }
+  );
+

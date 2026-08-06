@@ -290,6 +290,11 @@ async def vector_search(
     if active_only:
         clause += " AND node.status = $active"
         params["active"] = str(Lifecycle.ACTIVE)
+    # Index summaries (card / section_summary) are a navigation layer, not
+    # answer content — they are model-written and must never be returned as a
+    # citation. Merge summaries ('summary') stay recallable: they REPLACE the
+    # archived passages they came from, so excluding them would lose content.
+    clause += " AND NOT coalesce(node.node_type, 'fact') IN ['card', 'section_summary']"
     return await _run(
         f"""
         CALL db.index.vector.queryNodes('{VECTOR_INDEX}', $k, $embedding)
@@ -389,6 +394,73 @@ async def collection_chunk_vectors(
     )
 
 
+async def replace_near_edges(scope: Scope, edges: list[dict]) -> int:
+    """Persist the similarity neighbour graph as :NEAR relationships.
+
+    The graph view computes these in Python on every request; a traversal tool
+    cannot afford that, so consolidation writes them down and a hop becomes a
+    single relationship lookup. Rebuilt, not merged: an edge that no longer
+    clears the floor has to disappear, so the collection's NEAR edges are
+    dropped and the current set written in their place.
+
+    Stored once per unordered pair — the query that reads them is
+    direction-agnostic — carrying the cosine that produced the edge. Each dict
+    carries src, dst and similarity, exactly as ``neighbours.knn_edges`` returns.
+    """
+    clause, params = _scope_clause("c", scope)
+    await _run(
+        f"MATCH (c:Chunk)-[r:NEAR]->(:Chunk) WHERE {clause} DELETE r",
+        **params,
+    )
+    if not edges:
+        return 0
+    rows = await _run(
+        """
+        UNWIND $edges AS e
+        MATCH (a:Chunk {chunk_id: e.src})
+        MATCH (b:Chunk {chunk_id: e.dst})
+        MERGE (a)-[r:NEAR]->(b)
+        SET r.similarity = e.similarity
+        RETURN count(r) AS n
+        """,
+        edges=[
+            {"src": e["src"], "dst": e["dst"], "similarity": e["similarity"]} for e in edges
+        ],
+    )
+    return rows[0]["n"] if rows else 0
+
+
+async def chunk_neighbours(scope: Scope, chunk_id: str, limit: int = 10) -> list[dict]:
+    """The passages nearest this one — the store's own graph links, either way.
+
+    This is the traversal primitive. Given a passage, it returns what sits next
+    to it in meaning, so an agent — ours, or a caller's own LLM through the SDK —
+    can walk from one passage to related material a fresh search might not reach,
+    a hop at a time. NEAR edges are matched in both directions because they are
+    stored once per pair but mean an undirected relationship. Archived
+    neighbours are excluded: a hop must never land on content the store has
+    already retired.
+    """
+    clause, params = _scope_clause("c", scope)
+    return await _run(
+        f"""
+        MATCH (c:Chunk {{chunk_id: $chunk_id}}) WHERE {clause}
+        MATCH (c)-[r:NEAR]-(n:Chunk)
+        WHERE n.status = $active
+        RETURN n.chunk_id AS chunk_id, n.item_id AS item_id,
+               n.heading AS heading, n.title AS title,
+               coalesce(properties(n)['node_type'], 'fact') AS node_type,
+               r.similarity AS similarity
+        ORDER BY r.similarity DESC
+        LIMIT $limit
+        """,
+        chunk_id=chunk_id,
+        active=str(Lifecycle.ACTIVE),
+        limit=limit,
+        **params,
+    )
+
+
 async def upsert_summary(
     scope: Scope,
     chunk_id: str,
@@ -480,6 +552,163 @@ async def chunk_lineage(scope: Scope, chunk_id: str) -> list[dict]:
                s.item_id AS item_id, properties(s)['archived'] AS archived
         """,
         chunk_id=chunk_id,
+        **params,
+    )
+
+
+# ------------------------------ index summaries ------------------------------
+#
+# A card (per document) or section_summary (per section / probe-mapped cluster)
+# is a :Chunk with an embedding — so it is traversable and could be searched —
+# joined to the live passages it stands for by :SUMMARIZES. Unlike a merge
+# summary (DERIVED_FROM), the covered passages are NOT archived: the summary is
+# a navigation layer laid OVER the facts, not a replacement for them. Text lives
+# in Postgres; this stores only the node, its vector, and the edges.
+
+INDEX_SUMMARY_TYPES = ("card", "section_summary")
+
+
+async def upsert_index_summary(
+    scope: Scope,
+    chunk_id: str,
+    heading: str,
+    embedding: list[float],
+    covers: list[str],
+    kind: str,
+    item_id: str | None = None,
+) -> None:
+    """Create/refresh a summary node and its SUMMARIZES edges to live chunks.
+
+    ``kind`` is 'card' or 'section_summary'. The covered chunks stay live and
+    retrievable — this only lays a navigable edge over them. Rebuilt each time
+    it is generated: existing SUMMARIZES edges for this summary are dropped so a
+    regenerated summary cannot keep pointing at passages it no longer covers.
+    """
+    if kind not in INDEX_SUMMARY_TYPES:
+        raise ValueError(f"not an index-summary kind: {kind!r}")
+    await _run(
+        """
+        MERGE (c:Chunk {chunk_id: $chunk_id})
+        SET c.workspace_id  = $workspace,
+            c.collection_id = $collection,
+            c.item_id       = $item_id,
+            c.heading       = $heading,
+            c.title         = $heading,
+            c.node_type     = $kind,
+            c.status        = $status,
+            c.ordinal       = 0,
+            c.archived      = NULL
+        """,
+        chunk_id=chunk_id,
+        workspace=scope.workspace_id,
+        collection=scope.collection_id,
+        item_id=item_id,
+        heading=heading,
+        kind=kind,
+        status=str(Lifecycle.ACTIVE),
+    )
+    await _run(
+        """
+        MATCH (c:Chunk {chunk_id: $chunk_id})
+        CALL db.create.setNodeVectorProperty(c, 'embedding', $embedding)
+        """,
+        chunk_id=chunk_id,
+        embedding=embedding,
+    )
+    # Rebuild the coverage edges: drop this summary's old SUMMARIZES, write the
+    # current set. A stale edge is worse than none.
+    await _run(
+        "MATCH (c:Chunk {chunk_id: $chunk_id})-[r:SUMMARIZES]->() DELETE r",
+        chunk_id=chunk_id,
+    )
+    if covers:
+        await _run(
+            """
+            MATCH (c:Chunk {chunk_id: $chunk_id})
+            UNWIND $covers AS target
+            MATCH (t:Chunk {chunk_id: target})
+            MERGE (c)-[:SUMMARIZES]->(t)
+            """,
+            chunk_id=chunk_id,
+            covers=covers,
+        )
+
+
+async def unmapped_chunks(scope: Scope, limit: int = 50) -> list[dict]:
+    """Live fact passages that no summary covers yet — the mapper's worklist.
+
+    A chunk is "mapped" once a :SUMMARIZES edge points at it. This is the
+    source of truth for coverage, so the count the UI shows and the work the
+    mapper does can never disagree.
+    """
+    clause, params = _scope_clause("c", scope)
+    return await _run(
+        f"""
+        MATCH (c:Chunk) WHERE {clause}
+          AND c.status = $active
+          AND coalesce(c.node_type, 'fact') = 'fact'
+          AND NOT (:Chunk)-[:SUMMARIZES]->(c)
+        RETURN c.chunk_id AS chunk_id, c.item_id AS item_id,
+               c.heading AS heading, c.title AS title
+        ORDER BY c.item_id, c.ordinal
+        LIMIT $limit
+        """,
+        active=str(Lifecycle.ACTIVE),
+        limit=limit,
+        **params,
+    )
+
+
+async def mapping_counts(scope: Scope) -> dict:
+    """How many live fact passages are mapped vs not — the header stat."""
+    clause, params = _scope_clause("c", scope)
+    rows = await _run(
+        f"""
+        MATCH (c:Chunk) WHERE {clause}
+          AND c.status = $active
+          AND coalesce(c.node_type, 'fact') = 'fact'
+        RETURN count(c) AS total,
+               count(CASE WHEN (:Chunk)-[:SUMMARIZES]->(c) THEN 1 END) AS mapped
+        """,
+        active=str(Lifecycle.ACTIVE),
+        **params,
+    )
+    row = rows[0] if rows else {"total": 0, "mapped": 0}
+    total, mapped = int(row["total"]), int(row["mapped"])
+    return {"total": total, "mapped": mapped, "unmapped": total - mapped}
+
+
+async def summary_coverage(scope: Scope) -> list[dict]:
+    """Every summary node with the count of passages it connects — for the UI."""
+    clause, params = _scope_clause("c", scope)
+    return await _run(
+        f"""
+        MATCH (c:Chunk) WHERE {clause}
+          AND coalesce(c.node_type, 'fact') IN ['card', 'section_summary']
+        OPTIONAL MATCH (c)-[:SUMMARIZES]->(t:Chunk)
+        RETURN c.chunk_id AS chunk_id, c.node_type AS node_type,
+               c.item_id AS item_id, c.heading AS heading,
+               count(t) AS covers
+        ORDER BY c.node_type, covers DESC
+        """,
+        **params,
+    )
+
+
+async def chunk_summaries(scope: Scope, item_id: str) -> list[dict]:
+    """A document's card + section summaries — the navigator's rich catalogue."""
+    clause, params = _scope_clause("c", scope)
+    return await _run(
+        f"""
+        MATCH (c:Chunk) WHERE {clause}
+          AND c.item_id = $item_id
+          AND coalesce(c.node_type, 'fact') IN ['card', 'section_summary']
+        OPTIONAL MATCH (c)-[:SUMMARIZES]->(t:Chunk)
+        RETURN c.chunk_id AS chunk_id, c.node_type AS node_type,
+               c.heading AS heading, count(t) AS covers
+        ORDER BY c.node_type DESC
+        """,
+        item_id=item_id,
         **params,
     )
 

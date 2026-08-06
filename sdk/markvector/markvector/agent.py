@@ -27,17 +27,33 @@ if TYPE_CHECKING:
 
 DEFAULT_MODEL = "gpt-4o-mini"
 _READ_BUDGET = 8000  # chars of a document a single read_document returns
+# The overview is a MAP, so it must stay scannable: the document cards, bounded
+# and trimmed, not every section summary. Past this many documents the tail is
+# left to search — a card the model cannot read is no better than one it never
+# got, the same reason the navigator caps its catalogue.
+_MAX_OVERVIEW = 60
 
 SYSTEM = """You are a research assistant answering questions from a private \
 knowledge base, using ONLY the tools provided to look things up.
 
-Work like this: search for what you need, list or open the relevant files, read \
-the sections that matter, then answer. Ground every claim in what the tools \
-returned — do not use outside knowledge. For a long, structured document, prefer \
-`structure` to see its sections and `read_document` to read it; for a specific \
-fact, prefer `search`. Cite the file (item_id / filename) a claim came from. If \
-the knowledge base does not contain the answer, say so plainly rather than \
-guessing."""
+Work like this:
+1. FIRST call `overview` — a card for each document describing what it is \
+about. Use it to find the document that holds the answer.
+2. When the overview points to a document, open it directly with \
+`read_document` (or `structure` first for a long one) and read it. Do NOT \
+search when the map already tells you which document to open — reading the \
+right source is faster and more reliable than searching for it.
+3. Search ONLY when the overview does not make the source obvious: a specific \
+figure, name or identifier no card would mention, or when you genuinely cannot \
+tell which document to open.
+4. When a passage a search or read returned is close but not complete, call \
+`neighbors` on its chunk_id to reach the passages nearest it in the store's \
+graph — often the rest of the answer sits one hop away.
+
+Ground every claim in what the tools returned — do not use outside knowledge. \
+The overview is a MAP, not evidence: never cite it; cite the real document \
+(item_id / filename) a claim came from. If the knowledge base does not contain \
+the answer, say so plainly rather than guessing."""
 
 
 # --------------------------------- events ---------------------------------
@@ -96,6 +112,18 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "overview",
+            "description": "The collection's MAP, read FIRST: a card for each document "
+            "describing what it is about, with its document id and how many passages it "
+            "covers. Use it to find the document that holds the answer and open it directly "
+            "with read_document — it lets you SKIP searching when the right source is "
+            "obvious. It is the map, not the evidence, so never cite it.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "search",
             "description": "Search the knowledge base by meaning and wording. Returns the "
             "best-matching passages with their document id, filename and score.",
@@ -145,6 +173,26 @@ TOOLS: list[dict[str, Any]] = [
                 "type": "object",
                 "properties": {"item_id": {"type": "string"}},
                 "required": ["item_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "neighbors",
+            "description": "Given a passage's chunk_id (from a search result, or from an "
+            "earlier neighbors hop), list the passages nearest it in meaning — the store's "
+            "own similarity graph. Use it to explore around a promising hit: related "
+            "material often sits one hop away, where a fresh search would miss it. Returns "
+            "each neighbour's chunk_id (hop again from it), the document it belongs to, and "
+            "how close it is.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chunk_id": {"type": "string"},
+                    "limit": {"type": "integer", "default": 10},
+                },
+                "required": ["chunk_id"],
             },
         },
     },
@@ -330,6 +378,39 @@ class Agent:
         """Execute a tool against the collection. Errors become data the model
         can read and recover from, never exceptions that kill the run."""
         try:
+            if name == "overview":
+                # A lean map: the document CARDS ("what is this file about"), so
+                # the model can pick the right source and read it directly rather
+                # than searching. Bounded and trimmed so it stays scannable —
+                # section-level detail comes from reading or searching the file a
+                # card points to. Falls back to section summaries only when a
+                # collection has no cards yet.
+                everything = [
+                    s
+                    for s in self._c.summaries()
+                    if selected_files is None or s.item_id in selected_files
+                ]
+                cards = [s for s in everything if s.node_type == "card"]
+                pool = cards or everything
+                pool = sorted(pool, key=lambda s: s.covers, reverse=True)
+                out: list[Any] = [
+                    {
+                        "item_id": s.item_id,
+                        "kind": s.node_type,
+                        "heading": s.heading,
+                        "about": (s.text or "")[:240],
+                        "covers": s.covers,
+                    }
+                    for s in pool[:_MAX_OVERVIEW]
+                ]
+                if len(pool) > _MAX_OVERVIEW:
+                    out.append(
+                        {
+                            "note": f"{len(pool) - _MAX_OVERVIEW} more documents not "
+                            "shown here — use search to reach them."
+                        }
+                    )
+                return out
             if name == "search":
                 requested = args.get("files")
                 requested_files = requested if isinstance(requested, list) else None
@@ -355,6 +436,9 @@ class Agent:
                 return [
                     {
                         "item_id": h.id,
+                        # The winning passage's id, so the model can hop from a
+                        # hit to its neighbours instead of only reading its file.
+                        "chunk_id": h.chunk_id,
                         "title": h.title,
                         "score": round(h.score, 4),
                         "excerpt": h.clean_excerpt[:400],
@@ -398,6 +482,24 @@ class Agent:
                 if len(doc.body) > _READ_BUDGET:
                     out["truncated"] = True
                 return out
+            if name == "neighbors":
+                chunk_id = str(args.get("chunk_id", "") or "")
+                if not chunk_id:
+                    return {"error": "neighbors needs a chunk_id from a search result or a hop"}
+                found = self._c.neighbors(chunk_id, limit=int(args.get("limit", 10) or 10))
+                # Honour the same file scope search does: a hop must not walk out
+                # of the documents the caller confined the agent to.
+                return [
+                    {
+                        "chunk_id": n.neighbor_id,
+                        "item_id": n.item_id,
+                        "heading": n.heading,
+                        "title": n.title,
+                        "similarity": round(n.similarity, 4),
+                    }
+                    for n in found
+                    if selected_files is None or n.item_id in selected_files
+                ]
             return {"error": f"unknown tool {name!r}"}
         except MarkvectorError as exc:
             return {"error": str(exc)}

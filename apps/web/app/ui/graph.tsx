@@ -36,6 +36,22 @@ function groupKey(node: GraphNode): string {
   return node.itemId || node.category || node.source || "unfiled";
 }
 
+const SUMMARY_GOLD = "#f5c451";
+
+function isSummaryNode(nodeType?: string): boolean {
+  return nodeType === "card" || nodeType === "section_summary" || nodeType === "summary";
+}
+
+/** What a node stands for — used in the hover title and the legend, so the two
+ *  kinds of thing in the graph (real passages vs the summaries laid over them)
+ *  are never confused. */
+function nodeKindLabel(nodeType?: string): string {
+  if (nodeType === "card") return "Document card";
+  if (nodeType === "section_summary") return "Section summary";
+  if (nodeType === "summary") return "Summary";
+  return "Passage";
+}
+
 export function CollectionGraph({
   nodes,
   edges,
@@ -93,8 +109,14 @@ export function CollectionGraph({
         ...node,
         x: width / 2 + Math.cos(angle) * spread,
         y: height / 2 + Math.sin(angle) * spread,
-        radius: 5 + (node.degree / maxDegree) * 7,
-        colour: COLOURS[(groups.get(groupKey(node)) ?? 0) % COLOURS.length],
+        // A document card is a hub over a whole file, so it is drawn larger.
+        radius: (node.nodeType === "card" ? 8 : 5) + (node.degree / maxDegree) * 7,
+        // Summaries are gold whatever document they belong to; passages keep
+        // their document's colour — so the map reads "gold = a summary,
+        // coloured = a real passage" at a glance.
+        colour: isSummaryNode(node.nodeType)
+          ? SUMMARY_GOLD
+          : COLOURS[(groups.get(groupKey(node)) ?? 0) % COLOURS.length],
       };
     });
     const byId = new Map(simulationNodes.map((node) => [node.id, node]));
@@ -113,9 +135,14 @@ export function CollectionGraph({
       .attr("stroke", (edge) =>
         edge.kind === "same_document" ? "#3a4250" : HEAT_HEX[simBand(edge.similarity)]
       )
-      .attr("stroke-width", (edge) => edge.kind === "same_document" ? 1 : 0.6 + edge.similarity * 1.6)
+      .attr("stroke-width", (edge) => (edge.kind === "same_document" ? 0.8 : 0.5 + edge.similarity * 0.8))
       .attr("stroke-dasharray", (edge) => edge.kind === "same_document" ? "2 4" : null)
-      .attr("stroke-opacity", (edge) => edge.kind === "same_document" ? 0.48 : 0.2 + edge.similarity * 0.42);
+      // Faint at rest. With hundreds of edges, bright lines pile into a glare
+      // that hides which node joins which — so the web recedes to a hint, and
+      // hovering or selecting a node is what lights up its own connections.
+      .attr("stroke-opacity", (edge) =>
+        edge.kind === "same_document" ? 0.28 : 0.05 + edge.similarity * 0.13
+      );
 
     const node = nodeLayer
       .selectAll<SVGGElement, SimNode>("g")
@@ -137,14 +164,27 @@ export function CollectionGraph({
           .attr("fill", (entry) => entry.colour)
           .attr("stroke", "#070809")
           .attr("stroke-width", 1.3);
+        // A solid gold ring marks a document card; a dashed gold ring a section
+        // (or legacy merge) summary. Passages get no ring — so the summary
+        // layer is legible on top of the passages it stands over.
         group
-          .filter((entry) => entry.nodeType === "summary")
+          .filter((entry) => entry.nodeType === "card")
+          .append("circle")
+          .attr("r", (entry) => entry.radius + 4)
+          .attr("fill", "none")
+          .attr("stroke", SUMMARY_GOLD)
+          .attr("stroke-width", 2);
+        group
+          .filter((entry) => entry.nodeType === "section_summary" || entry.nodeType === "summary")
           .append("circle")
           .attr("r", (entry) => entry.radius + 3.5)
           .attr("fill", "none")
-          .attr("stroke", "#f5c451")
-          .attr("stroke-width", 1.4);
-        group.append("title").text((entry) => `${entry.document || entry.source}\n${entry.title}`);
+          .attr("stroke", SUMMARY_GOLD)
+          .attr("stroke-width", 1.4)
+          .attr("stroke-dasharray", "2 3");
+        group
+          .append("title")
+          .text((entry) => `${nodeKindLabel(entry.nodeType)} · ${entry.document || entry.source}\n${entry.title}`);
         return group;
       });
 
@@ -153,14 +193,21 @@ export function CollectionGraph({
       .duration(window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 420)
       .style("opacity", 1);
 
-    const updateSelection = (id: string | null) => {
-      node.attr("opacity", (entry) => !id || entry.id === id ? 1 : 0.24);
+    // Dim everything but a focused node and its own edges. Shared by hover and
+    // click, so a passage's connections are the ONLY bright lines while it is in
+    // focus and the rest of the web fades almost out — which is how you read
+    // "what connects to what" out of an otherwise solid mesh.
+    const applyFocus = (id: string | null) => {
+      node.attr("opacity", (entry) => (!id || entry.id === id ? 1 : 0.14));
       link.attr("stroke-opacity", (entry) => {
-        if (!id) return entry.kind === "same_document" ? 0.48 : 0.2 + entry.similarity * 0.42;
+        if (!id) return entry.kind === "same_document" ? 0.28 : 0.05 + entry.similarity * 0.13;
         const source = typeof entry.source === "object" ? entry.source.id : String(entry.source);
         const target = typeof entry.target === "object" ? entry.target.id : String(entry.target);
-        return source === id || target === id ? 0.9 : 0.035;
+        return source === id || target === id ? 0.95 : 0.012;
       });
+    };
+    const updateSelection = (id: string | null) => {
+      applyFocus(id);
       node
         .select<SVGCircleElement>(".selection-ring")
         .attr("r", (entry) => entry.radius + 6)
@@ -171,6 +218,14 @@ export function CollectionGraph({
     updateSelection(selectedRef.current);
 
     node
+      // Hover to trace: light up a node's connections without committing to a
+      // selection. An active selection wins, so hovering does not fight a click.
+      .on("mouseenter", (_event, entry) => {
+        if (!selectedRef.current) applyFocus(entry.id);
+      })
+      .on("mouseleave", () => {
+        if (!selectedRef.current) applyFocus(null);
+      })
       .on("click", (event, entry) => {
         event.stopPropagation();
         if (!selectRef.current) {
@@ -294,10 +349,20 @@ export function CollectionGraph({
 
   useEffect(() => {
     const svg = d3.select(svgRef.current);
+    const id = selectedId;
     svg.selectAll<SVGGElement, SimNode>(".nodes > g")
-      .attr("opacity", (entry) => !selectedId || entry.id === selectedId ? 1 : 0.24);
+      .attr("opacity", (entry) => (!id || entry.id === id ? 1 : 0.14));
     svg.selectAll<SVGCircleElement, SimNode>(".selection-ring")
-      .attr("opacity", (entry) => entry.id === selectedId ? 0.9 : 0);
+      .attr("opacity", (entry) => (entry.id === id ? 0.9 : 0));
+    // Keep the edges in step with an externally-driven selection, so the same
+    // "only my connections are bright" behaviour holds whether a node was
+    // clicked in the canvas or selected from elsewhere.
+    svg.selectAll<SVGLineElement, SimLink>(".links line").attr("stroke-opacity", (entry) => {
+      if (!id) return entry.kind === "same_document" ? 0.28 : 0.05 + entry.similarity * 0.13;
+      const source = typeof entry.source === "object" ? (entry.source as SimNode).id : String(entry.source);
+      const target = typeof entry.target === "object" ? (entry.target as SimNode).id : String(entry.target);
+      return source === id || target === id ? 0.95 : 0.012;
+    });
   }, [selectedId]);
 
   useEffect(() => {
@@ -328,6 +393,26 @@ export function CollectionGraph({
       />
       <div className="pointer-events-none absolute bottom-3 left-3 rounded-md border border-edge bg-raised/90 px-2.5 py-1.5 font-mono text-2xs text-subtle backdrop-blur">
         Drag nodes · scroll to zoom · click empty space to clear
+      </div>
+      <div className="pointer-events-none absolute right-3 top-3 flex flex-col gap-1.5 rounded-md border border-edge bg-raised/90 px-2.5 py-2 font-mono text-2xs text-subtle backdrop-blur">
+        <span className="flex items-center gap-2">
+          <span className="inline-block h-2.5 w-2.5 rounded-full" style={{ background: "#7c8cff" }} />
+          passage <span className="text-subtle/70">(coloured by document)</span>
+        </span>
+        <span className="flex items-center gap-2">
+          <span
+            className="inline-block h-3.5 w-3.5 rounded-full"
+            style={{ background: SUMMARY_GOLD, boxShadow: `0 0 0 2px ${SUMMARY_GOLD}` }}
+          />
+          document card
+        </span>
+        <span className="flex items-center gap-2">
+          <span
+            className="inline-block h-2.5 w-2.5 rounded-full border border-dashed"
+            style={{ background: SUMMARY_GOLD, borderColor: SUMMARY_GOLD }}
+          />
+          section summary
+        </span>
       </div>
     </div>
   );

@@ -7,6 +7,10 @@ import os
 from datetime import datetime
 from typing import Any
 
+
+def _summaries_enabled() -> bool:
+    return os.getenv("SUMMARIES_ENABLED", "false").lower() in ("1", "true", "yes")
+
 from arq.connections import RedisSettings
 
 from packages.core import blobs, chunks, graph, pages
@@ -311,6 +315,15 @@ async def embed_item(
             for p, vector in zip(passages, vectors, strict=True)
         ],
     )
+    # Index summaries: a navigable semantic layer over the passages. Enqueued
+    # AFTER embedding because summaries need the chunk nodes in Neo4j in order
+    # to attach SUMMARIZES edges. Gated separately from consolidation — this
+    # adds navigation but never archives or rewrites passages.
+    if _summaries_enabled() and (redis := ctx.get("redis")) is not None:
+        await redis.enqueue_job(
+            "summarize_item", workspace_id, collection_id, item.id
+        )
+
     return {"item_id": item.id, "outcome": "embedded", "chunks": written}
 
 
@@ -339,10 +352,49 @@ async def classify_new_item(
     }
 
 
+async def summarize_item(
+    ctx: dict[str, Any],
+    workspace_id: str,
+    collection_id: str | None,
+    item_id: str,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Generate index summaries for one document — a card + section summaries.
+
+    A SEPARATE background job, always — never inline in a request or in the
+    ingest path. It is enqueued only AFTER embed_item, so the chunk nodes it
+    hangs SUMMARIZES edges off already exist. Every model call inside runs on a
+    worker thread (see summarize.py), so a slow provider cannot block the loop.
+
+    Isolated on purpose: a failure here is logged and returned, never raised —
+    summarising is a best-effort navigation aid, and nothing it does may stall
+    or crash ingestion, the API, or the worker. Gated by SUMMARIES_ENABLED
+    unless ``force`` (the explicit "generate now" endpoint).
+    """
+    if not force and not _summaries_enabled():
+        return {"item_id": item_id, "outcome": "disabled"}
+
+    from packages.core.summarize import summarize_document
+
+    scope = _scope(workspace_id, collection_id)
+    try:
+        async with Session() as session:
+            item = await get_item(session, scope, item_id)
+            if item is None:
+                return {"item_id": item_id, "outcome": "missing"}
+            written = await summarize_document(
+                session, scope, item.id, item.title, generated_by="ingest"
+            )
+    except Exception as exc:  # noqa: BLE001 - a summary failure must never escalate
+        log.exception("summarize_item failed for %s", item_id)
+        return {"item_id": item_id, "outcome": "failed", "error": str(exc)[:200]}
+    return {"item_id": item_id, "outcome": "summarized", "summaries": written}
+
+
 class WorkerSettings:
     """arq worker entry point."""
 
-    functions = [ingest_file, ingest_text, embed_item, classify_new_item]
+    functions = [ingest_file, ingest_text, embed_item, classify_new_item, summarize_item]
     redis_settings = redis_settings()
     max_tries = 3
     job_timeout = 300

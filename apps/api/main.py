@@ -6,6 +6,7 @@ import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from arq import create_pool
@@ -44,6 +45,7 @@ from packages.core.consolidate import recent_runs
 from packages.core.consolidate import run_once as run_consolidation
 from packages.core.db import Session
 from packages.core.graph import chunk_lineage as graph_lineage
+from packages.core.graph import chunk_neighbours as graph_neighbours
 from packages.core.keys import create_key, list_keys, revoke_key
 from packages.core.neighbours import collection_graph
 from packages.core.normalise import can_parse, supported
@@ -73,8 +75,33 @@ from packages.shared.schema import Lifecycle, Scope
 # ---------------------------------------------------------------------------
 
 
+def _run_migrations() -> None:
+    """Apply every pending Alembic migration, up to head.
+
+    Run in a worker thread by the caller: alembic/env.py drives the async engine
+    with ``asyncio.run()``, which cannot be called from inside the server's
+    already-running event loop. script_location is resolved absolutely so it
+    does not depend on the directory the server started in.
+    """
+    from alembic import command
+    from alembic.config import Config
+
+    root = Path(__file__).resolve().parents[2]
+    cfg = Config(str(root / "alembic.ini"))
+    cfg.set_main_option("script_location", str(root / "alembic"))
+    command.upgrade(cfg, "head")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Bring the schema to head before anything serves — owned here, by the
+    # server itself, so a fresh boot (in Docker or a bare `uvicorn`) is always
+    # on the current schema and a new migration needs no manual step. Runs off
+    # the event loop because alembic's env drives an async engine. Set
+    # AUTO_MIGRATE=false where migrations are applied out of band (for instance
+    # several API replicas that must not race Alembic against each other).
+    if os.getenv("AUTO_MIGRATE", "true").lower() in ("1", "true", "yes"):
+        await asyncio.to_thread(_run_migrations)
     await graph.bootstrap()
     await blobs.ensure_bucket()
     app.state.queue = await create_pool(redis_settings())
@@ -261,7 +288,7 @@ async def retrieve(
 async def answer_question(
     q: str = Query(min_length=1),
     limit: int = Query(8, ge=1, le=20),
-    mode: str = Query("vectorless", pattern="^(hybrid|vectorless|agentic)$"),
+    mode: str = Query("agentic", pattern="^(hybrid|vectorless|agentic)$"),
     sources: list[str] | None = Query(None),
     scope: Scope = Depends(workspace_scope),
     principal: dict[str, Any] = Depends(resolve_caller),
@@ -282,16 +309,19 @@ async def answer_question(
 
     `mode` picks how the evidence is found:
 
-      vectorless  reason over each document's table of contents and open the
-                  sections that look like they answer it (default)
-      hybrid      passage embeddings and keyword matching, fused
-      agentic     one agent with both: it reasons over the tables of contents
-                  and may run hybrid search to locate a figure or identifier no
-                  heading advertises, then reads the section it lands in
+      agentic  (default) one agent reaches the whole collection: it reasons over
+               the tables of contents, runs hybrid search to locate a figure or
+               identifier no heading advertises, and hops the similarity graph
+               from a promising passage, then reads what it lands on
+      hybrid   passage embeddings and keyword matching, fused into one ranked
+               pass — fast, deterministic, the primitive other software builds on
 
-    Neither is a strict improvement on the other, so this is a choice rather
-    than a migration. The mode comes back on the response, because two answers
-    to one question can differ entirely on it.
+    A third value, `vectorless`, is accepted for backward compatibility only
+    (catalogue reasoning with search and graph-hop off); it is no longer a
+    surfaced choice and answers from a partial view once a collection exceeds
+    the catalogue window, which the response then says out loud. The mode comes
+    back on the response, because two answers to one question can differ
+    entirely on it.
     """
     cfg = RetrievalConfig(limit=limit, sources=tuple(sources or ()))
     result, trace = await answer(session, scope, q, cfg, mode=mode)
@@ -320,7 +350,7 @@ async def answer_question(
 async def answer_stream(
     q: str = Query(min_length=1),
     limit: int = Query(8, ge=1, le=20),
-    mode: str = Query("vectorless", pattern="^(hybrid|vectorless|agentic)$"),
+    mode: str = Query("agentic", pattern="^(hybrid|vectorless|agentic)$"),
     sources: list[str] | None = Query(None),
     scope: Scope = Depends(workspace_scope),
     principal: dict[str, Any] = Depends(resolve_caller),
@@ -1068,6 +1098,144 @@ async def consolidate_now(
     return outcome.as_dict()
 
 
+# ------------------------------ index summaries ------------------------------
+
+
+@app.get("/api/collections/{collection_id}/summaries")
+async def collection_summaries(
+    collection_id: str,
+    principal: dict[str, Any] = Depends(resolve_caller),
+    session: AsyncSession = Depends(db),
+) -> dict[str, Any]:
+    """Every index summary in this collection with coverage and provenance.
+
+    This is the Summaries view's data source: each summary, how many chunks it
+    connects, and how it was generated (at upload or by the mapper + its probe
+    question).
+    """
+    enforce_binding(principal, collection_id)
+    scope = Scope(workspace_id=str(principal["company_id"]), collection_id=collection_id)
+    coverage = await graph.summary_coverage(scope)
+
+    # Hydrate with the text + provenance fields from Postgres.
+    chunk_ids = [r["chunk_id"] for r in coverage]
+    if chunk_ids:
+        placeholders = ", ".join(f":c{i}" for i in range(len(chunk_ids)))
+        params: dict[str, Any] = {"w": scope.workspace_id}
+        params.update({f"c{i}": cid for i, cid in enumerate(chunk_ids)})
+        rows = (
+            await session.execute(
+                text(
+                    f"SELECT chunk_id, item_id, heading, text, node_type, generated_by, "  # noqa: S608
+                    f"probe_question FROM kb_chunks "
+                    f"WHERE workspace_id = :w AND chunk_id IN ({placeholders})"
+                ),
+                params,
+            )
+        ).all()
+        pg_data = {r.chunk_id: r for r in rows}
+    else:
+        pg_data = {}
+
+    summaries = []
+    for c in coverage:
+        pg = pg_data.get(c["chunk_id"])
+        summaries.append({
+            "chunk_id": c["chunk_id"],
+            "node_type": c.get("node_type") or (pg.node_type if pg else None),
+            "item_id": c.get("item_id") or (pg.item_id if pg else None),
+            "heading": c.get("heading") or (pg.heading if pg else None),
+            "text": pg.text if pg else None,
+            "covers": int(c.get("covers", 0)),
+            "generated_by": pg.generated_by if pg else None,
+            "probe_question": pg.probe_question if pg else None,
+        })
+
+    return {"summaries": summaries}
+
+
+@app.get("/api/collections/{collection_id}/mapping")
+async def collection_mapping(
+    collection_id: str,
+    limit: int = Query(20, ge=1, le=100),
+    principal: dict[str, Any] = Depends(resolve_caller),
+    session: AsyncSession = Depends(db),
+) -> dict[str, Any]:
+    """Mapping progress and recent mapper runs — the Summaries header stat.
+
+    Shows total/mapped/unmapped counts and a live feed of the probe-mapper's
+    runs (the random question it asked + chunks it mapped each pass).
+    """
+    enforce_binding(principal, collection_id)
+    scope = Scope(workspace_id=str(principal["company_id"]), collection_id=collection_id)
+
+    counts = await graph.mapping_counts(scope)
+
+    runs = (
+        await session.execute(
+            text(
+                "SELECT id, question, chunks_mapped, error, created_at "
+                "FROM mapper_runs "
+                "WHERE workspace_id = :w AND (collection_id = :c OR collection_id IS NULL) "
+                "ORDER BY created_at DESC LIMIT :limit"
+            ),
+            {"w": scope.workspace_id, "c": collection_id, "limit": limit},
+        )
+    ).all()
+
+    return {
+        **counts,
+        "runs": [
+            {
+                "id": r.id,
+                "question": r.question,
+                "chunks_mapped": r.chunks_mapped,
+                "error": r.error,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in runs
+        ],
+    }
+
+
+@app.post("/api/collections/{collection_id}/summarize")
+async def summarize_now(
+    collection_id: str,
+    principal: dict[str, Any] = Depends(resolve_caller),
+    session: AsyncSession = Depends(db),
+) -> dict[str, Any]:
+    """Queue index-summary generation for every document in this collection.
+
+    The work runs in the worker, never here: summarising is many model calls per
+    document, and doing it inline would block the API for the whole collection.
+    Each document is handed to the same background ``summarize_item`` job that
+    runs after an upload, so a slow or failing model call can never reach — let
+    alone stall — the request thread. Returns how many documents were queued.
+    """
+    require_write(principal)
+    enforce_binding(principal, collection_id)
+    workspace = str(principal["company_id"])
+
+    item_rows = (
+        await session.execute(
+            text(
+                "SELECT item_id FROM kb_items "
+                "WHERE workspace_id = :w AND collection_id = :c AND status = 'active'"
+            ),
+            {"w": workspace, "c": collection_id},
+        )
+    ).all()
+
+    for item in item_rows:
+        # force=True: an explicit "generate now" runs regardless of the
+        # SUMMARIES_ENABLED cron gate, like consolidate_now.
+        await app.state.queue.enqueue_job(
+            "summarize_item", workspace, collection_id, item.item_id, True
+        )
+
+    return {"documents": len(item_rows), "queued": len(item_rows)}
+
+
 @app.get("/api/chunks/{chunk_id}")
 async def read_chunk(
     chunk_id: str,
@@ -1147,6 +1315,41 @@ async def chunk_sources(
                 "text": (hydrated[s["chunk_id"]].text if s["chunk_id"] in hydrated else None),
             }
             for s in sources
+        ],
+    }
+
+
+@app.get("/api/chunks/{chunk_id}/neighbors")
+async def chunk_neighbors(
+    chunk_id: str,
+    limit: int = Query(10, ge=1, le=50),
+    principal: dict[str, Any] = Depends(resolve_caller),
+) -> dict[str, Any]:
+    """The passages nearest this one — the graph's traversal primitive.
+
+    Given a passage, what sits next to it in meaning: the stored :NEAR edges the
+    consolidation pass maintains. This is the hop an agent takes to walk from a
+    passage a search turned up to related material, following the thread rather
+    than searching again from the top. The same primitive serves our own
+    navigator and a caller's own-LLM agent through the SDK.
+    """
+    scope = Scope(workspace_id=str(principal["company_id"]))
+    neighbours = await graph_neighbours(scope, chunk_id, limit=limit)
+    return {
+        "chunk_id": chunk_id,
+        "neighbors": [
+            {
+                "neighbor_id": n["chunk_id"],
+                "item_id": n["item_id"],
+                "heading": n["heading"],
+                "title": n["title"],
+                "node_type": n["node_type"],
+                "relation": "near",
+                "similarity": (
+                    round(n["similarity"], 4) if n["similarity"] is not None else None
+                ),
+            }
+            for n in neighbours
         ],
     }
 

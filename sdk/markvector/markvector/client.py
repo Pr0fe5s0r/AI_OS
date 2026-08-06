@@ -24,7 +24,10 @@ from .models import (
     Chunk,
     CollectionInfo,
     Document,
+    IndexSummary,
+    Match,
     MintedKey,
+    Neighbor,
     Results,
     Structure,
     WriteResult,
@@ -367,16 +370,24 @@ class Collection:
     def answer(
         self,
         question: str,
-        mode: str = "vectorless",
+        mode: str = "agentic",
         limit: int = 8,
         sources: list[str] | None = None,
     ) -> Answer:
         """Retrieval, then a written answer built only from what was retrieved.
 
         Check `answer.grounded` before trusting the text: it is False when the
-        store had nothing to answer from. `mode` is "vectorless" (reason over
-        each document's table of contents) or "hybrid" (passage embeddings +
-        keyword, fused).
+        store had nothing to answer from. `mode` is one of:
+
+          "agentic"  (default) an agent reaches the whole collection — reasoning
+                     over each document's table of contents, searching passages,
+                     and hopping the similarity graph as the question needs.
+          "hybrid"   passage embeddings + keyword, fused into one ranked pass:
+                     fast and deterministic.
+
+        ("vectorless" is still accepted for backward compatibility — catalogue
+        reasoning only — but agentic does the same and also reaches the rest of
+        a large collection, so prefer it.)
         """
         params: dict[str, Any] = {"q": question, "mode": mode, "limit": limit}
         if sources:
@@ -462,6 +473,41 @@ class Collection:
             "GET", f"/api/items/{document_id}/chunks", headers=self._headers
         )
         return [Chunk.from_json(c) for c in payload.get("chunks", [])]
+
+    def summaries(self) -> _List[IndexSummary]:
+        """The collection's navigable index: a card per document (what it is
+        about) and section summaries (what each part contains), with how many
+        passages each connects.
+
+        Read this FIRST to find the right sources. It is the map — a card tells
+        you which document holds what — and then `search`, `structure` and `get`
+        are how you follow it to the real passages an answer must cite.
+        """
+        payload = self._mv._request(
+            "GET", f"/api/collections/{self.id}/summaries", headers=self._headers
+        )
+        return [IndexSummary.from_json(s) for s in payload.get("summaries", [])]
+
+    def neighbors(self, chunk: str | Chunk | Match, limit: int = 10) -> _List[Neighbor]:
+        """The passages nearest a given one — a hop across the similarity graph.
+
+        The traversal primitive. Pass a passage's `chunk_id` — a `Match` from
+        `search()` carries one, as does a `Chunk` from `chunks()` — and get back
+        what sits next to it in meaning, so an agent can follow the thread from a
+        hit to related passages instead of searching again from the top. Feed a
+        returned `neighbor_id` straight back in to keep walking.
+
+        These are the stored links the consolidation pass maintains, so the walk
+        is over the graph as the store has organised it, not a fresh computation.
+        """
+        cid = chunk if isinstance(chunk, str) else chunk.chunk_id
+        payload = self._mv._request(
+            "GET",
+            f"/api/chunks/{cid}/neighbors",
+            params={"limit": limit},
+            headers=self._headers,
+        )
+        return [Neighbor.from_json(n) for n in payload.get("neighbors", [])]
 
     def download_original(
         self, document_id: str, path: str | Path | None = None

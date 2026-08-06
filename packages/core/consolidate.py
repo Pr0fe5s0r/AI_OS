@@ -12,6 +12,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core import graph
+from packages.core.neighbours import knn_edges
 from packages.shared.schema import Scope
 
 # ---------------------------------------------------------------------------
@@ -431,7 +432,13 @@ async def run_once(session: AsyncSession, scope: Scope) -> Outcome:
     await session.commit()
 
     live = await graph.collection_chunk_vectors(scope, limit=400, live_only=True)
-    degrees = await _degrees(live)
+    # One k-NN computation, used twice: it is the degree signal promote() needs,
+    # AND the :NEAR edge set the traversal tools walk. Persisted here because
+    # this pass already has the live graph in hand — rebuilding the edges
+    # anywhere else would mean recomputing the same neighbours over again.
+    edges, _ = knn_edges(live)
+    await graph.replace_near_edges(scope, edges)
+    degrees = _degrees_from_edges(edges)
     outcome.promoted = await promote(session, scope, degrees)
     outcome.duration_ms = int((time.perf_counter() - started) * 1000)
 
@@ -455,11 +462,13 @@ async def run_once(session: AsyncSession, scope: Scope) -> Outcome:
     return outcome
 
 
-async def _degrees(points: list[dict[str, Any]]) -> dict[str, int]:
-    """Neighbour counts, from the same k-NN rule the graph view draws."""
-    from packages.core.neighbours import knn_edges
+def _degrees_from_edges(edges: list[dict[str, Any]]) -> dict[str, int]:
+    """Neighbour counts from the k-NN edge set — the signal promote() ranks by.
 
-    edges, _ = knn_edges(points)
+    Takes the edges already computed in ``run_once`` rather than recomputing
+    them: the same k-NN pass now serves both promotion and the persisted :NEAR
+    graph, so it runs once.
+    """
     degrees: dict[str, int] = {}
     for edge in edges:
         degrees[edge["src"]] = degrees.get(edge["src"], 0) + 1

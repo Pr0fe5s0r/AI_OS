@@ -91,6 +91,9 @@ async def for_item(session: AsyncSession, scope: Scope, item_id: str) -> list[St
                 """
                 SELECT chunk_id, item_id, ordinal, heading, text FROM kb_chunks
                 WHERE workspace_id = :w AND item_id = :i AND archived_at IS NULL
+                  -- Real passages only: a summary is not a passage of the
+                  -- document, so it must not be embedded or replaced as one.
+                  AND node_type = 'fact'
                 ORDER BY ordinal
                 """
             ),
@@ -147,6 +150,10 @@ async def keyword_search(
                   -- already decided they are superseded or decaying, and
                   -- answering from them would contradict that.
                   AND archived_at IS NULL
+                  -- Index summaries (card / section_summary) are a navigation
+                  -- layer, never answer evidence. Merge 'summary' nodes stay,
+                  -- since they replace the passages they were built from.
+                  AND node_type NOT IN ('card', 'section_summary')
                   AND content_tsv @@ websearch_to_tsquery('english', :q)
                 ORDER BY score DESC
                 LIMIT :limit

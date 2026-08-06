@@ -61,6 +61,38 @@ async def test_keyword_search_works_without_any_embedding(db):
     assert trace.keyword, "the keyword arm must have proposed passages"
 
 
+async def test_index_summaries_do_not_appear_as_search_evidence(db):
+    """Navigation summaries are kept for browsing, but never surfaced as answer evidence."""
+    await put_item(db, _doc(_LONG))
+    await db.commit()
+
+    await db.execute(
+        text(
+            """
+            INSERT INTO kb_chunks (
+                chunk_id, workspace_id, collection_id, item_id, version, ordinal,
+                heading, text, node_type, generated_by, merged_from
+            ) VALUES (
+                :cid, :w, :c, :item, NULL, 0, :heading, :text, 'section_summary', 'ingest', '[]'::jsonb
+            )
+            """
+        ),
+        {
+            "cid": "summary-test",
+            "w": SCOPE.workspace_id,
+            "c": SCOPE.collection_id,
+            "item": "dummy-item",
+            "heading": "Navigation summary",
+            "text": "This summary should never be returned as evidence.",
+        },
+    )
+    await db.commit()
+
+    hits, _ = await search_traced(db, SCOPE, "receipts submitted within thirty days")
+    assert hits, "real passages must still answer the query"
+    assert all(p.chunk_id != "summary-test" for h in hits for p in h.passages)
+
+
 async def test_the_citation_and_the_quote_are_the_same_passage(db):
     """A result was once cited as one section while quoting text from another,
     because the heading came from the vector arm's best passage and the excerpt

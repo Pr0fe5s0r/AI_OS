@@ -201,6 +201,10 @@ class Match:
     score: float
     semantic: float = 0.0
     keyword: float = 0.0
+    # The passage that actually won this result — the unit that was scored, and
+    # the handle a graph hop starts from. Pass it to `collection.neighbors()` to
+    # walk from this hit to what sits near it in meaning.
+    chunk_id: str = ""
     categories: list[Category] = field(default_factory=list)
 
     @property
@@ -219,6 +223,9 @@ class Match:
 
     @classmethod
     def from_json(cls, d: dict[str, Any]) -> Match:
+        # The winning passage rides along under `passages`, best first; its id is
+        # what a graph traversal hops from.
+        passages = d.get("passages") or []
         return cls(
             id=d.get("item_id", ""),
             title=d.get("title", ""),
@@ -227,6 +234,7 @@ class Match:
             score=float(d.get("score", 0) or 0),
             semantic=float(d.get("semantic", 0) or 0),
             keyword=float(d.get("keyword", 0) or 0),
+            chunk_id=(passages[0].get("chunk_id", "") if passages else ""),
             categories=[Category.from_json(c) for c in d.get("classes") or []],
         )
 
@@ -265,6 +273,70 @@ class Results:
             trace_id=d.get("trace_id", ""),
             took_ms=int(d.get("took_ms", 0) or 0),
             degraded=d.get("degraded"),
+        )
+
+
+@dataclass(slots=True)
+class Neighbor:
+    """A passage adjacent to another in the store's similarity graph.
+
+    What a hop returns: the neighbour's own `neighbor_id` — feed it straight
+    back to `collection.neighbors()` to keep walking — the document it belongs
+    to, and how close it sits. `relation` names the edge; today always "near", a
+    computed cosine link, with room for typed links later.
+    """
+
+    neighbor_id: str
+    item_id: str
+    heading: str
+    title: str
+    node_type: str = "fact"
+    relation: str = "near"
+    similarity: float = 0.0
+
+    @classmethod
+    def from_json(cls, d: dict[str, Any]) -> Neighbor:
+        return cls(
+            neighbor_id=d.get("neighbor_id", ""),
+            item_id=d.get("item_id", "") or "",
+            heading=d.get("heading", "") or "",
+            title=d.get("title", "") or "",
+            node_type=d.get("node_type", "fact") or "fact",
+            relation=d.get("relation", "near") or "near",
+            similarity=float(d.get("similarity", 0) or 0),
+        )
+
+
+@dataclass(slots=True)
+class IndexSummary:
+    """A navigation summary over a document's passages: a ``card`` (what the whole
+    document is about) or a ``section_summary`` (what one section contains).
+
+    Read these first to find the right sources. They are model-written and never
+    cited — drop to the real passages (``search`` / ``get``) for evidence.
+    ``covers`` is how many passages the summary connects.
+    """
+
+    chunk_id: str
+    node_type: str
+    item_id: str | None
+    heading: str
+    text: str
+    covers: int
+    generated_by: str | None = None
+    probe_question: str | None = None
+
+    @classmethod
+    def from_json(cls, d: dict[str, Any]) -> IndexSummary:
+        return cls(
+            chunk_id=d.get("chunk_id", ""),
+            node_type=d.get("node_type", "") or "",
+            item_id=d.get("item_id"),
+            heading=d.get("heading", "") or "",
+            text=d.get("text", "") or "",
+            covers=int(d.get("covers", 0) or 0),
+            generated_by=d.get("generated_by"),
+            probe_question=d.get("probe_question"),
         )
 
 
@@ -427,8 +499,10 @@ __all__ = [
     "Citation",
     "CollectionInfo",
     "Document",
+    "IndexSummary",
     "Match",
     "MintedKey",
+    "Neighbor",
     "Original",
     "Results",
     "Section",

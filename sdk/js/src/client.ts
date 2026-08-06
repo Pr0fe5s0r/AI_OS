@@ -5,7 +5,10 @@ import {
   type Chunk,
   type CollectionInfo,
   type Document,
+  type IndexSummary,
+  type Match,
   type MintedKey,
+  type Neighbor,
   type Answer,
   type Results,
   type Structure,
@@ -14,7 +17,9 @@ import {
   toChunk,
   toCollectionInfo,
   toDocument,
+  toIndexSummary,
   toMintedKey,
+  toNeighbor,
   toAnswer,
   toResults,
   toStructure,
@@ -339,15 +344,18 @@ export class Collection {
   }
 
   /** Retrieval, then a written answer built only from what was retrieved.
-   *  `mode` is "vectorless" (default; reason over the heading tree) or "hybrid"
-   *  (passage embeddings + keyword). Check `answer.grounded`. */
+   *  `mode` is "agentic" (default; an agent reasons over the heading tree,
+   *  searches passages, and hops the similarity graph, reaching the whole
+   *  collection) or "hybrid" (passage embeddings + keyword, fused — fast and
+   *  deterministic). "vectorless" is still accepted for backward compatibility.
+   *  Check `answer.grounded`. */
   async answer(
     question: string,
-    opts: { mode?: "vectorless" | "hybrid"; limit?: number; sources?: string[] } = {},
+    opts: { mode?: "agentic" | "hybrid" | "vectorless"; limit?: number; sources?: string[] } = {},
   ): Promise<Answer> {
     const q: [string, string][] = [
       ["q", question],
-      ["mode", opts.mode ?? "vectorless"],
+      ["mode", opts.mode ?? "agentic"],
       ["limit", String(opts.limit ?? 8)],
     ];
     for (const s of opts.sources ?? []) q.push(["sources", s]);
@@ -395,8 +403,36 @@ export class Collection {
     return payload.chunks.map(toChunk);
   }
 
-  /** The document's heading tree — the PageIndex structure vectorless search
-   *  reasons over. */
+  /** The collection's navigable index: a card per document (what it is about)
+   *  and section summaries (what each part contains), with how many passages
+   *  each connects. Read this FIRST to find the right sources — it is the map,
+   *  and `search`/`structure`/`get` are how you follow it to the real passages
+   *  an answer must cite. */
+  async summaries(): Promise<IndexSummary[]> {
+    const payload = await this.mv.request<{ summaries: any[] }>(
+      "GET",
+      `/api/collections/${this.id}/summaries`,
+      { collection: this.id },
+    );
+    return payload.summaries.map(toIndexSummary);
+  }
+
+  /** The passages nearest a given one — a hop across the similarity graph. Pass
+   *  a passage's chunkId (a Match from `search()` carries one, as does a Chunk
+   *  from `chunks()`) and get back what sits next to it in meaning; feed a
+   *  returned `neighborId` straight back in to keep walking. These are the
+   *  stored links the consolidation pass maintains. */
+  async neighbors(chunk: string | Chunk | Match, opts: { limit?: number } = {}): Promise<Neighbor[]> {
+    const chunkId = typeof chunk === "string" ? chunk : chunk.chunkId;
+    const payload = await this.mv.request<{ neighbors: any[] }>("GET", `/api/chunks/${chunkId}/neighbors`, {
+      collection: this.id,
+      query: [["limit", String(opts.limit ?? 10)]],
+    });
+    return payload.neighbors.map(toNeighbor);
+  }
+
+  /** The document's heading tree — the PageIndex structure the agent reasons
+   *  over to choose which sections to read. */
   async structure(file: string | Document): Promise<Structure> {
     return toStructure(
       await this.mv.request("GET", `/api/items/${docId(file)}/structure`, { collection: this.id }),

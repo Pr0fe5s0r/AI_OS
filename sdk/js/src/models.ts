@@ -144,6 +144,9 @@ export interface Match {
   semantic: number;
   keyword: number;
   categories: Category[];
+  /** The winning passage's id — the handle a graph hop starts from. Pass it to
+   *  `collection.neighbors()` to walk from this hit to what sits near it. */
+  chunkId: string;
   /** How it was found: "meaning+wording" | "meaning" | "wording". */
   matchedOn: string;
   /** The excerpt without the highlight markers. */
@@ -165,8 +168,34 @@ export function toMatch(d: Raw): Match {
     semantic,
     keyword,
     categories: (d.classes ?? []).map(toCategory),
+    // The winning passage rides along under `passages`, best first.
+    chunkId: d.passages?.[0]?.chunk_id ?? "",
     matchedOn: byMeaning && byWording ? "meaning+wording" : byMeaning ? "meaning" : "wording",
     cleanExcerpt: excerpt.replaceAll("[[", "").replaceAll("]]", ""),
+  };
+}
+
+/** A passage adjacent to another in the store's similarity graph — what a hop
+ *  returns. Feed `neighborId` back to `neighbors()` to keep walking. */
+export interface Neighbor {
+  neighborId: string;
+  itemId: string;
+  heading: string;
+  title: string;
+  nodeType: string;
+  relation: string;
+  similarity: number;
+}
+
+export function toNeighbor(d: Raw): Neighbor {
+  return {
+    neighborId: d.neighbor_id ?? "",
+    itemId: d.item_id ?? "",
+    heading: d.heading ?? "",
+    title: d.title ?? "",
+    nodeType: d.node_type ?? "fact",
+    relation: d.relation ?? "near",
+    similarity: Number(d.similarity ?? 0) || 0,
   };
 }
 
@@ -186,6 +215,34 @@ export function toResults(d: Raw): Results {
     traceId: d.trace_id ?? "",
     tookMs: Number(d.took_ms ?? 0),
     degraded: d.degraded ?? null,
+  };
+}
+
+/** A navigation summary over a document's passages: a `card` (what the whole
+ *  document is about) or a `section_summary` (what one section contains). Read
+ *  these first to find the right sources; they are never cited — drop to real
+ *  passages (search / get) for evidence. `covers` is how many passages it links. */
+export interface IndexSummary {
+  chunkId: string;
+  nodeType: string;
+  itemId: string | null;
+  heading: string;
+  text: string;
+  covers: number;
+  generatedBy: string | null;
+  probeQuestion: string | null;
+}
+
+export function toIndexSummary(d: Raw): IndexSummary {
+  return {
+    chunkId: d.chunk_id ?? "",
+    nodeType: d.node_type ?? "",
+    itemId: d.item_id ?? null,
+    heading: d.heading ?? "",
+    text: d.text ?? "",
+    covers: Number(d.covers ?? 0) || 0,
+    generatedBy: d.generated_by ?? null,
+    probeQuestion: d.probe_question ?? null,
   };
 }
 

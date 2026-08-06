@@ -11,7 +11,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 EXPOSE 8000
-# Apply every pending schema migration before accepting traffic. This is
-# intentionally owned by the API container so the API and worker do not race
-# each other while running Alembic during a fresh deployment.
-CMD ["sh", "-c", "alembic upgrade head && exec uvicorn apps.api.main:app --host 0.0.0.0 --port 8000"]
+# Migrations run in the API's own startup (lifespan) now — before it serves, and
+# owned by the API alone so it never races the worker over Alembic. That covers
+# a bare `uvicorn` too, not just this image. Set AUTO_MIGRATE=false to skip it
+# where migrations are applied out of band.
+CMD ["uvicorn", "apps.api.main:app", "--host", "0.0.0.0", "--port", "8000"]

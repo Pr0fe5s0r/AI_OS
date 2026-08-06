@@ -6,11 +6,12 @@ import { Collection, cx } from "../data";
 import { Code, Mono } from "../ui/kit";
 
 type Lang = "javascript" | "python";
-type Topic = "start" | "search" | "answer" | "files" | "agent" | "manage";
+type Topic = "start" | "search" | "explore" | "answer" | "files" | "agent" | "manage";
 
 const TOPICS: { id: Topic; label: string }[] = [
   { id: "start", label: "Get started" },
   { id: "search", label: "Add & search" },
+  { id: "explore", label: "Explore the index" },
   { id: "answer", label: "Ask questions" },
   { id: "files", label: "Files" },
   { id: "agent", label: "Agent" },
@@ -173,6 +174,49 @@ console.log(await mv.trace(results.traceId));`}
           </TopicPanel>
         )}
 
+        {topic === "explore" && (
+          <TopicPanel
+            title="Explore the index"
+            description="Two navigation layers over your passages: summaries — a card per document and a summary per section — to find the right source, and neighbors to hop the similarity graph from one passage to what sits near it. Both guide navigation; neither is ever cited."
+          >
+            <LanguageCode
+              lang={lang}
+              python={`# The map: a card per document (what it is about) and section summaries.
+# Read this FIRST to find the right source before searching.
+for s in docs.summaries():
+    if s.node_type == "card":
+        print(s.item_id, "·", s.covers, "passages")
+        print("  ", s.text[:90])
+
+# The hop: from a search hit, walk to the passages nearest it in meaning —
+# related material a fresh query would miss, one step away.
+hit = docs.search("beneficiary account")[0]
+for n in docs.neighbors(hit.chunk_id):
+    print(f"{n.similarity:.3f}  {n.heading}  → {n.neighbor_id}")`}
+              javascript={`// The map: a card per document (what it is about) and section summaries.
+// Read this FIRST to find the right source before searching.
+for (const s of await docs.summaries()) {
+  if (s.nodeType === "card") {
+    console.log(s.itemId, "·", s.covers, "passages");
+    console.log("  ", s.text.slice(0, 90));
+  }
+}
+
+// The hop: from a search hit, walk to the passages nearest it in meaning —
+// related material a fresh query would miss, one step away.
+const [hit] = (await docs.search("beneficiary account")).matches;
+for (const n of await docs.neighbors(hit.chunkId)) {
+  console.log(n.similarity.toFixed(3), n.heading, "→", n.neighborId);
+}`}
+            />
+            <Note>
+              Summaries and neighbours are built by a background pass and appear once a
+              collection has been indexed. They are a navigation aid — answers still cite the
+              real passages <Mono>search</Mono> and <Mono>answer</Mono> return, never a summary.
+            </Note>
+          </TopicPanel>
+        )}
+
         {topic === "answer" && (
           <TopicPanel
             title="Ask a grounded question"
@@ -182,7 +226,7 @@ console.log(await mv.trace(results.traceId));`}
               lang={lang}
               python={`answer = docs.answer(
     "Summarise Q2 paid performance",
-    mode="vectorless",
+    mode="agentic",
 )
 
 if not answer.grounded:
@@ -192,7 +236,7 @@ else:
     for citation in answer.citations:
         print(f"[{citation.marker}] {citation.title} — {citation.heading}")`}
               javascript={`const answer = await docs.answer("Summarise Q2 paid performance", {
-  mode: "vectorless",
+  mode: "agentic",
 });
 
 if (!answer.grounded) {
@@ -205,8 +249,9 @@ if (!answer.grounded) {
 }`}
             />
             <Note>
-              <Mono>vectorless</Mono> reads document heading trees. Use <Mono>hybrid</Mono> for
-              passage embeddings plus keyword retrieval.
+              <Mono>agentic</Mono> (default) reasons over heading trees, searches passages, and
+              hops the similarity graph to reach the whole collection. Use <Mono>hybrid</Mono>{" "}
+              for a fast, deterministic embeddings-plus-keyword ranking.
             </Note>
           </TopicPanel>
         )}
@@ -222,7 +267,7 @@ if (!answer.grounded) {
 
 file = docs.files()[0]
 
-# PageIndex heading tree used by vectorless retrieval.
+# PageIndex heading tree the agent reasons over to find sections.
 for section in docs.structure(file).walk():
     print(section.title, section.opens)
 
@@ -232,7 +277,7 @@ docs.download_original(file.id, path="q2-copy.pdf")`}
 
 const [file] = await docs.files();
 
-// PageIndex heading tree used by vectorless retrieval.
+// PageIndex heading tree the agent reasons over to find sections.
 const structure = await docs.structure(file);
 for (const section of structure.sections) {
   console.log(section.title, section.opens);
@@ -252,7 +297,7 @@ await docs.downloadOriginal(file.id, { path: "q2-copy.pdf" });`}
         {topic === "agent" && (
           <TopicPanel
             title="Run a read-only agent"
-            description="Bring an OpenAI-compatible model. Ask across the entire collection, or enforce a selected-file scope for one question. The agent cannot write to the collection."
+            description="Bring an OpenAI-compatible model. The agent reads the index overview to find the right documents, then searches, reads structure, and hops the similarity graph — grounding every claim in real passages. Ask across the whole collection, or scope one question to selected files. It cannot write."
           >
             <Install lang={lang} agent />
             <LanguageCode
@@ -308,9 +353,11 @@ for await (const event of agent.stream("How does the spec handle voice input?", 
               </p>
             </div>
             <Note>
-              A selected-file run is a hard boundary: search, file listing, structure, and
-              document reads are all restricted. Omit <Mono>files</Mono> to use the whole
-              collection. Use <Mono>instructions</Mono> for additive custom prompting;
+              The agent has five tools: <Mono>overview</Mono> (read the index first),
+              <Mono>search</Mono>, <Mono>structure</Mono>, <Mono>read_document</Mono>, and
+              <Mono>neighbors</Mono> (hop the graph). A selected-file run is a hard boundary —
+              every tool is restricted to those files. Omit <Mono>files</Mono> to use the whole
+              collection. Use <Mono>instructions</Mono> for additive prompting;{" "}
               <Mono>system</Mono> replaces the complete built-in prompt.
             </Note>
           </TopicPanel>
@@ -504,7 +551,9 @@ function aiDoc(lang: Lang, collection: string, base: string): string {
       "- `docs.add(text, locator=..., title=..., wait=False)` stores text.",
       "- `docs.add_file(path, wait=False)` uploads PDF, Word, Markdown, or text.",
       "- `docs.search(query, limit=10, files=[...])` returns iterable results with `trace_id`.",
-      "- `docs.answer(question, mode='vectorless')` returns text, citations, and `grounded`.",
+      "- `docs.summaries()` returns the index — a card per document + section summaries. Read first.",
+      "- `docs.neighbors(chunk_id, limit=10)` returns passages nearest one in the graph — a hop.",
+      "- `docs.answer(question, mode='agentic')` returns text, citations, and `grounded`.",
       "- `docs.list()` lists documents; `docs.files()` lists uploaded files with originals.",
       "- `docs.structure(file)` returns the PageIndex heading tree.",
       "- `docs.chunks(document_id)` returns indexed passages.",
@@ -571,7 +620,9 @@ print(result.answer, result.tool_calls)`
     "- `docs.add(text, { locator, title, wait })` stores text.",
     "- `docs.addFile(path, { wait })` uploads PDF, Word, Markdown, or text.",
     "- `docs.search(query, { limit, files })` returns `{ matches, traceId }`.",
-    "- `docs.answer(question, { mode: 'vectorless' })` returns text, citations, and `grounded`.",
+    "- `docs.summaries()` returns the index — a card per document + section summaries. Read first.",
+    "- `docs.neighbors(chunkId, { limit })` returns passages nearest one in the graph — a hop.",
+    "- `docs.answer(question, { mode: 'agentic' })` returns text, citations, and `grounded`.",
     "- `docs.list()` lists documents; `docs.files()` lists uploaded files with originals.",
     "- `docs.structure(file)` returns the PageIndex heading tree.",
     "- `docs.chunks(documentId)` returns indexed passages.",

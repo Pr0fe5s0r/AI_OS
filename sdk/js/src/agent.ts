@@ -4,10 +4,21 @@ import { type Document, walkSections } from "./models.js";
 
 const DEFAULT_MODEL = "gpt-4o-mini";
 const READ_BUDGET = 8000;
+// The overview is a MAP, so it must stay scannable: the document cards, bounded
+// and trimmed, not every section summary. Past this many documents the tail is
+// left to search — a card the model cannot read is no better than one it never
+// got, the same reason the navigator caps its catalogue.
+const MAX_OVERVIEW = 60;
 
 const DEFAULT_SYSTEM = `You are a research assistant answering questions from a private knowledge base, using ONLY the tools provided to look things up.
 
-Work like this: search for what you need, list or open the relevant files, read the sections that matter, then answer. Ground every claim in what the tools returned — do not use outside knowledge. For a long, structured document, prefer structure to see its sections and read_document to read it; for a specific fact, prefer search. Cite the file (item_id / filename) a claim came from. If the knowledge base does not contain the answer, say so plainly rather than guessing.`;
+Work like this:
+1. FIRST call overview — a card for each document describing what it is about. Use it to find the document that holds the answer.
+2. When the overview points to a document, open it directly with read_document (or structure first for a long one) and read it. Do NOT search when the map already tells you which document to open — reading the right source is faster and more reliable than searching for it.
+3. Search ONLY when the overview does not make the source obvious: a specific figure, name or identifier no card would mention, or when you genuinely cannot tell which document to open.
+4. When a passage a search or read returned is close but not complete, call neighbors on its chunk_id to reach the passages nearest it in the store's graph — often the rest of the answer sits one hop away.
+
+Ground every claim in what the tools returned — do not use outside knowledge. The overview is a MAP, not evidence: never cite it; cite the real document (item_id / filename) a claim came from. If the knowledge base does not contain the answer, say so plainly rather than guessing.`;
 
 type JsonObject = Record<string, unknown>;
 type Message = Record<string, unknown>;
@@ -103,6 +114,15 @@ const TOOLS = [
   {
     type: "function",
     function: {
+      name: "overview",
+      description:
+        "The collection's MAP, read FIRST: a card for each document describing what it is about, with its document id and how many passages it covers. Use it to find the document that holds the answer and open it directly with read_document — it lets you SKIP searching when the right source is obvious. It is the map, not the evidence, so never cite it.",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "search",
       description:
         "Search the knowledge base by meaning and wording. Returns the best-matching passages with their document id, filename and score.",
@@ -152,6 +172,22 @@ const TOOLS = [
         type: "object",
         properties: { item_id: { type: "string" } },
         required: ["item_id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "neighbors",
+      description:
+        "Given a passage's chunk_id (from a search result, or an earlier neighbors hop), list the passages nearest it in meaning — the store's own similarity graph. Related material often sits one hop from the first hit, where a fresh search would miss it. Returns each neighbour's chunk_id (hop again from it), the document it belongs to, and how close it is.",
+      parameters: {
+        type: "object",
+        properties: {
+          chunk_id: { type: "string" },
+          limit: { type: "integer", default: 10 },
+        },
+        required: ["chunk_id"],
       },
     },
   },
@@ -300,6 +336,29 @@ export class Agent {
     selectedFiles?: ReadonlySet<string>,
   ): Promise<unknown> {
     try {
+      if (name === "overview") {
+        // A lean map: the document CARDS ("what is this file about"), so the
+        // model can pick the right source and read it directly rather than
+        // searching. Bounded and trimmed so it stays scannable — section-level
+        // detail comes from reading or searching the file a card points to.
+        // Falls back to section summaries only when a collection has no cards.
+        const everything = (await this.collection.summaries()).filter(
+          (s) => selectedFiles === undefined || (s.itemId !== null && selectedFiles.has(s.itemId)),
+        );
+        const cards = everything.filter((s) => s.nodeType === "card");
+        const pool = (cards.length ? cards : everything).sort((a, b) => b.covers - a.covers);
+        const out: JsonObject[] = pool.slice(0, MAX_OVERVIEW).map((s) => ({
+          item_id: s.itemId,
+          kind: s.nodeType,
+          heading: s.heading,
+          about: s.text.slice(0, 240),
+          covers: s.covers,
+        }));
+        if (pool.length > MAX_OVERVIEW) {
+          out.push({ note: `${pool.length - MAX_OVERVIEW} more documents not shown here — use search to reach them.` });
+        }
+        return out;
+      }
       if (name === "search") {
         const limit = finiteNumber(args.limit, 8);
         const requested = Array.isArray(args.files) ? args.files.map(String) : undefined;
@@ -312,6 +371,9 @@ export class Agent {
         const results = await this.collection.search(String(args.query ?? ""), { limit, files });
         return results.matches.map((hit) => ({
           item_id: hit.id,
+          // The winning passage's id, so the model can hop from a hit to its
+          // neighbours instead of only reading its file.
+          chunk_id: hit.chunkId,
           title: hit.title,
           score: Math.round(hit.score * 10000) / 10000,
           excerpt: hit.cleanExcerpt.slice(0, 400),
@@ -358,6 +420,22 @@ export class Agent {
         };
         if (doc.body.length > READ_BUDGET) result.truncated = true;
         return result;
+      }
+      if (name === "neighbors") {
+        const chunkId = String(args.chunk_id ?? "");
+        if (!chunkId) return { error: "neighbors needs a chunk_id from a search result or a hop" };
+        const found = await this.collection.neighbors(chunkId, { limit: finiteNumber(args.limit, 10) });
+        // Honour the same file scope search does: a hop must not walk out of the
+        // documents the caller confined the agent to.
+        return found
+          .filter((n) => selectedFiles === undefined || selectedFiles.has(n.itemId))
+          .map((n) => ({
+            chunk_id: n.neighborId,
+            item_id: n.itemId,
+            heading: n.heading,
+            title: n.title,
+            similarity: Math.round(n.similarity * 10000) / 10000,
+          }));
       }
       return { error: `unknown tool ${JSON.stringify(name)}` };
     } catch (error) {

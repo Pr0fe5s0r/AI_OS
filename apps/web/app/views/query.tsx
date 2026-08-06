@@ -165,12 +165,15 @@ export function Query({ active }: { active: string | null }) {
   const [pending, setPending] = useState<string | null>(null);
   // Remembered rather than reset every visit: a retrieval preference is a
   // standing choice about how you want the store to work, not a per-question
-  // one. Vectorless is the default until someone says otherwise.
-  const [mode, setMode] = useState<api.AskMode>("vectorless");
+  // one. Agentic is the default — it reaches the whole collection.
+  const [mode, setMode] = useState<api.AskMode>("agentic");
 
   useEffect(() => {
     const saved = localStorage.getItem("retrieval-mode");
-    if (saved === "hybrid" || saved === "vectorless" || saved === "agentic") setMode(saved);
+    if (saved === "hybrid" || saved === "agentic") setMode(saved);
+    // vectorless was retired as a choice; carry an old preference over to
+    // agentic, which does the same catalogue reasoning and also reaches the rest.
+    else if (saved === "vectorless") setMode("agentic");
   }, []);
 
   function choose(next: api.AskMode) {
@@ -233,21 +236,19 @@ export function Query({ active }: { active: string | null }) {
             </p>
           </div>
           <div className="ml-auto flex items-center gap-3">
-            {/* Two ways of finding the evidence. Neither is strictly better,
-                so it is a choice rather than a setting with a right answer. */}
+            {/* Two modes: agentic reasons and reaches the whole collection;
+                hybrid is the fast, deterministic ranking integrations build on. */}
             <div className="flex items-center gap-1.5">
               <Label>retrieval</Label>
               <div className="flex gap-1 rounded-lg border border-edge bg-elevated p-0.5">
-                {(["vectorless", "hybrid", "agentic"] as const).map((m) => (
+                {(["agentic", "hybrid"] as const).map((m) => (
                   <button
                     key={m}
                     onClick={() => choose(m)}
                     title={
-                      m === "hybrid"
-                        ? "Match passages by meaning and by wording, then fuse. Better at finding a specific figure or identifier anywhere in a collection."
-                        : m === "agentic"
-                          ? "One agent with both: it reasons over the tables of contents and runs hybrid search to locate a figure or identifier no heading advertises, then reads that section. Best on mixed questions over structured documents."
-                          : "Read each document's table of contents and reason about which sections answer the question. No embeddings. Better on long structured documents. (default)"
+                      m === "agentic"
+                        ? "One agent that reaches the whole collection: it reasons over the tables of contents, searches passages, and hops the similarity graph from a promising hit, then reads what it lands on. Best for most questions. (default)"
+                        : "Match passages by meaning and by wording, then fuse into one ranked pass. Fast and deterministic — the primitive integrations build on."
                     }
                     className={cx(
                       "rounded-md px-2.5 py-1 font-mono text-2xs transition",
@@ -270,11 +271,9 @@ export function Query({ active }: { active: string | null }) {
               </span>
               <h2 className="mt-4 text-lg font-semibold text-ink">Ask your collection</h2>
               <p className="mt-2 max-w-md text-sm leading-relaxed text-muted">
-                {mode === "vectorless"
-                  ? "Reads document structure to find relevant sections without embeddings."
-                  : mode === "agentic"
-                    ? "Navigates document structure and searches passages when the answer needs both."
-                    : "Combines semantic meaning with exact wording to find relevant passages."}{" "}
+                {mode === "agentic"
+                  ? "An agent navigates document structure, searches passages, and follows the similarity graph to reach the whole collection."
+                  : "Combines semantic meaning with exact wording to find relevant passages, fast."}{" "}
                 Every answer includes evidence you can open and verify.
               </p>
               <div className="mt-6 grid w-full gap-2 sm:grid-cols-3">
@@ -467,11 +466,9 @@ export function Query({ active }: { active: string | null }) {
                   <div className="rounded-xl border border-edge bg-elevated/40 p-3.5">
                     <div className="mb-2 flex items-center gap-2 font-mono text-2xs text-subtle">
                       <span className="h-3 w-3 animate-spin rounded-full border-2 border-edgeStrong border-t-accent" />
-                      {mode === "vectorless"
-                        ? "reading document structure…"
-                        : mode === "agentic"
-                          ? "navigating structure and searching…"
-                          : "embedding and searching…"}
+                      {mode === "agentic"
+                        ? "navigating structure and searching…"
+                        : "embedding and searching…"}
                     </div>
 
                     {live && live.activity.length > 0 && (
@@ -555,7 +552,7 @@ export function Query({ active }: { active: string | null }) {
             </div>
             <div className="mt-1.5 flex flex-col gap-0.5 px-1 font-mono text-2xs text-subtle sm:flex-row sm:items-center sm:justify-between">
               <span>
-                {mode === "vectorless" ? "Vectorless" : mode === "agentic" ? "Agentic" : "Hybrid"} retrieval · citations included
+                {mode === "agentic" ? "Agentic" : "Hybrid"} retrieval · citations included
               </span>
               <span>Enter to ask · Shift + Enter for a new line</span>
             </div>

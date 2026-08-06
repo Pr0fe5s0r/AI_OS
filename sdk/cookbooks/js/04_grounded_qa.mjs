@@ -28,9 +28,11 @@ try {
   const mv = new Markvector();
   const docs = mv.collection("cookbook");
 
-  // vectorless (default): reason over each document's heading tree.
-  await ask(docs, question, "vectorless");
-  // hybrid: passage embeddings + keyword, fused. Try both on hard questions.
+  // agentic (default): an agent reasons over the heading trees, searches
+  // passages, and hops the similarity graph — reaching the whole collection.
+  await ask(docs, question, "agentic");
+  // hybrid: passage embeddings + keyword, fused. Fast and deterministic;
+  // try both on hard questions.
   await ask(docs, question, "hybrid");
 } catch (error) {
   if (error instanceof MarkvectorError) console.error(`markvector error: ${error.message}`);

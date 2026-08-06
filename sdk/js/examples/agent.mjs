@@ -1,12 +1,12 @@
 import { AgentAnswer, Markvector, Thinking, ToolCall, ToolResult } from "markvector";
 
-const question = process.argv.slice(2).join(" ") || "what is the bank details?";
+const question = process.argv.slice(2).join(" ") || "who is  R. Anitha?";
 
-const mv = new Markvector({apiKey: "kb_live_U7wojtVTiKL0IvTUEHgcAfn3c4EJqlo9YDpwoaFXy74"}); // MARKVECTOR_API_KEY / MARKVECTOR_URL
+const mv = new Markvector({apiKey: "kb_live_PmIEhz0lebWBS1h2xWm3azF-9Wn5WbaPCxZMjODAjnQ", baseUrl: "http://localhost:8000"}); // MARKVECTOR_API_KEY / MARKVECTOR_URL
 
 const agent = mv.collection("checking-collection").agent({
-  apiKey: "v1.CmMKHHN0YXRpY2tlZS1lMDBreGJhdnBxNTJwOTd6enQSIXNlcnZpY2VhY2NvdW50LWUwMHljeWt5bjhyendhNDRlcTILCP6wrswGEMDPzzM6DAj9s8aXBxCA_OuOAkACWgNlMDA.AAAAAAAAAAFX3TPuGB5p10KSS8cwpiVYwqtWfUPdUXSFnnTy4z17Vqzn8Hr2V_C-7B4BJkBtTwDviyGwibudnPbztpworoYE",
-  baseUrl: "https://api.studio.nebius.com/v1",
+  apiKey: "v1.CmMKHHN0YXRpY2tleS1lMDBoajFjNTZiaHQ0M3BiNjUSIXNlcnZpY2VhY2NvdW50LWUwMGdhNmtrdnAxNDdxMXhxdzILCKbp29AGEPr69yc6DAik7PObBxDAw671AkACWgNlMDA.AAAAAAAAAAEbKvVycfxZnzQDxNeyjzAMx1bTwSUobZmE69qw655yYIdw5vrH2B-Q8QNUrHRkxGDaUV41fZ1lSJZ-ZG7pFCMM",
+  baseUrl: "https://api.tokenfactory.uk-south1.nebius.com/v1",
   model: "zai-org/GLM-5.2",
 });
 

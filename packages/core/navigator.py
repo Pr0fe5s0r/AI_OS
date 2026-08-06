@@ -142,7 +142,9 @@ _HYBRID_NOTE = (
     "about where an answer lives, and hybrid_search when the answer is a "
     "specific figure, name or identifier that no heading would announce. "
     "Passages it returns are numbered exactly like sections you read, and you "
-    "cite them the same way."
+    "cite them the same way. When one is close but not the whole answer, call "
+    "neighbors with its chunk_id to read the passages nearest it in the store's "
+    "graph — the rest of the answer often sits one hop away."
 )
 
 _HYBRID_TOOL = {
@@ -163,6 +165,34 @@ _HYBRID_TOOL = {
                 }
             },
             "required": ["query"],
+        },
+    },
+}
+
+# The graph hop. Only useful once a hybrid_search has surfaced a passage with a
+# real chunk_id — read_section returns tree-node ids, which are not nodes in the
+# similarity graph — so it is offered alongside hybrid_search and points the
+# model at the chunk_ids that came back from it.
+_NEIGHBOURS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "neighbors",
+        "description": (
+            "Given the chunk_id of a passage a hybrid_search returned, list the "
+            "passages nearest it in the store's own similarity graph. Related "
+            "material often sits one hop from the first hit, where a fresh search "
+            "would miss it. Returns passages numbered for citing, exactly like "
+            "the sections you read, each with its own chunk_id to hop from again."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "chunk_id": {
+                    "type": "string",
+                    "description": "A chunk_id from a hybrid_search result.",
+                }
+            },
+            "required": ["chunk_id"],
         },
     },
 }
@@ -256,7 +286,9 @@ _TOOLS = [
 ]
 
 
-async def _documents(session: AsyncSession, scope: Scope) -> list[dict[str, Any]]:
+async def _documents(
+    session: AsyncSession, scope: Scope, limit: int = MAX_DOCUMENTS
+) -> list[dict[str, Any]]:
     clause = "AND collection_id = :c" if scope.collection_id else ""
     rows = (
         await session.execute(
@@ -273,7 +305,7 @@ async def _documents(session: AsyncSession, scope: Scope) -> list[dict[str, Any]
                 "w": scope.workspace_id,
                 "c": scope.collection_id,
                 "active": str(Lifecycle.ACTIVE),
-                "limit": MAX_DOCUMENTS,
+                "limit": limit,
             },
         )
     ).all()
@@ -521,18 +553,42 @@ def _where_named_things_live(
 
 
 def _catalogue(documents: list[dict[str, Any]], trees: dict[str, tree.Node]) -> str:
-    """Every document and its sections. Titles and openings, never full text."""
-    return json.dumps(
-        [
-            {
-                "doc": doc["item_id"],
-                "title": doc["title"],
-                "sections": trees[doc["item_id"]].outline().get("sections", []),
+    """Every document and its sections. Titles and openings, never full text.
+
+    When index summaries exist for a document (a card and section summaries
+    generated at ingest or by the mapper), they are injected: a ``blurb`` on
+    the document and a ``summary`` on each section. The agent reads these to
+    decide where to look, rather than guessing from headings alone. When a
+    document has no summaries yet, the bare outline is still present — the
+    agent navigates as before, and the mapper will catch up in the background.
+    """
+    # The summary data was pre-fetched and attached to each document dict by
+    # the caller (navigate) — see the ``_enrich_catalogue`` call there. If not
+    # present, the field is simply absent and the fallback is the old outline.
+    entries: list[dict[str, Any]] = []
+    for doc in documents:
+        entry: dict[str, Any] = {
+            "doc": doc["item_id"],
+            "title": doc["title"],
+            "sections": trees[doc["item_id"]].outline().get("sections", []),
+        }
+        # Inject the card blurb when present.
+        if doc.get("_card"):
+            entry["blurb"] = doc["_card"]
+        # Inject per-section descriptions when present.
+        if doc.get("_section_summaries"):
+            by_heading: dict[str, str] = {
+                s["heading"]: s["body"]
+                for s in doc["_section_summaries"]
+                if s.get("heading") and s.get("body")
             }
-            for doc in documents
-        ],
-        ensure_ascii=False,
-    )
+            for section in entry["sections"]:
+                desc = by_heading.get(section.get("title", ""))
+                if desc:
+                    section["summary"] = desc
+        entries.append(entry)
+    return json.dumps(entries, ensure_ascii=False)
+
 
 
 async def navigate(
@@ -583,13 +639,61 @@ async def navigate(
         if on_step is not None:
             on_step(step)
 
-    documents = await _documents(session, scope)
+    # One past the cap so a collection larger than the catalogue window is
+    # detectable: catalogue retrieval can only read what fits in the prompt, and
+    # an answer drawn from a partial view has to say so rather than look whole.
+    documents = await _documents(session, scope, limit=MAX_DOCUMENTS + 1)
+    catalogue_truncated = len(documents) > MAX_DOCUMENTS
+    documents = documents[:MAX_DOCUMENTS]
     if not documents:
         trace.timings_ms["total"] = int((time.perf_counter() - started) * 1000)
         return outcome, trace
 
     trees = {doc["item_id"]: tree.build(doc["body"], doc["title"]) for doc in documents}
     by_id = {doc["item_id"]: doc for doc in documents}
+
+    # Enrich the catalogue with index summaries when they exist. Each document
+    # gets a ``_card`` blurb and ``_section_summaries`` list that _catalogue
+    # injects, so the agent navigates by description rather than raw headings.
+    # The text lives in Postgres; graph.chunk_summaries returns only ids,
+    # headings and coverage counts — the text is fetched lazily below.
+    for doc in documents:
+        try:
+            sums = await graph.chunk_summaries(scope, doc["item_id"])
+        except Exception:  # noqa: BLE001 — summaries are optional
+            sums = []
+        card_text = None
+        section_summaries: list[dict[str, Any]] = []
+        for s in sums:
+            ntype = s.get("node_type") or s.get("kind", "")
+            if ntype == "card":
+                # Fetch the card body from Postgres.
+                row = (
+                    await session.execute(
+                        sql(
+                            "SELECT text FROM kb_chunks WHERE chunk_id = :cid AND workspace_id = :w"
+                        ),
+                        {"cid": s["chunk_id"], "w": scope.workspace_id},
+                    )
+                ).first()
+                if row:
+                    card_text = row.text
+            elif ntype == "section_summary":
+                row = (
+                    await session.execute(
+                        sql(
+                            "SELECT text FROM kb_chunks WHERE chunk_id = :cid AND workspace_id = :w"
+                        ),
+                        {"cid": s["chunk_id"], "w": scope.workspace_id},
+                    )
+                ).first()
+                if row:
+                    section_summaries.append({"heading": s.get("heading", ""), "body": row.text})
+        if card_text:
+            doc["_card"] = card_text
+        if section_summaries:
+            doc["_section_summaries"] = section_summaries
+
     outcome.documents_considered = len(documents)
     outcome.sections_available = sum(tree.count(t) for t in trees.values())
 
@@ -657,7 +761,11 @@ async def navigate(
         # document that actually has pages. Before that the tool does not exist
         # as far as the model is concerned, which is a stronger guarantee than
         # telling it not to.
-        tools = [_TOOLS[0], _HYBRID_TOOL, _TOOLS[1]] if hybrid else list(_TOOLS)
+        tools = (
+            [_TOOLS[0], _HYBRID_TOOL, _NEIGHBOURS_TOOL, _TOOLS[1]]
+            if hybrid
+            else list(_TOOLS)
+        )
         if looks < MAX_LOOKS and any(page_counts.values()):
             tools = [*tools, _LOOK_TOOL]
         try:
@@ -1091,7 +1199,8 @@ async def navigate(
                     )
                     surfaced.append(
                         f"[{marker}] {hit.title} > {passage.heading}\n\n{body}\n\n"
-                        f"(Cite this as [{marker}].)"
+                        f"(Cite this as [{marker}]. To read passages near this one, "
+                        f"call neighbors with chunk_id {passage.chunk_id!r}.)"
                     )
                     surfaced_headings.append(passage.heading or hit.title)
                     record(
@@ -1144,6 +1253,114 @@ async def navigate(
                                 "ok": False,
                                 "count": 0,
                             }
+                        )
+                continue
+
+            if call["name"] == "neighbors" and hybrid:
+                origin = str(args.get("chunk_id") or "").strip()
+                if not origin:
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call["id"],
+                            "content": "Provide the chunk_id of a passage a hybrid_search returned.",
+                        }
+                    )
+                    continue
+                # The stored :NEAR edges — the graph as consolidation organised
+                # it. The neighbour manifest carries ids and headings but not
+                # text, so the bodies are hydrated from Postgres and turned into
+                # citable reads, numbered in the same sequence as everything else.
+                from packages.core import chunks as chunk_store
+                from packages.core import graph
+
+                neighbours = await graph.chunk_neighbours(scope, origin, limit=MAX_HYBRID_HITS)
+                hydrated = await chunk_store.by_ids(
+                    session, scope, [n["chunk_id"] for n in neighbours]
+                )
+                surfaced = []
+                surfaced_headings = []
+                for n in neighbours:
+                    stored = hydrated.get(n["chunk_id"])
+                    if stored is None:
+                        continue
+                    key = (n["item_id"], n["chunk_id"])
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    by_id.setdefault(
+                        n["item_id"],
+                        {
+                            "item_id": n["item_id"],
+                            "title": n["title"] or n["item_id"],
+                            "body": "",
+                            "source": "",
+                            "locator": "",
+                            "url": None,
+                        },
+                    )
+                    marker = len(read) + 1
+                    heading = n["heading"] or stored.heading
+                    body = stored.text[:MAX_SECTION_CHARS]
+                    read.append(
+                        (
+                            Passage(
+                                chunk_id=n["chunk_id"],
+                                ordinal=marker - 1,
+                                heading=heading,
+                                text=body,
+                                score=round(float(n["similarity"] or 0.0), 4),
+                            ),
+                            n["item_id"],
+                        )
+                    )
+                    surfaced.append(
+                        f"[{marker}] {by_id[n['item_id']]['title']} > {heading}\n\n{body}\n\n"
+                        f"(Cite this as [{marker}]. chunk_id {n['chunk_id']!r} — call "
+                        f"neighbors on it to keep exploring.)"
+                    )
+                    surfaced_headings.append(heading or n["title"])
+                    record(Step(round_number, "hopped", f"{heading[:50]} → [{marker}]"))
+                if surfaced:
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call["id"],
+                            "content": "\n\n".join(surfaced),
+                        }
+                    )
+                    if emit is not None:
+                        await emit(
+                            {
+                                "type": "tool_result",
+                                "tool": "neighbors",
+                                "ok": True,
+                                "count": len(surfaced),
+                                "headings": surfaced_headings,
+                            }
+                        )
+                    if len(read) >= MAX_READS:
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": "That is enough reading. Answer now with submit_answer.",
+                            }
+                        )
+                else:
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call["id"],
+                            "content": (
+                                f"Nothing live neighbours {origin!r}, or its neighbours were "
+                                "already read. Answer from what you have, or search anew."
+                            ),
+                        }
+                    )
+                    record(Step(round_number, "hopped", f"{origin[:40]} → nothing"))
+                    if emit is not None:
+                        await emit(
+                            {"type": "tool_result", "tool": "neighbors", "ok": False, "count": 0}
                         )
                 continue
 
@@ -1310,6 +1527,18 @@ async def navigate(
             "The passages below are what was opened."
         )
         record(Step(outcome.rounds, "gave up", "out of rounds"))
+
+    # A catalogue-only answer over a collection too big for the prompt read just
+    # the newest MAX_DOCUMENTS documents. Say so — silently answering from a
+    # partial view is the failure this store treats as its most dangerous.
+    # Agentic needs no such warning: its hybrid_search reaches the rest, so this
+    # is scoped to the vectorless path and never clobbers a real degradation.
+    if catalogue_truncated and not hybrid and outcome.degraded is None:
+        outcome.degraded = (
+            f"This collection has more than {MAX_DOCUMENTS} documents; catalogue "
+            f"retrieval read only the {MAX_DOCUMENTS} most recent. Ask again with "
+            "agentic or hybrid retrieval to reach the whole collection."
+        )
 
     trace.timings_ms["navigate"] = int((time.perf_counter() - mark) * 1000)
 

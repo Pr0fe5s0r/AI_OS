@@ -108,7 +108,7 @@ class Answer:
     # Which retrieval produced the evidence. Travels with the answer because
     # two answers to the same question can differ entirely on this, and a
     # reader comparing them needs to know which they are looking at.
-    mode: str = "vectorless"
+    mode: str = "agentic"
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -374,31 +374,33 @@ async def answer(
     scope: Scope,
     question: str,
     cfg: RetrievalConfig = DEFAULT,
-    mode: str = "vectorless",
+    mode: str = "agentic",
     emit: EmitFn | None = None,
 ) -> tuple[Answer, Trace]:
     """Retrieve, then write an answer from what was retrieved.
 
-    Three ways of retrieving, and the writing is identical for each:
+    Two public modes, and the writing is identical for both:
 
-      vectorless  reason over each document's table of contents and open the
-                  sections that look like they answer the question (default)
-      hybrid      passage embeddings and keyword matching, fused
-      agentic     the vectorless loop plus a hybrid_search tool, the agent
-                  choosing between structure and search per question
+      agentic  (default) an agent reads its way to the answer. It reasons over
+               each document's table of contents, runs hybrid_search to reach a
+               figure or identifier no heading advertises, and hops the
+               similarity graph from a promising passage — reaching the whole
+               collection and choosing its own strategy per question.
+      hybrid   passage embeddings and keyword matching, fused into one ranked
+               pass. No agent loop: fast, deterministic, and the retrieval
+               primitive other software builds on.
 
-    Vectorless is the default because on the material this store actually
-    holds — long documents with headings their authors wrote on purpose — it
-    was measurably faster and cited more precisely. That is a default, not a
-    verdict: hybrid remains a request away, and is the better choice for flat
-    text or for finding an identifier buried anywhere in a corpus.
+    Agentic is the default because it reaches the whole store and picks how to
+    find the evidence; hybrid stays a request away for callers that need speed
+    and a reproducible ranking.
 
-    They suit different material. Hybrid is better at finding a specific figure
-    or identifier anywhere in a corpus; vectorless is better on long structured
-    documents where the author already labelled what is where, and where
-    similarity keeps returning passages that sound right and are not. Neither
-    is a strict improvement, which is why this is a choice rather than a
-    replacement.
+    A third value, ``vectorless``, is accepted for backward compatibility only
+    and is no longer offered as a choice. It is agentic's catalogue-reasoning
+    step with search and graph-hop turned off — the same table-of-contents
+    navigation, but blind to anything past the newest ``MAX_DOCUMENTS``
+    documents, so a large collection answers from a partial view (the navigator
+    now says so on the answer). Prefer agentic, which does the same reasoning
+    and can also reach the rest.
 
     Returns the trace alongside, so the answer and the retrieval that produced
     it can be recorded together — an answer whose retrieval cannot be inspected

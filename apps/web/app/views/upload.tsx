@@ -224,6 +224,16 @@ export function Upload({
     [library]
   );
 
+  // In-flight (and just-failed) uploads, surfaced in the Documents list so a
+  // file appears among your uploaded files the moment it is sent — marked
+  // "indexing" — rather than only after the worker has finished. A "done"
+  // upload drops out of here because by then it is a real document below.
+  const uploading = useMemo(() => rows.filter((r) => r.state !== "done"), [rows]);
+  const indexingCount = useMemo(
+    () => uploading.filter((r) => r.state !== "failed").length,
+    [uploading]
+  );
+
   return (
     <div
       className="px-6 py-6"
@@ -325,54 +335,6 @@ export function Upload({
         </div>
       </Card>
 
-      {rows.length > 0 && (
-        <>
-          <Label className="mb-2 block">this session</Label>
-          <Card className="divide-y divide-edge/60">
-            {rows.map((r) => (
-              <div key={r.name} className="flex items-center gap-3 px-4 py-2.5">
-                {r.state === "done" ? (
-                  <span className="text-heat-0">✓</span>
-                ) : r.state === "failed" ? (
-                  <span className="text-danger">✕</span>
-                ) : r.state === "working" ? (
-                  // Still going. A clock, not a cross: the difference between
-                  // "this is taking a while" and "this did not work" is the
-                  // whole point of the distinction.
-                  <span className="text-warn">◷</span>
-                ) : (
-                  <span className="h-3 w-3 animate-spin rounded-full border-2 border-edgeStrong border-t-accent" />
-                )}
-                <Mono className="min-w-0 flex-1 truncate text-xs text-ink">{r.name}</Mono>
-                <span className="font-mono text-2xs text-subtle">
-                  {r.detail ||
-                    {
-                      sending: "sending…",
-                      indexing: "indexing…",
-                      done: "",
-                      failed: "",
-                      working: "",
-                    }[r.state]}
-                </span>
-                <Chip
-                  tone={
-                    r.state === "done"
-                      ? "text-heat-0 border-heat-0/30 bg-heat-0/10"
-                      : r.state === "failed"
-                        ? "text-danger border-danger/30 bg-danger/10"
-                        : r.state === "working"
-                          ? "text-warn border-warn/30 bg-warn/10"
-                          : "text-muted border-edgeStrong bg-elevated"
-                  }
-                >
-                  {r.state}
-                </Chip>
-              </div>
-            ))}
-          </Card>
-        </>
-      )}
-
       {collectionId && (
         <div className="mt-6">
           <div className="mb-3 flex items-start justify-between gap-3">
@@ -380,6 +342,9 @@ export function Upload({
               <h2 className="text-base font-semibold text-ink">Documents</h2>
               <p className="mt-0.5 text-xs text-muted">
                 {library?.length ?? 0} document{library?.length === 1 ? "" : "s"} in this collection
+                {indexingCount > 0 && (
+                  <span className="text-accentSoft"> · {indexingCount} indexing</span>
+                )}
               </p>
             </div>
             <button
@@ -418,15 +383,57 @@ export function Upload({
 
           {library === null ? (
             <div className="font-mono text-xs text-subtle">Loading…</div>
-          ) : library.length === 0 ? (
+          ) : library.length === 0 && uploading.length === 0 ? (
             <Empty
               title="Nothing uploaded yet"
-              hint="Drop a file or paste text above. Once it is indexed it shows here, and you can open it to read the text and the passages it was split into."
+              hint="Drop a file or paste text above. It appears here right away while it indexes, and once indexed you can open it to read the text and the passages it was split into."
             />
-          ) : visibleDocuments.length === 0 ? (
-            <Empty title="No matching documents" hint="Try a broader search or clear the source filter." />
           ) : (
             <Card className="divide-y divide-edge/60">
+              {/* Uploads in flight, shown among the files the instant they are
+                  sent — "indexing" until the worker lands them, then they are
+                  replaced by the real document below. A failed one stays visible
+                  with its reason rather than vanishing. */}
+              {uploading.map((r) => (
+                <div key={`up-${r.name}`} className="flex items-center gap-3 px-4 py-2.5">
+                  {r.state === "failed" ? (
+                    <span className="text-danger">✕</span>
+                  ) : r.state === "working" ? (
+                    <span className="text-warn">◷</span>
+                  ) : (
+                    <span className="h-3 w-3 animate-spin rounded-full border-2 border-edgeStrong border-t-accent" />
+                  )}
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate font-mono text-xs text-ink">{r.name}</div>
+                    <div className="truncate text-2xs text-subtle">
+                      {r.detail ||
+                        (r.state === "failed"
+                          ? "failed"
+                          : r.state === "working"
+                            ? "still indexing…"
+                            : r.state === "sending"
+                              ? "sending…"
+                              : "indexing…")}
+                    </div>
+                  </div>
+                  <Chip
+                    tone={
+                      r.state === "failed"
+                        ? "text-danger border-danger/30 bg-danger/10"
+                        : r.state === "working"
+                          ? "text-warn border-warn/30 bg-warn/10"
+                          : "text-accentSoft border-accent/30 bg-accent/10"
+                    }
+                  >
+                    {r.state === "failed" ? "failed" : r.state === "working" ? "working" : "indexing"}
+                  </Chip>
+                </div>
+              ))}
+              {visibleDocuments.length === 0 && library.length > 0 && (
+                <div className="px-4 py-6 text-center text-2xs text-subtle">
+                  No documents match that search.
+                </div>
+              )}
               {visibleDocuments.map((d) => (
                 <button
                   key={d.id}
