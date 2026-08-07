@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import logging
+import mimetypes
 import os
 import time
 from collections.abc import AsyncIterator
@@ -130,6 +133,12 @@ app.add_middleware(
 )
 app.include_router(auth_router)
 
+# There was none. Two handlers already called ``log.exception`` — so the moment
+# either of them fired, the handler itself raised NameError and a clean 500 with
+# a reason turned into a bare "Internal Server Error" with nothing behind it.
+# The error path was untested precisely because it is the error path.
+log = logging.getLogger("markvector.api")
+
 
 async def db() -> Any:
     async with Session() as session:
@@ -196,6 +205,18 @@ async def ingest_file_item(
     if not data:
         raise HTTPException(400, "Empty file.")
 
+    # An upper bound, because the whole file is in memory by the line above and
+    # several API replicas each holding a large upload is how a container gets
+    # OOM-killed mid-request — which the caller sees as the connection dropping,
+    # with nothing in any log to explain it. Refusing is the kinder failure.
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            413,
+            f"{filename} is {len(data) // (1024 * 1024)}MB, over the "
+            f"{MAX_UPLOAD_BYTES // (1024 * 1024)}MB limit. Split it, or raise "
+            "MAX_UPLOAD_MB on the server.",
+        )
+
     # Refuse here rather than in the worker. Accepting a file we have no parser
     # for produced the worst of both: the upload reported success, indexing
     # failed in a job whose reason nobody reads, and the console could only say
@@ -205,20 +226,60 @@ async def ingest_file_item(
             415, f"Cannot read {filename}. Supported formats: {', '.join(supported())}"
         )
 
-    job = await app.state.queue.enqueue_job(
-        "ingest_file",
-        scope.workspace_id,
-        scope.collection_id,
-        source,
-        locator or filename,
-        filename,
-        data,
-        url,
-        period_start,
-        period_end,
-        None,
-    )
-    return Accepted(job_id=job.job_id if job else None)
+    # A big file goes to blob storage and the queue carries only its key. Redis
+    # is a message broker, not a file store, and a 17 MB job payload is how you
+    # find that out.
+    payload_data: bytes | str = data
+    if len(data) > INLINE_UPLOAD_LIMIT:
+        if not blobs.enabled():
+            # Said plainly instead of enqueuing it anyway. Without this the job
+            # payload goes to Redis, fails somewhere inside the queue client,
+            # and the console shows "Internal Server Error" against a file that
+            # is simply too big for the way this deployment is configured.
+            raise HTTPException(
+                503,
+                f"{filename} is {len(data) // (1024 * 1024)}MB. Files over "
+                f"{INLINE_UPLOAD_LIMIT // (1024 * 1024)}MB need blob storage, "
+                "which is not configured on this deployment. Set the S3/MinIO "
+                "variables, or upload a smaller file.",
+            )
+        staging_key = f"staging/{scope.workspace_id}/{hashlib.sha256(data).hexdigest()}"
+        content_type = (
+            file.content_type
+            or mimetypes.guess_type(filename)[0]
+            or "application/octet-stream"
+        )
+        try:
+            await blobs.put(staging_key, data, content_type)
+        except Exception as exc:
+            # This call used to sit outside any try. A blob store that was full,
+            # unreachable or misconfigured raised straight through the route and
+            # the browser got a bare 500 with nothing in it — no filename, no
+            # cause, nothing to act on.
+            log.exception("Staging upload failed for %s", filename)
+            raise HTTPException(
+                502, f"Could not stage {filename} for indexing: {type(exc).__name__}"
+            ) from exc
+        payload_data = staging_key
+
+    try:
+        job = await app.state.queue.enqueue_job(
+            "ingest_file",
+            scope.workspace_id,
+            scope.collection_id,
+            source,
+            locator or filename,
+            filename,
+            payload_data,
+            url,
+            period_start,
+            period_end,
+            None,
+        )
+        return Accepted(job_id=job.job_id if job else None)
+    except Exception as exc:
+        log.exception("Failed to enqueue ingest_file job for %s", filename)
+        raise HTTPException(500, f"Upload enqueue failed: {type(exc).__name__}") from exc
 
 
 @app.get("/api/formats")
@@ -300,6 +361,20 @@ async def retrieve(
 # cancelling the task cannot interrupt a thread parked in a socket read. This is
 # the only place that can promise the caller an ending.
 ANSWER_DEADLINE_SECONDS = float(os.getenv("ANSWER_DEADLINE_SECONDS", "300"))
+
+# The largest upload accepted at all. The file is read fully into memory before
+# anything else can happen, so this is a memory bound per in-flight request, not
+# a policy. 128MB clears a 17MB scanned book with room to spare.
+MAX_UPLOAD_BYTES = int(float(os.getenv("MAX_UPLOAD_MB", "128")) * 1024 * 1024)
+# Above this, the bytes go to blob storage and the queue carries only the key.
+# Redis is a message broker; a multi-megabyte job payload is how you learn that.
+INLINE_UPLOAD_LIMIT = 2 * 1024 * 1024
+
+# How long the answer stream may go quiet before it sends a keepalive comment.
+# Well under the 60s idle timeout common to proxies and load balancers, and far
+# under the longest measured gap between real events (42.5s for one agentic
+# read). Costs four bytes.
+HEARTBEAT_SECONDS = 15.0
 
 
 def _too_slow() -> str:
@@ -482,10 +557,24 @@ async def answer_stream(
                     yield _sse({"type": "error", "detail": _too_slow()})
                     break
                 try:
-                    event = await asyncio.wait_for(queue.get(), timeout=remaining)
+                    event = await asyncio.wait_for(
+                        queue.get(), timeout=min(HEARTBEAT_SECONDS, remaining)
+                    )
                 except TimeoutError:
-                    yield _sse({"type": "error", "detail": _too_slow()})
-                    break
+                    # Nothing produced for a while — which is normal here, not a
+                    # fault. A single agentic read was measured at 42.5 seconds:
+                    # one model call, no bytes on the wire for its whole
+                    # duration. Every proxy between here and the browser reads
+                    # that silence as a dead connection and closes it, and the
+                    # reader sees "network error" over an answer that was being
+                    # produced perfectly well. Verified: the same question
+                    # succeeded in 87.5s straight to this API and failed through
+                    # the dev proxy.
+                    #
+                    # An SSE comment. Clients ignore it by specification, so it
+                    # keeps the connection warm without appearing as an event.
+                    yield ": keepalive\n\n"
+                    continue
                 if event is None:
                     break
                 yield _sse(event)

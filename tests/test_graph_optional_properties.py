@@ -11,11 +11,14 @@ async def test_chunk_vector_query_does_not_reference_absent_property_tokens(monk
     view polls. Dynamic optional reads and the always-present status field keep
     the same defaults without producing schema warnings.
     """
-    seen: dict[str, object] = {}
+    # Every query it issues, not just the first. It now runs a cheap grouping to
+    # learn which documents are present before sampling a fair share of each —
+    # so the query that returns the passages is no longer the first one, and a
+    # test that inspected only ``seen["query"]`` was checking the wrong string.
+    seen: list[tuple[str, dict]] = []
 
     async def capture(query: str, **params):
-        seen["query"] = query
-        seen["params"] = params
+        seen.append((query, params))
         return []
 
     monkeypatch.setattr(graph, "_run", capture)
@@ -23,16 +26,22 @@ async def test_chunk_vector_query_does_not_reference_absent_property_tokens(monk
 
     assert await graph.collection_chunk_vectors(scope, live_only=True) == []
 
-    query = str(seen["query"])
-    assert "c.archived" not in query
-    assert "c.node_type" not in query
-    assert "c.stage" not in query
-    assert "c.status = $active" in query
-    assert "properties(c)['node_type']" in query
-    assert "properties(c)['stage']" in query
-    params = seen["params"]
-    assert isinstance(params, dict)
-    assert params["active"] == str(Lifecycle.ACTIVE)
+    assert seen, "it must ask the database something"
+    for query, params in seen:
+        # The property-warning rules apply to every query, whichever it is.
+        assert "c.archived" not in query
+        assert "c.node_type" not in query
+        assert "c.stage" not in query
+        assert "c.status = $active" in query
+        assert params["active"] == str(Lifecycle.ACTIVE)
+
+    # The counting query legitimately reads no optional properties; the one that
+    # returns passages must read them dynamically. With no documents found there
+    # is no second query, which is itself correct — nothing to sample.
+    passages = [q for q, _ in seen if "AS embedding" in q]
+    for query in passages:
+        assert "properties(c)['node_type']" in query
+        assert "properties(c)['stage']" in query
 
 
 async def test_lineage_reads_optional_archive_metadata_dynamically(monkeypatch):

@@ -78,7 +78,14 @@ class Routing:
     """
 
     item_ids: list[str] = field(default_factory=list)
-    how: str = "everything"  # named | everything | routed
+    how: str = "everything"  # named | everything | ranked | routed
+    # Every document, best match first. Populated for "ranked" and "routed"
+    # alike — the difference between them is whether anything was EXCLUDED, not
+    # whether the ranking happened. Kept separate from ``item_ids`` for exactly
+    # that reason: item_ids means "load only these", order means "these look
+    # most relevant, in this order", and conflating the two is how a ranking
+    # silently becomes a filter.
+    order: list[str] = field(default_factory=list)
     # item_id -> a short human sentence about why it is here.
     because: dict[str, str] = field(default_factory=dict)
     # How many documents the store holds in scope, whether or not they fit.
@@ -147,28 +154,47 @@ async def choose(
         )
 
     available = await count_documents(session, scope)
-    if limit <= 0 or available <= limit:
-        # Everything fits. No decision to make, and therefore none made — this
-        # is the path that keeps a small store behaving exactly as it did.
-        #
-        # ``limit <= 0`` is the no-count-limit default: every document is laid
-        # out and the byte budget in the navigator is what bounds the work.
-        # Routing narrows only when an operator has asked for a cap, because
-        # narrowing is a guess and a guess nobody needed is a way to be wrong
-        # for free.
+    if available <= 1:
+        # One document (or none) cannot be ranked against itself.
         return Routing(item_ids=[], how="everything", available=available)
 
-    ranked, because, fell_back = await _rank(session, scope, question, limit)
+    ranked, because, fell_back = await _rank(session, scope, question, limit or available)
     if not ranked:
         # Nothing to rank on: no cards, and search returned nothing or failed.
         # Recency is a poor answer and is reported as one rather than being
         # presented as a choice.
         return Routing(item_ids=[], how="everything", available=available, fell_back=True)
 
+    if limit <= 0 or available <= limit:
+        # Everything FITS — so nothing is excluded. But the ranking still runs
+        # and is still reported, which is the whole point and was the bug.
+        #
+        # Before this, a store under the cap returned early and the card score
+        # was computed for nobody. Measured on a four-document store asked
+        # "server requirements": the cards separated cleanly — 0.778 for the
+        # server document against 0.614 for a Harry Potter collection — and the
+        # agent was told none of it. It searched all 11,460 passages of the
+        # novel, read two of them, and wrote a paragraph explaining that Harry
+        # Potter is unrelated to server requirements. It was right, and it
+        # should never have had to work that out.
+        #
+        # ``item_ids`` stays empty so the navigator still lays out EVERY
+        # document. This is guidance, not exclusion: a ranking says where to
+        # look first and must never be able to hide the answer.
+        return Routing(
+            item_ids=[],
+            how="ranked",
+            because=because,
+            order=ranked,
+            available=available,
+            fell_back=fell_back,
+        )
+
     return Routing(
         item_ids=ranked,
         how="routed",
         because=because,
+        order=ranked,
         available=available,
         fell_back=fell_back,
     )

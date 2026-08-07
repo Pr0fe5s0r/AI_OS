@@ -102,10 +102,20 @@ def test_a_provider_call_cannot_outlive_the_job_that_is_waiting_for_it():
     asyncio.to_thread because the client blocks, and a cancellation cannot
     interrupt a thread parked in a socket read.
     """
+    from packages.core.pipeline import JOB_TIMEOUT_SECONDS
+
     worst_case = llm.LLM_TIMEOUT_SECONDS * (1 + llm.LLM_MAX_RETRIES)
-    assert worst_case <= 300, (
+    assert worst_case <= JOB_TIMEOUT_SECONDS, (
         "a call must not outlive the queue's job_timeout, or a wedged request "
         "goes quiet instead of being retried"
+    )
+    # Compared against the real constant rather than a copy of it. This read
+    # `<= 300` while job_timeout happened to be 300, so raising the timeout for
+    # large documents would have left the test passing about a number nothing
+    # used any more.
+    assert JOB_TIMEOUT_SECONDS >= 1800, (
+        "a 170-page PDF embeds 11,460 passages and was killed at 299.98s, "
+        "leaving the document stored and unsearchable"
     )
     assert llm.LLM_TIMEOUT_SECONDS >= 120, (
         "the same image has taken 193s; clip too close and slow-but-fine calls "

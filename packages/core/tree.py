@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -336,6 +339,78 @@ def _fallback_sections(body: str) -> list[dict[str, Any]]:
     ]
 
 
+# How much source text the parsed-tree cache may hold, counted in characters of
+# the Markdown that produced the trees. Trees are a few times larger than their
+# source, so this is a proxy rather than a true memory bound — but it is the
+# number that scales with the thing being cached, and it fails by parsing again
+# rather than by growing without limit.
+#
+# 32M characters is roughly five War-and-Peace-sized books, or hundreds of
+# ordinary documents.
+CACHE_BUDGET_CHARS = int(os.getenv("TREE_CACHE_CHARS", str(32_000_000)))
+
+# item key -> (source hash, source length, tree). An OrderedDict used as an LRU.
+# The source length is stored rather than re-derived, so what is subtracted on
+# eviction is exactly what was added on insert — deriving it from the tree
+# instead would drift and the budget would slowly stop meaning anything.
+_cache: OrderedDict[str, tuple[str, int, Node]] = OrderedDict()
+_cache_chars = 0
+
+
+def cache_stats() -> dict[str, int]:
+    """What the cache is holding — for tests and for anyone measuring."""
+    return {"entries": len(_cache), "chars": _cache_chars, "budget": CACHE_BUDGET_CHARS}
+
+
+def clear_cache() -> None:
+    global _cache_chars
+    _cache.clear()
+    _cache_chars = 0
+
+
+def build_cached(key: str, markdown: str, title: str = "") -> Node:
+    """``build``, reusing the tree when the same document is parsed again.
+
+    Parsing is pure, deterministic and free of model calls — and on a large
+    document it is not free of TIME. Measured: three documents totalling 6.4MB
+    took 8.2 seconds to parse, on EVERY question, because the navigator rebuilt
+    every tree from the body it had just read out of Postgres. That was the
+    single largest fixed cost before the first model call.
+
+    Keyed on a hash of the source, not on the item id alone: an edited document
+    keeps its id and must not keep its old tree. The id is still part of the key
+    so one document's versions replace each other rather than accumulating.
+
+    Safe to share because nothing mutates a Node. ``outline()`` builds fresh
+    dictionaries on every call, and the catalogue's summary injection writes
+    into those dictionaries, never into the tree.
+    """
+    global _cache_chars
+    digest = hashlib.sha256(markdown.encode("utf-8", "ignore")).hexdigest()
+    cached = _cache.get(key)
+    if cached is not None and cached[0] == digest:
+        _cache.move_to_end(key)
+        return cached[2]
+
+    root = build(markdown, title)
+
+    if cached is not None:
+        # Replacing this document's own older version.
+        _cache_chars -= cached[1]
+        del _cache[key]
+
+    size = len(markdown)
+    _cache[key] = (digest, size, root)
+    _cache_chars += size
+    # `len(_cache) > 1` so the document just parsed is never the one evicted —
+    # a cache that throws away the entry it was asked for does the work twice
+    # and keeps nothing, which is worse than having no cache at all.
+    while _cache_chars > CACHE_BUDGET_CHARS and len(_cache) > 1:
+        _, (_, evicted_size, _tree) = _cache.popitem(last=False)
+        _cache_chars -= evicted_size
+    return root
+
+
 def build(markdown: str, title: str = "") -> Node:
     """A document as a tree of its own sections.
 
@@ -542,6 +617,9 @@ __all__ = [
     "FALLBACK_CHARS",
     "MAX_NODE_CHARS",
     "PREVIEW_CHARS",
+    "build_cached",
+    "cache_stats",
+    "clear_cache",
     "Node",
     "build",
     "count",

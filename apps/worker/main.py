@@ -10,6 +10,7 @@ from apps.common.summaries import enabled as summaries_enabled
 from apps.common.summaries import interval_seconds as summaries_interval
 from packages.core import graph
 from packages.core.pipeline import (
+    JOB_TIMEOUT_SECONDS,
     classify_new_item,
     embed_item,
     ingest_file,
@@ -98,7 +99,7 @@ class WorkerSettings:
     cron_jobs = _schedule()
     redis_settings = redis_settings()
     max_tries = 3
-    job_timeout = 300
+    job_timeout = JOB_TIMEOUT_SECONDS
 
     @staticmethod
     async def on_startup(ctx) -> None:

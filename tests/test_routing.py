@@ -155,6 +155,65 @@ async def test_a_document_is_ranked_by_its_best_passage_not_its_busiest(monkeypa
     assert "precise clause" in reasons["exact"]
 
 
+def test_a_store_that_fits_is_still_ranked():
+    """The signal was computed and thrown away.
+
+    Routing returned early whenever every document fitted — which, once the
+    document cap defaulted to "no limit", is ALWAYS. So the card score was
+    calculated for nobody.
+
+    Measured on a four-document store asked "server requirements": the cards
+    separated cleanly, 0.778 for the server document against 0.614 for a Harry
+    Potter collection. The agent was told none of it, searched all 11,460
+    passages of the novel, read two pages, and wrote a paragraph explaining
+    that Harry Potter is unrelated to server requirements. It was right, and it
+    should never have had to work that out.
+
+    Ranking now runs whether or not anything is excluded — those are two
+    different questions and only the second depends on the cap.
+    """
+    ranked = Routing(
+        item_ids=[],  # nothing excluded
+        how="ranked",
+        order=["server-doc", "novel"],
+        because={"server-doc": "its summary matches the question"},
+        available=4,
+    )
+    # The critical invariant: a ranking must not become a filter. Empty
+    # item_ids is what tells the navigator to lay out EVERY document.
+    assert ranked.item_ids == []
+    assert ranked.order[0] == "server-doc"
+    assert ranked.routed is False, "ranked is guidance; routed is exclusion"
+
+
+def test_the_prompt_says_the_ranking_is_not_a_finding():
+    """An agent told "these are the relevant documents" will stop reading and
+    trust the top one. The wording has to give it an order without giving it a
+    conclusion, and must say plainly that nothing was excluded."""
+    from packages.core.navigator import _why_these_documents
+
+    docs = [
+        {"item_id": "server-doc", "title": "MarkVector — Server Requirements"},
+        {"item_id": "novel", "title": "Harry Potter: The Complete Collection"},
+    ]
+    note = _why_these_documents(
+        Routing(
+            how="ranked",
+            order=["server-doc", "novel"],
+            because={"server-doc": "its summary matches the question"},
+            available=2,
+        ),
+        docs,
+    )
+    assert "best match" in note
+    assert "not a filter" in note, "nothing was excluded and it must say so"
+    assert "not a finding" in note, "rank is where to look, never what is true"
+    assert note.index("server-doc") < note.index("novel"), "order must survive"
+
+    # A single-document store has nothing to rank and says nothing at all.
+    assert _why_these_documents(Routing(how="everything", available=1), docs) == ""
+
+
 def test_no_count_limit_does_not_slice_the_store_to_nothing():
     """The bug that shipped with "0 means unlimited", caught on a real book.
 
@@ -211,6 +270,28 @@ def test_cards_are_not_looked_up_through_the_ann_index():
         "nothing and fails silently"
     )
     assert "vector.similarity.cosine" in source, "cards must be scored exactly"
+
+
+def test_no_limit_does_not_become_limit_zero():
+    """``k <= 0`` means "no limit" everywhere in this codebase and "return
+    nothing" in Cypher, and that collision has now cost the card arm twice.
+
+    Once MAX_DOCUMENTS defaulted to 0, the route limit became 0, `LIMIT 0`
+    returned zero cards on every single question, and routing quietly fell back
+    to passages. Nothing looked broken — it reported ``fell_back`` and carried
+    on. Asked "server requirements", the passage arm then matched a Harry
+    Potter chapter on the words "Room of Requirement".
+
+    The same convention emptied the document list once before via
+    ``documents[:0]``. It is translated at the boundary now.
+    """
+    import inspect
+
+    from packages.core import graph
+
+    assert "k if k > 0 else" in inspect.getsource(graph.card_matches), (
+        "a k of 0 means unlimited to callers and empty to Cypher"
+    )
 
 
 def test_routing_and_the_navigator_agree_on_the_cap():

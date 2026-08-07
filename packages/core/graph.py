@@ -405,19 +405,61 @@ async def collection_chunk_vectors(
         # UnknownPropertyKeyWarning on otherwise healthy collections.
         clause += " AND c.status = $active"
         params["active"] = str(Lifecycle.ACTIVE)
-    return await _run(
+
+    # Which documents are here, and how big each is. One cheap grouping, and it
+    # is what makes the sampling below fair.
+    counts = await _run(
         f"""
         MATCH (c:Chunk) WHERE {clause} AND c.embedding IS NOT NULL
-        RETURN c.chunk_id AS id, c.item_id AS item_id, c.ordinal AS ordinal,
-               c.heading AS heading, c.title AS title, c.embedding AS embedding,
-               coalesce(properties(c)['node_type'], 'fact') AS node_type,
-               coalesce(properties(c)['stage'], 1) AS stage
-        ORDER BY c.item_id, c.ordinal
-        LIMIT $limit
+        RETURN c.item_id AS item_id, count(*) AS n
+        ORDER BY n DESC
         """,
-        limit=limit,
         **params,
     )
+    items = [(r["item_id"], int(r["n"])) for r in counts if r["item_id"]]
+    if not items:
+        return []
+
+    # A SHARE EACH, not an alphabetical prefix.
+    #
+    # This was `ORDER BY c.item_id, c.ordinal LIMIT 400`, which hands the whole
+    # budget to whichever documents happen to sort first. Measured on a
+    # three-document collection: bitcoin (~40 passages) and a Harry Potter
+    # collection (11,460) between them filled all 400 slots, and the Server
+    # Requirements document — sorting last by id — contributed ZERO points. The
+    # graph reported "2 documents" for a collection holding three, and the
+    # missing one looked like it had never been indexed.
+    #
+    # Every document now gets an equal share, and any budget left over by
+    # documents smaller than their share is handed back to the larger ones, so
+    # the picture stays full without starving anybody.
+    share = max(1, limit // len(items))
+    spare = limit - sum(min(n, share) for _, n in items)
+    rows: list[dict] = []
+    for item_id, n in sorted(items, key=lambda pair: pair[1]):
+        take = min(n, share)
+        if spare > 0 and n > take:
+            extra = min(spare, n - take)
+            take += extra
+            spare -= extra
+        rows.extend(
+            await _run(
+                f"""
+                MATCH (c:Chunk) WHERE {clause} AND c.embedding IS NOT NULL
+                  AND c.item_id = $item_id
+                RETURN c.chunk_id AS id, c.item_id AS item_id, c.ordinal AS ordinal,
+                       c.heading AS heading, c.title AS title, c.embedding AS embedding,
+                       coalesce(properties(c)['node_type'], 'fact') AS node_type,
+                       coalesce(properties(c)['stage'], 1) AS stage
+                ORDER BY c.ordinal
+                LIMIT $take
+                """,
+                item_id=item_id,
+                take=take,
+                **params,
+            )
+        )
+    return rows[:limit]
 
 
 async def replace_near_edges(scope: Scope, edges: list[dict]) -> int:
@@ -812,7 +854,16 @@ async def card_matches(scope: Scope, embedding: list[float], k: int = 20) -> lis
         ORDER BY similarity DESC
         LIMIT $k
         """,
-        k=k,
+        # ``k <= 0`` means "no limit" to every caller in this codebase, and it
+        # means "return nothing" to Cypher. That collision silently killed the
+        # entire card arm: MAX_DOCUMENTS defaulted to 0, the route limit became
+        # 0, and `LIMIT 0` returned zero cards on every question — routing fell
+        # back to passages and reported it, and nothing else looked wrong.
+        #
+        # Second time this convention has leaked into an index expression; the
+        # first emptied the document list via documents[:0]. Translated here, at
+        # the boundary, rather than trusting each caller to remember.
+        k=k if k > 0 else 10_000,
         embedding=embedding,
         **params,
     )

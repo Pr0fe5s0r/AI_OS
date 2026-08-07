@@ -4,6 +4,8 @@ x-app-env: &app-env
   # answer paths were unbounded, and a streamed vectorless answer was observed
   # holding a connection open for over twelve minutes with no error and no end.
   ANSWER_DEADLINE_SECONDS: ${ANSWER_DEADLINE_SECONDS:-300}
+  JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-1800}
+  MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-128}
   MAX_DOCUMENTS: ${MAX_DOCUMENTS:-0}
   MAX_CATALOGUE_BYTES: ${MAX_CATALOGUE_BYTES:-67108864}
   SUMMARIES_ENABLED: ${SUMMARIES_ENABLED:-true}

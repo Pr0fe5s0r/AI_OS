@@ -25,6 +25,24 @@ from packages.core.normalise import (
 from packages.core.store import get_item, put_item, record_failure, stable_item_id
 from packages.shared.schema import Item, Scope, SourceRef
 
+# How long one queued job may run before arq abandons it.
+#
+# This was 300s, and 300s is a number that fits an ordinary document and nothing
+# else. Measured on a 170-page, 16.5MB PDF: parsing took 240s in its own job,
+# then embedding produced 11,460 passages and was killed at 299.98s — the
+# document was fully parsed and stored, and then silently had no vectors. The
+# upload looked finished and the document was unsearchable.
+#
+# The work is genuinely long and it is not stuck: embedding is one provider
+# round trip per batch of 64, and eleven thousand passages is 180 batches. A
+# ceiling has to exist so a wedged job frees its slot, but it has to be set
+# against the largest REAL document rather than the median one.
+#
+# 30 minutes. Individual provider calls are separately bounded by
+# LLM_TIMEOUT_SECONDS, so this never becomes "wait forever" — it is the budget
+# for many bounded calls, not permission for one unbounded one.
+JOB_TIMEOUT_SECONDS = int(os.getenv("JOB_TIMEOUT_SECONDS", "1800"))
+
 
 def _summaries_enabled() -> bool:
     """Whether a document gets a card and section summaries after it is indexed.
@@ -211,7 +229,7 @@ async def ingest_file(
     source: str,
     locator: str,
     filename: str,
-    data: bytes,
+    data: bytes | str,
     url: str | None = None,
     period_start: datetime | None = None,
     period_end: datetime | None = None,
@@ -225,6 +243,13 @@ async def ingest_file(
     PDF). A file that fails to parse keeps no original either — there is nothing
     a person could usefully preview.
     """
+    if isinstance(data, str):
+        if blobs.enabled() and await blobs.exists(data):
+            raw_data, _ = await blobs.get(data)
+            data = raw_data
+        else:
+            raise UnsupportedFormat(f"Staging file reference expired or missing: {data}")
+
     scope = _scope(workspace_id, collection_id)
     ref = SourceRef(source=source, locator=locator, url=url, fetched_at=datetime.now())
     try:
@@ -442,7 +467,7 @@ class WorkerSettings:
     functions = [ingest_file, ingest_text, embed_item, classify_new_item, summarize_item]
     redis_settings = redis_settings()
     max_tries = 3
-    job_timeout = 300
+    job_timeout = JOB_TIMEOUT_SECONDS
 
     @staticmethod
     async def on_startup(ctx: dict[str, Any]) -> None:

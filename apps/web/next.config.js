@@ -15,6 +15,21 @@ const nextConfig = {
      doesn't help, Next re-compresses anyway. Compression belongs at the edge
      (a CDN or reverse proxy), not in this dev/app proxy. */
   compress: false,
+  /* How large a request body the proxy will carry. Next's default is 10MB, and
+     it does not reject a larger one — it forwards the FIRST 10MB, the upstream
+     sees a truncated multipart body and resets the connection, and the browser
+     is handed a bare 500. Measured on a 17MB PDF: 30.5 seconds, then
+     "Internal Server Error", with nothing whatsoever in the API log because the
+     request never arrived intact.
+
+       Request body exceeded 10MB for /api/items/file
+       Failed to proxy http://api:8000/api/items/file Error: socket hang up
+
+     Matched to the API's own MAX_UPLOAD_MB (128MB) so the two agree. If the
+     proxy limit is the smaller of the pair, the API's polite "file too large"
+     refusal can never be reached and every oversized upload dies as a 500
+     instead. */
+  experimental: { proxyClientMaxBodySize: "128mb" },
   async rewrites() {
     // The browser only ever calls same-origin /api/*; Next proxies to the API.
     return [{ source: "/api/:path*", destination: `${API_URL}/api/:path*` }];

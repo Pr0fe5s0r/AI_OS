@@ -122,6 +122,10 @@ MAX_CATALOGUE_BYTES = _int_env("MAX_CATALOGUE_BYTES", 64 * 1024 * 1024)
 MAX_ROUNDS = 6
 # Reading the same section twice is a loop, not research.
 MAX_READS = 6
+# The most sections one read_section call may ask for. Batching several is the
+# point of the list form; asking for a RANGE is not. Left uncapped, the agent
+# requested 299 sections in a single call the first time it was offered a list.
+MAX_SECTIONS_PER_CALL = MAX_READS
 MAX_SECTION_CHARS = 4000
 # Looking at a page costs a second model call on a bigger model. Two is enough
 # to check a table and the page after it; more than that is the agent browsing.
@@ -371,14 +375,33 @@ _TOOLS = [
         "function": {
             "name": "read_section",
             "description": (
-                "Read the full text of one section. Returns the text with a "
-                "citation number to use in your answer."
+                "Read the full text of one or more sections of a document. "
+                "Pass SEVERAL section ids at once whenever you have more than "
+                "one candidate — they are read in a single step, and reading "
+                "three costs the same wait as reading one. Returns each "
+                "section's text with a citation number to use in your answer."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "doc": {"type": "string", "description": "The document id."},
-                    "section": {"type": "string", "description": "The section id, e.g. n014."},
+                    "section": {
+                        # Either shape is accepted. A list is what the tool is
+                        # for, but a schema that ONLY took a list would make a
+                        # single read look like the unusual case, and models
+                        # reliably send a bare string anyway — refusing it would
+                        # cost a round to discover.
+                        "anyOf": [
+                            {"type": "string"},
+                            {"type": "array", "items": {"type": "string"}},
+                        ],
+                        "description": (
+                            "One section id (e.g. 'n014') or several "
+                            f"(e.g. ['n014','n015','n016']), at most "
+                            f"{MAX_SECTIONS_PER_CALL}. Prefer several — but "
+                            "pick the likely ones, do not ask for a range."
+                        ),
+                    },
                 },
                 "required": ["doc", "section"],
             },
@@ -765,6 +788,7 @@ def _where_named_things_live(
 def _why_these_documents(
     routing: route.Routing, documents: list[dict[str, Any]]
 ) -> str:
+    by_title = {doc["item_id"]: doc["title"] for doc in documents}
     """Tell the agent this list was narrowed, and on what evidence.
 
     Two failures this prevents, both seen before it existed.
@@ -782,6 +806,32 @@ def _why_these_documents(
     """
     if routing.how == "everything":
         return ""
+    if routing.how == "ranked":
+        # Nothing was excluded — every document is in the catalogue above. This
+        # says which ones the index believes the question is about, so the agent
+        # starts there instead of sampling whatever the search returned.
+        #
+        # The case this exists for: asked "server requirements" of a store
+        # holding one server document and an 11,460-passage Harry Potter
+        # collection, the agent searched the novel, read two pages of it, and
+        # then explained in its answer that Harry Potter is unrelated to server
+        # requirements. The cards already knew — 0.778 against 0.614 — and
+        # nobody had told it.
+        lines = [
+            f"- {item_id} ({by_title.get(item_id, '')[:60]}): "
+            f"{routing.because.get(item_id, 'matched the question')}"
+            for item_id in routing.order
+            if item_id in by_title
+        ]
+        return (
+            "WHICH DOCUMENTS THIS QUESTION LOOKS LIKE IT IS ABOUT, best match "
+            "first, from the index — each document's summary and its passages "
+            "scored against the question. Start with the first one. Nothing is "
+            "excluded and you may read any document above; this is a ranking, "
+            "not a filter, and a ranking is not a finding.\n"
+            "Do NOT read from a document far down this list to 'check' it. If "
+            "the top one answers the question, answer.\n" + "\n".join(lines) + "\n\n"
+        )
     if routing.how == "named":
         return (
             "THESE DOCUMENTS WERE NAMED IN THE REQUEST. Answer only from them. "
@@ -839,8 +889,35 @@ def _node_holding(root: tree.Node, text: str) -> tree.Node | None:
     return best
 
 
+# How long the section-address hint may hold up the answer. Measured at 1.4 to
+# 2.4 seconds on real collections, so this is generous rather than tight.
+HINT_DEADLINE_SECONDS = 8.0
+
+
+async def _hint_or_nothing(task: asyncio.Future[str]) -> str:
+    """Wait for the hint, but never on it.
+
+    ``await task`` with no bound is what turned a slow hint into a dead answer.
+    Symptom: the SSE stream opened, reported the index, emitted nothing further,
+    and the browser eventually gave up with ERR_INCOMPLETE_CHUNKED_ENCODING —
+    "network error" on screen. Nothing in any log, because nothing had failed;
+    the walk was simply parked on an await that never returned.
+
+    The hint is an optimisation and its own docstring already says a hint that
+    cannot be produced is not an error. That has to be true of a hint that is
+    merely slow as well, or the optimisation becomes a dependency. Losing it
+    costs a slightly worse prompt; waiting on it costs the answer.
+    """
+    try:
+        # wait_for cancels the task itself on timeout, so nothing is left
+        # running against a database session nobody is reading from.
+        return await asyncio.wait_for(task, HINT_DEADLINE_SECONDS)
+    except Exception:
+        return ""
+
+
 async def _words_in_parallel(
-    scope: Scope, question: str, trees: dict[str, tree.Node]
+    scope: Scope, question: str, trees: dict[str, tree.Node], prefer: tuple[str, ...] = ()
 ) -> str:
     """``_where_the_words_are`` on its own database session, so it can be
     started early and awaited late.
@@ -854,7 +931,7 @@ async def _words_in_parallel(
 
     try:
         async with Session() as session:
-            return await _where_the_words_are(session, scope, question, trees)
+            return await _where_the_words_are(session, scope, question, trees, prefer=prefer)
     except Exception:
         return ""
 
@@ -865,6 +942,7 @@ async def _where_the_words_are(
     question: str,
     trees: dict[str, tree.Node],
     limit: int = 6,
+    prefer: tuple[str, ...] = (),
 ) -> str:
     """Sections the index already matched, named so they can be opened.
 
@@ -895,7 +973,29 @@ async def _where_the_words_are(
         # the way it did before.
         return ""
 
+    # Ordered by the card ranking, not by passage score.
+    #
+    # The two signals disagree, and the passage arm is the weaker one. Asked
+    # "Server requirement" of a store holding one server document and a Harry
+    # Potter collection, the passage arm matched "the door to the Room of
+    # Requirement" and the hint duly told the agent to read two chapters of the
+    # novel. The ranking already knew better — 0.778 against 0.614 — and the
+    # agent was left holding two pieces of advice that pointed different ways.
+    # It hedged by calling open_document, which is exactly the round this hint
+    # exists to save.
+    #
+    # Ordering, not filtering: every matched section is still offered, because a
+    # card is a summary and can be wrong about a detail buried in a document.
+    # The best-ranked document simply goes first, and the ready-made call leads
+    # with it.
+    if prefer:
+        rank = {item_id: n for n, item_id in enumerate(prefer)}
+        hits = sorted(hits, key=lambda h: rank.get(h.item_id, len(rank)))
+
     lines: list[str] = []
+    # Section ids grouped by the document they belong to, so the hint can end
+    # with the exact call to make rather than parts the model has to assemble.
+    found: OrderedDict[str, list[str]] = OrderedDict()
     for hit in hits:
         root = trees.get(hit.item_id)
         if root is None:
@@ -910,11 +1010,23 @@ async def _where_the_words_are(
             )
             if line not in lines:
                 lines.append(line)
+                ids = found.setdefault(hit.item_id, [])
+                if node.node_id not in ids:
+                    ids.append(node.node_id)
         if len(lines) >= limit:
             break
 
     if not lines:
         return ""
+
+    # The exact call, written out. The hint named the right sections and the
+    # agent still spent a round on open_document first — roughly ten seconds to
+    # fetch an outline whose relevant entries were already in the prompt. A tool
+    # call it can copy removes the step where it decides how to begin.
+    ready = "\n".join(
+        f'  read_section(doc="{item_id}", section={ids[:limit]!r})'
+        for item_id, ids in found.items()
+    )
     return (
         "SECTIONS THE INDEX ALREADY MATCHED TO THIS QUESTION. Read these FIRST, "
         "in one turn, before opening anything else — they were found by "
@@ -929,7 +1041,8 @@ async def _where_the_words_are(
         # per round. Honest hedging that reads as "this is unreliable" gets the
         # evidence thrown away. The hedge is still here; it no longer leads.
         + "\n".join(lines[:limit])
-        + "\n\n"
+        + "\nThese ids are read_section ids: you do NOT need open_document to "
+        "reach them. Start with exactly this:\n" + ready + "\n\n"
     )
 
 
@@ -1172,19 +1285,30 @@ async def navigate(
     catalogue_truncated = len(documents) < routing.available
     trace.config["routing"] = routing.as_dict()
     if routing.how != "everything":
-        record(
-            Step(
-                0,
-                "narrowed" if routing.routed else "filtered",
-                f"{len(documents)} of {routing.available} documents"
-                + (" — named in the request" if routing.how == "named" else ""),
-            )
+        # The label has to match what actually happened. "ranked" excludes
+        # nothing, so reporting it as "filtered 3 of 3 documents" described a
+        # narrowing that never took place — and a trail that misdescribes the
+        # retrieval is worse than a silent one, because it is believed.
+        action = {"routed": "narrowed", "named": "filtered", "ranked": "ranked"}[routing.how]
+        detail = (
+            f"{len(documents)} document{'s' if len(documents) != 1 else ''} by relevance"
+            if routing.how == "ranked"
+            else f"{len(documents)} of {routing.available} documents"
+            + (" — named in the request" if routing.how == "named" else "")
         )
+        record(Step(0, action, detail))
     if not documents:
         trace.timings_ms["total"] = int((time.perf_counter() - started) * 1000)
         return outcome, trace
 
-    trees = {doc["item_id"]: tree.build(doc["body"], doc["title"]) for doc in documents}
+    # Cached on the document's content, so re-parsing only happens when the
+    # document actually changed. Measured on this collection: 8.2 seconds of
+    # every single question went on rebuilding trees the previous question had
+    # already built.
+    trees = {
+        doc["item_id"]: tree.build_cached(doc["item_id"], doc["body"], doc["title"])
+        for doc in documents
+    }
     by_id = {doc["item_id"]: doc for doc in documents}
 
     # Started here, awaited when the prompt is assembled. It is an embedding
@@ -1195,7 +1319,9 @@ async def navigate(
     #
     # Uses its own session: two coroutines sharing one AsyncSession would
     # interleave statements on a connection that does not expect it.
-    words_ahead = asyncio.ensure_future(_words_in_parallel(scope, question, trees))
+    words_ahead = asyncio.ensure_future(
+        _words_in_parallel(scope, question, trees, prefer=tuple(routing.order))
+    )
 
     # Enrich the catalogue with index summaries when they exist. Each document
     # gets a ``_card`` blurb and ``_section_summaries`` list that _catalogue
@@ -1305,7 +1431,7 @@ async def navigate(
                     if abbreviated
                     else ""
                 )
-                + (await words_ahead if abbreviated else "")
+                + (await _hint_or_nothing(words_ahead) if abbreviated else "")
                 + f"{_where_named_things_live(question, documents, trees)}"
                 + _why_these_documents(routing, documents)
                 + f"QUESTION: {question}"
@@ -2116,7 +2242,29 @@ async def navigate(
                 continue
 
             doc_id = str(args.get("doc") or "")
-            node_id = str(args.get("section") or "")
+            # One id or several. Reading three sections used to cost three
+            # rounds — three model round trips — to fetch text the loop could
+            # have returned in one. Measured: pages 3325, 3326 and 3327 read
+            # one per round, ~15 seconds, for an answer that needed all three.
+            raw_sections = args.get("section")
+            if isinstance(raw_sections, list):
+                node_ids = [str(s) for s in raw_sections if str(s).strip()]
+            else:
+                node_ids = [str(raw_sections or "")]
+
+            # Capped, because making batching free made it shotgun. Measured
+            # immediately after the batch change: asked for the three Deathly
+            # Hallows, the agent requested 299 sections in one call — every
+            # section from n3306 to n3604. Only MAX_READS of them could be read,
+            # and the other 293 each returned a "limit reached" line, so the
+            # prompt filled with refusals and the walk stopped being navigation
+            # and became a scan.
+            #
+            # Trimmed rather than refused: the first few are the ones it thought
+            # most likely, and reading those is exactly right.
+            overflow = len(node_ids) - MAX_SECTIONS_PER_CALL
+            node_ids = node_ids[:MAX_SECTIONS_PER_CALL]
+
             root = trees.get(doc_id)
             if root is None and len(trees) == 1:
                 # A section id with the wrong document attached, when there is
@@ -2124,126 +2272,149 @@ async def navigate(
                 # a guess.
                 doc_id, root = next(iter(trees.items()))
 
-            nodes = tree.find(root, [node_id]) if root else []
-            if not nodes:
-                # Said plainly so the model can try another rather than
-                # treating silence as "nothing is there".
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call["id"],
-                        "content": (
-                            f"No section {node_id!r} in that document. "
-                            "Check the ids in the catalogue and try another."
+            # Every section in this call answers into ONE tool message, because
+            # the protocol allows exactly one reply per tool_call_id. Failures
+            # are reported inside it rather than swallowed — a section the model
+            # asked for and did not get has to come back as a line it can read,
+            # or it will cite a number it was never given.
+            parts: list[str] = []
+            read_any = False
+            for node_id in node_ids:
+                nodes = tree.find(root, [node_id]) if root else []
+                if not nodes:
+                    # Said plainly so the model can try another rather than
+                    # treating silence as "nothing is there".
+                    parts.append(
+                        f"No section {node_id!r} in that document. "
+                        "Check the ids in the catalogue and try another."
+                    )
+                    record(Step(round_number, "missed", node_id))
+                    if emit is not None:
+                        await emit(
+                            {
+                                "type": "tool_result",
+                                "tool": "read_section",
+                                "ok": False,
+                                "detail": f"no section {node_id!r}",
+                            }
+                        )
+                    continue
+
+                node = nodes[0]
+                if (doc_id, node_id) in seen:
+                    parts.append(
+                        f"Section {node_id!r}: already read. "
+                        "Read a different section, or answer."
+                    )
+                    if emit is not None:
+                        await emit(
+                            {
+                                "type": "tool_result",
+                                "tool": "read_section",
+                                "ok": False,
+                                "detail": "already read",
+                            }
+                        )
+                    continue
+
+                if len(read) >= MAX_READS:
+                    # The budget is spent. Said here rather than silently
+                    # dropping the rest of the batch, so the model knows the
+                    # sections it asked for were not read.
+                    parts.append(
+                        f"Section {node_id!r} not read: the reading limit of "
+                        f"{MAX_READS} sections is reached. Answer from what you have."
+                    )
+                    continue
+
+                seen.add((doc_id, node_id))
+                body = tree.section_text(node, limit=MAX_SECTION_CHARS)
+                marker = len(read) + 1
+                read.append(
+                    (
+                        Passage(
+                            chunk_id=f"{doc_id}:{node.node_id}",
+                            ordinal=marker - 1,
+                            heading=node.title,
+                            text=body,
+                            score=round(1.0 - (marker - 1) * 0.05, 4),
+                            # Where this section sits in the original. It was
+                            # read as text, not off a picture — but a reader
+                            # checking a transcribed table wants the page
+                            # whether the words were read at ingest or
+                            # mid-question, and for a scan every passage came
+                            # off a page.
+                            #
+                            # Only when that page can be RENDERED, though. A
+                            # deck writes the same page markers a PDF does, so
+                            # slide 3 claimed a picture nothing could produce
+                            # and the console drew a broken image.
+                            page=(
+                                tree.page_of(by_id[doc_id]["body"] or "", node)
+                                if _has_pictures(by_id[doc_id])
+                                else None
+                            ),
                         ),
-                    }
+                        doc_id,
+                    )
                 )
-                record(Step(round_number, "missed", node_id))
+                read_any = True
+                record(Step(round_number, "read", f"{node.title[:60]} → [{marker}]"))
                 if emit is not None:
                     await emit(
                         {
                             "type": "tool_result",
                             "tool": "read_section",
-                            "ok": False,
-                            "detail": f"no section {node_id!r}",
+                            "ok": True,
+                            "heading": node.title,
+                            "title": by_id[doc_id]["title"],
+                            "marker": marker,
                         }
                     )
-                continue
+                parts.append(
+                    f"[{marker}] {by_id[doc_id]['title']} > {node.title}\n\n{body}\n\n"
+                    f"(Cite this as [{marker}].)"
+                )
 
-            node = nodes[0]
-            if (doc_id, node_id) in seen:
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call["id"],
-                        "content": "Already read. Read a different section, or answer.",
-                    }
-                )
-                if emit is not None:
-                    await emit(
-                        {
-                            "type": "tool_result",
-                            "tool": "read_section",
-                            "ok": False,
-                            "detail": "already read",
-                        }
-                    )
-                continue
-            seen.add((doc_id, node_id))
-
-            body = tree.section_text(node, limit=MAX_SECTION_CHARS)
-            marker = len(read) + 1
-            read.append(
-                (
-                    Passage(
-                        chunk_id=f"{doc_id}:{node.node_id}",
-                        ordinal=marker - 1,
-                        heading=node.title,
-                        text=body,
-                        score=round(1.0 - (marker - 1) * 0.05, 4),
-                        # Where this section sits in the original. It was read
-                        # as text, not off a picture — but a reader checking a
-                        # transcribed table wants the page whether the words
-                        # were read at ingest or mid-question, and for a scan
-                        # every passage came off a page.
-                        #
-                        # Only when that page can be RENDERED, though. A deck
-                        # writes the same page markers a PDF does, so slide 3
-                        # claimed a picture nothing could produce and the
-                        # console drew a broken image.
-                        page=(
-                            tree.page_of(by_id[doc_id]["body"] or "", node)
-                            if _has_pictures(by_id[doc_id])
-                            else None
-                        ),
-                    ),
-                    doc_id,
-                )
-            )
-            record(Step(round_number, "read", f"{node.title[:60]} → [{marker}]"))
-            if emit is not None:
-                await emit(
-                    {
-                        "type": "tool_result",
-                        "tool": "read_section",
-                        "ok": True,
-                        "heading": node.title,
-                        "title": by_id[doc_id]["title"],
-                        "marker": marker,
-                    }
-                )
-            if _is_a_picture(by_id[doc_id]):
+            if read_any and _is_a_picture(by_id[doc_id]):
                 read_a_picture = True
 
             # Now that this document has been opened, find out whether it has
             # pages to fall back on — and say so only if it does. An offer of
             # something that is not there is worse than no offer.
-            if doc_id not in page_counts:
-                from packages.core import pages as page_store
-
-                page_counts[doc_id] = (
-                    await page_store.count(
-                        scope.workspace_id, doc_id, by_id[doc_id]["locator"] or ""
-                    )
-                    if page_store.available()
-                    else 0
-                )
             offer = ""
-            if page_counts[doc_id] and looks < MAX_LOOKS:
-                offer = (
-                    f"\n\n(This document has {page_counts[doc_id]} pages. If the text "
-                    "above is there but unusable — a table whose columns have "
-                    "collapsed, a form, a chart — look_at_page will read the page "
-                    "picture instead.)"
+            if read_any:
+                if doc_id not in page_counts:
+                    from packages.core import pages as page_store
+
+                    page_counts[doc_id] = (
+                        await page_store.count(
+                            scope.workspace_id, doc_id, by_id[doc_id]["locator"] or ""
+                        )
+                        if page_store.available()
+                        else 0
+                    )
+                if page_counts[doc_id] and looks < MAX_LOOKS:
+                    offer = (
+                        f"\n\n(This document has {page_counts[doc_id]} pages. If the "
+                        "text above is there but unusable — a table whose columns "
+                        "have collapsed, a form, a chart — look_at_page will read "
+                        "the page picture instead.)"
+                    )
+
+            if overflow > 0:
+                # One line, not one per dropped section.
+                parts.append(
+                    f"({overflow} further section ids were not read: at most "
+                    f"{MAX_SECTIONS_PER_CALL} may be read per call. Ask for the "
+                    "most likely ones, not a range.)"
                 )
+
             messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": call["id"],
-                    "content": (
-                        f"[{marker}] {by_id[doc_id]['title']} > {node.title}\n\n{body}\n\n"
-                        f"(Cite this as [{marker}].){offer}"
-                    ),
+                    "content": "\n\n---\n\n".join(parts) + offer,
                 }
             )
 
