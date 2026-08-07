@@ -1033,10 +1033,20 @@ async def _where_the_words_are(
     # agent still spent a round on open_document first — roughly ten seconds to
     # fetch an outline whose relevant entries were already in the prompt. A tool
     # call it can copy removes the step where it decides how to begin.
-    ready = "\n".join(
-        f'  read_section(doc="{item_id}", section={ids[:limit]!r})'
-        for item_id, ids in found.items()
-    )
+    # The ready-made call names the BEST-RANKED document only.
+    #
+    # Listing every matched document here undid the ranking. Asked "Server
+    # requirement", the passage arm matched "the door to the Room of
+    # Requirement" in a novel; with open_document withheld the agent obediently
+    # read every id in this block, and a server-sizing answer cited Harry
+    # Potter — the exact contamination the ranking exists to prevent.
+    #
+    # The other documents stay in the list above, so nothing is hidden and the
+    # agent can still reach them if the first does not answer. They are simply
+    # not what it is told to start with.
+    best = next(iter(found.items()))
+    ready = f'  read_section(doc="{best[0]}", section={best[1][:limit]!r})'
+    others = len(found) - 1
     return (
         "SECTIONS THE INDEX ALREADY MATCHED TO THIS QUESTION. Read these FIRST, "
         "in one turn, before opening anything else — they were found by "
@@ -1052,7 +1062,17 @@ async def _where_the_words_are(
         # evidence thrown away. The hedge is still here; it no longer leads.
         + "\n".join(lines[:limit])
         + "\nThese ids are read_section ids: you do NOT need open_document to "
-        "reach them. Start with exactly this:\n" + ready + "\n\n"
+        "reach them. Start with exactly this, and answer from it if it "
+        "settles the question:\n" + ready + "\n"
+        + (
+            f"(Sections in {others} other document"
+            f"{'s' if others != 1 else ''} are listed above as well. They "
+            "matched on wording and are usually a different subject — only "
+            "read them if the call above does not answer the question.)\n"
+            if others
+            else ""
+        )
+        + "\n"
     )
 
 
@@ -1370,18 +1390,6 @@ async def navigate(
     }
     by_id = {doc["item_id"]: doc for doc in documents}
 
-    # Started here, awaited when the prompt is assembled. It is an embedding
-    # call plus a search — measured at 1.4 seconds — and it needs nothing that
-    # the enrichment below produces, so running it in front of them made every
-    # question wait 1.4s longer than it had to. Everything between this line
-    # and the await is now free.
-    #
-    # Uses its own session: two coroutines sharing one AsyncSession would
-    # interleave statements on a connection that does not expect it.
-    words_ahead = asyncio.ensure_future(
-        _words_in_parallel(scope, question, trees, prefer=tuple(routing.order))
-    )
-
     # Enrich the catalogue with index summaries when they exist. Each document
     # gets a ``_card`` blurb and ``_section_summaries`` list that _catalogue
     # injects, so the agent navigates by description rather than raw headings.
@@ -1464,19 +1472,30 @@ async def navigate(
     _system = _SYSTEM + _HYBRID_NOTE + (_NEIGHBOURS_NOTE if can_hop else "") if hybrid else _SYSTEM
 
     catalogue, abbreviated = _catalogue(documents, trees)
-    if not abbreviated:
-        # The hint only goes in the prompt when the catalogue had to be
-        # shortened, and whether it was is not known until now. Started
-        # speculatively so its 1.4s overlaps the work above; cancelled here when
-        # it turns out not to be wanted, rather than left to finish into nobody.
-        words_ahead.cancel()
     # Reaching a chapter through a shortened catalogue costs two rounds the
     # flat one never spent: open the document, open the part. Measured
     # without this, the agent used them on navigation and ran out before it
     # could read anything — five books opened, no answer. The extra rounds
     # are the price of the smaller prompt, and only charged when it applies.
     max_rounds = MAX_ROUNDS + (2 if abbreviated else 0)
-    hint = await _hint_or_nothing(words_ahead) if abbreviated else ""
+
+    # Run inline, on the request's own session, rather than as a task started
+    # earlier on a session of its own.
+    #
+    # The parallel version saved about a second and cost the hint entirely. Run
+    # as a task and awaited inside the caller's open session scope, the second
+    # session it opened could not make progress: 394ms of work timed out at 25
+    # seconds, every time, and the failure was swallowed into an empty string.
+    # So the agent never got section ids, fell back to open_document, and met a
+    # 138,000-character outline. Two separate bugs traced back to this
+    # optimisation; it is not worth one second.
+    hint = (
+        await _where_the_words_are(
+            session, scope, question, trees, prefer=tuple(routing.order)
+        )
+        if abbreviated
+        else ""
+    )
     # Whether the index handed over section ids. When it did, open_document has
     # nothing left to tell the agent, and the tool is withheld for the opening
     # rounds — see where `tools` is built.
