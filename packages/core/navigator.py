@@ -369,6 +369,63 @@ _LOOK_PROMPT = (
 )
 _NOT_ON_PAGE = "NOT_ON_THIS_PAGE"
 
+# An answer that concludes the store does not say something.
+#
+# Needed because a negative can arrive two ways and only one of them is
+# honest. submit_answer(found=false) says so outright. But the model also
+# writes a confident paragraph explaining what is NOT there — "the owl is not
+# named", "the text does not give" — while reporting found=true, because from
+# its point of view it did answer the question it was asked.
+#
+# Both are conclusions of absence, and a conclusion of absence drawn from two
+# sections that a search picked is worth almost nothing. This is what triggers
+# one push to search before such an answer is accepted.
+_READS_AS_ABSENT = re.compile(
+    r"\b(?:is|are|was|were)\s+not\s+(?:named|given|provided|specified|mentioned|stated)\b"
+    r"|\bdoes\s+not\s+(?:say|name|give|provide|specify|mention|state)\b"
+    r"|\bno\s+(?:mention|name|reference)\s+of\b"
+    r"|\bnot\s+(?:provided|specified|named)\s+in\s+the\b"
+    r"|\bcannot\s+be\s+determined\b",
+    re.I,
+)
+
+
+def _reads_as_absent(text: str) -> bool:
+    return bool(_READS_AS_ABSENT.search(text or ""))
+
+
+def _should_search_first(
+    *, absent: bool, hybrid: bool, searched: bool, pressed: bool, rounds_left: bool
+) -> bool:
+    """Whether to send the agent back to search before accepting a negative.
+
+    Every condition has to hold, which is what keeps this off the fast path:
+    it costs a round ONLY when the agent is about to say something is not there
+    and has not actually looked for it.
+
+    The case it exists for: asked "Harry owl name", the index hint matched two
+    pages that mention owls and name none of them. The agent read exactly those
+    two, concluded "the owl is not named", and reported found=true — in 8.5
+    seconds, having never once searched for "Hedwig". The hint is chosen by
+    searching the whole QUESTION; the answer is often a single word inside it,
+    and those are not the same query.
+    """
+    return absent and hybrid and not searched and not pressed and rounds_left
+
+
+_SEARCH_FIRST = (
+    "Before concluding that. The sections you read were chosen by searching "
+    "your whole question, which is not the same as searching for the thing the "
+    "question ASKS FOR — a name, a number, a title. You have not run "
+    "hybrid_search once.\n"
+    "Run it now on the specific term itself, not the question: if you are asked "
+    "what something is called, search for what you think it might be called, or "
+    "for the words that would appear beside the name. Then answer.\n"
+    "If the search also finds nothing, say so and cite what you read — a "
+    "considered 'not in these documents' is a fine answer. A guess after two "
+    "sections is not."
+)
+
 _TOOLS = [
     {
         "type": "function",
@@ -1558,6 +1615,10 @@ async def navigate(
     # loop gave up. A nudge repeated is not a nudge, it is a deadlock.
     pressed_to_look = False
     pressed_to_read = False
+    # Whether hybrid_search has been used, and whether the agent has been sent
+    # back once for concluding something is absent without it.
+    searched = False
+    pressed_to_search = False
 
     mark = time.perf_counter()
     for round_number in range(1, max_rounds + 1):
@@ -1714,7 +1775,19 @@ async def navigate(
             # produced would turn a formatting slip into an empty result, which
             # is the failure this whole module exists to remove.
             if reply.get("content"):
-                outcome.answer = _strip_pseudo_call(reply["content"].strip())
+                drafted = _strip_pseudo_call(reply["content"].strip())
+                if _should_search_first(
+                    absent=_reads_as_absent(drafted),
+                    hybrid=hybrid,
+                    searched=searched,
+                    pressed=pressed_to_search,
+                    rounds_left=round_number < max_rounds,
+                ):
+                    pressed_to_search = True
+                    messages.append({"role": "user", "content": _SEARCH_FIRST})
+                    record(Step(round_number, "sent back", "concluded absent without searching"))
+                    continue
+                outcome.answer = drafted
                 outcome.found = bool(read)
                 record(Step(round_number, "answered", "without submit_answer"))
             break
@@ -1900,7 +1973,26 @@ async def navigate(
                     )
                     continue
 
-                outcome.answer = str(args.get("answer") or "").strip()
+                drafted = str(args.get("answer") or "").strip()
+                if _should_search_first(
+                    absent=(not said_found) or _reads_as_absent(drafted),
+                    hybrid=hybrid,
+                    searched=searched,
+                    pressed=pressed_to_search,
+                    rounds_left=round_number < max_rounds,
+                ):
+                    pressed_to_search = True
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call["id"],
+                            "content": _SEARCH_FIRST,
+                        }
+                    )
+                    record(Step(round_number, "sent back", "concluded absent without searching"))
+                    continue
+
+                outcome.answer = drafted
                 outcome.found = said_found and bool(read)
                 record(
                     Step(round_number, "answered", "found" if outcome.found else "not found")
@@ -2100,6 +2192,10 @@ async def navigate(
                 continue
 
             if call["name"] == "hybrid_search" and hybrid:
+                # Recorded even when the search returns nothing: the guard below
+                # asks whether the agent LOOKED, and a search that found nothing
+                # is still having looked.
+                searched = True
                 found_query = str(args.get("query") or "").strip()
                 if not found_query:
                     messages.append(

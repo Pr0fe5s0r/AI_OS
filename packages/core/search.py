@@ -180,6 +180,34 @@ def _filters(scope: Scope, cfg: RetrievalConfig) -> tuple[str, dict[str, Any]]:
     return " AND ".join(clauses), params
 
 
+def _keep_the_exact_matches(group: list[Passage], slots: int = 2, keep: int = 5) -> list[Passage]:
+    """Return a document's best passages, never dropping every exact match.
+
+    The passage score is ``max(semantic, min(keyword * 2, 0.6))`` — a keyword-
+    only passage is capped at 0.6. That is fine when semantic scores are spread
+    out. It is fatal when they are not: on a store holding one novel, every
+    cosine lands around 0.85 because all the prose is the same domain, so EVERY
+    semantic passage outranks EVERY exact match and the top five are always
+    semantic.
+
+    Measured: searching the literal word "Hedwig" returned five passages, none
+    of which contained "Hedwig", while 182 chunks did and the keyword arm found
+    them in 73ms. The agent then answered that Harry's owl is never named.
+
+    Two slots are reserved rather than the scoring being rebalanced. Changing
+    the cap would move every ranking in the system to fix one; this leaves the
+    order alone and only guarantees that if a document matched a word exactly,
+    the reader gets to see where.
+    """
+    top = group[:keep]
+    if any(p.keyword > 0 for p in top):
+        return top
+    exact = [p for p in group if p.keyword > 0][:slots]
+    if not exact:
+        return top
+    return (top[: max(0, keep - len(exact))] + exact) or top
+
+
 async def search(
     session: AsyncSession,
     scope: Scope,
@@ -359,7 +387,7 @@ async def search_traced(
         # "7. Deliverables" while quoting text from the connectors section,
         # which is a citation pointing at the wrong place — worse than no
         # citation, because it looks checkable and is not.
-        ranked_passages = per_item.get(row.item_id, [])
+        ranked_passages = _keep_the_exact_matches(per_item.get(row.item_id, []))
         winner = ranked_passages[0] if ranked_passages else None
         detail = {
             "item_id": row.item_id,
