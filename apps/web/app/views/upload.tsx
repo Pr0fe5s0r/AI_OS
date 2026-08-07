@@ -247,7 +247,13 @@ export function Upload({
       onDrop={(e) => {
         e.preventDefault();
         setDragging(false);
-        send(e.dataTransfer.files);
+        try {
+          if (e.dataTransfer?.files?.length) {
+            send(e.dataTransfer.files);
+          }
+        } catch (err) {
+          console.warn("File drop error:", err);
+        }
       }}
     >
       <div className="mb-5 flex flex-wrap items-start justify-between gap-4">

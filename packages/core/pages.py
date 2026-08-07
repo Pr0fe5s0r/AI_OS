@@ -33,9 +33,10 @@ from packages.core import blobs
 # Wide enough that small table type stays legible after the model's own
 # downscaling; not so wide that a page becomes a megabyte of base64.
 TARGET_WIDTH = 1400
-# Past this a "document" is a book, and looking at page 300 of it is not the
-# workflow this exists for.
-MAX_PAGES = 200
+# Large documents — books, legal filings, technical manuals — can run into the
+# thousands of pages.  The cap exists to prevent runaway rendering, not to
+# reject legitimate uploads.  Override with the MAX_RENDER_PAGES env var.
+MAX_PAGES = int(os.getenv("MAX_RENDER_PAGES", "5000"))
 
 
 def enabled() -> bool:
@@ -200,7 +201,7 @@ async def image(workspace_id: str, item_id: str, page: int) -> bytes | None:
 # document. What is transcribed is indexed and what is not is said out loud on
 # the item, so a truncated scan is visibly truncated instead of quietly short.
 def max_transcribe_pages() -> int:
-    return int(os.getenv("MAX_TRANSCRIBE_PAGES", "20"))
+    return int(os.getenv("MAX_TRANSCRIBE_PAGES", "200"))
 
 
 # Ingest-time reading is a different job from the navigator's mid-question look.

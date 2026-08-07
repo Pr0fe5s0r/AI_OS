@@ -37,7 +37,7 @@ def _bucket() -> str:
 def max_original_bytes() -> int:
     """Files larger than this are still indexed, but their original is not kept:
     object storage is cheap, but a store is not a backup target."""
-    return int(os.getenv("S3_MAX_ORIGINAL_MB", "25")) * 1024 * 1024
+    return int(os.getenv("S3_MAX_ORIGINAL_MB", "200")) * 1024 * 1024
 
 
 def key_for(workspace_id: str, item_id: str) -> str:
