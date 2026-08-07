@@ -178,7 +178,19 @@ def test_the_answer_stream_never_goes_silent_long_enough_to_be_cut():
     assert 'yield ": keepalive\\n\\n"' in source
 
 
-def test_the_hint_can_never_hold_up_the_answer():
-    """An unbounded await on an optimisation is how a slow hint became a dead
-    stream: 200 OK, no events, then ERR_INCOMPLETE_CHUNKED_ENCODING."""
-    assert 0 < HINT_DEADLINE_SECONDS <= 15
+def test_the_hint_is_bounded_but_not_so_tight_it_is_lost():
+    """Both failure modes are real and they pull in opposite directions.
+
+    Unbounded, a slow hint became a dead stream — 200 OK, no events, then
+    ERR_INCOMPLETE_CHUNKED_ENCODING. Bounded at 8s, the hint simply came back
+    EMPTY and said nothing: the embedding alone measures 4.4-5.8s cold, so past
+    the deadline the agent got no section ids, fell back to open_document, and a
+    walk that should take seconds took 113.
+
+    A silent optimisation that switches itself off is worse than one that is
+    merely slow, because nothing in the trace says it happened.
+    """
+    assert HINT_DEADLINE_SECONDS >= 20, (
+        "the embedding alone has measured 5.8s; a tight deadline loses the hint"
+    )
+    assert HINT_DEADLINE_SECONDS <= 60, "still bounded — an unbounded await is the original bug"

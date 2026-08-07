@@ -889,9 +889,19 @@ def _node_holding(root: tree.Node, text: str) -> tree.Node | None:
     return best
 
 
-# How long the section-address hint may hold up the answer. Measured at 1.4 to
-# 2.4 seconds on real collections, so this is generous rather than tight.
-HINT_DEADLINE_SECONDS = 8.0
+# How long the section-address hint may hold up the answer.
+#
+# 8s was too tight and failed silently, which is the worst combination. The hint
+# is an embedding call plus a hybrid search: 2.6s warm, but the embedding alone
+# has been measured at 4.4s and 5.8s cold, and past the deadline the hint came
+# back empty with nothing said. The agent then had no section ids, so it fell
+# back to open_document — which on a 3,604-section book is the single largest
+# thing in the conversation, and the query never finished.
+#
+# 25s. Still bounded — the original bug was an UNBOUNDED await, and that is what
+# must never come back — but no longer tight enough to lose the hint on a slow
+# embedding and turn a fast walk into a 113-second one.
+HINT_DEADLINE_SECONDS = 25.0
 
 
 async def _hint_or_nothing(task: asyncio.Future[str]) -> str:
@@ -1194,7 +1204,7 @@ def _outline_of(
                 "doc": document["item_id"],
                 "section": section_id,
                 "title": node.title,
-                "sections": _headings_only(inside),
+                "sections": _trim_to_fit(_headings_only(inside), budget),
             },
             ensure_ascii=False,
         )
@@ -1203,7 +1213,56 @@ def _outline_of(
     rendered = json.dumps(_entry(document, sections), ensure_ascii=False)
     if len(rendered) <= budget:
         return rendered
-    return json.dumps(_entry(document, _headings_only(sections)), ensure_ascii=False)
+    # Headings-only was treated as small enough by definition, and it is not.
+    # Measured: open_document on a 3,604-section book returned 138,584
+    # characters — about 34,600 tokens — straight into the next prompt, because
+    # the fallback returned without re-checking. The query never finished.
+    #
+    # Checked against the FINAL rendered string, not against the section list.
+    # Trimming the list alone left the wrapper unaccounted for and still came
+    # back 574 characters over. A budget is about what is sent.
+    headings = _headings_only(sections)
+    for _ in range(4):
+        rendered = json.dumps(_entry(document, _trim_to_fit(headings, budget)), ensure_ascii=False)
+        if len(rendered) <= budget:
+            return rendered
+        budget = int(budget * 0.85)
+    return rendered
+
+
+def _trim_to_fit(sections: list[dict[str, Any]], budget: int) -> list[dict[str, Any]]:
+    """Cut a heading list to the budget, saying how much was cut.
+
+    The last line of defence, and it has to exist: "headings only" is a big
+    reduction on a report and no reduction at all on a book, where the headings
+    ARE the size. A budget that is checked before one fallback and not after
+    the next is not a budget.
+
+    Reported rather than silent, so the agent knows it is looking at part of a
+    list and can drill in instead of concluding the rest is not there.
+    """
+    if not sections:
+        return sections
+    # Measured, not estimated. Estimating from the first entry's length assumes
+    # every heading is the same size, and on a real book they are not — that
+    # assumption overshot a 24,000 budget by 1,203 characters. Entries are added
+    # until the rendered JSON would exceed the budget, so the result fits by
+    # construction rather than by arithmetic that is nearly right.
+    room = budget - 200  # headroom for the wrapper this list is nested in
+    kept: list[dict[str, Any]] = []
+    used = 2  # the enclosing [] of the rendered list
+    for entry in sections:
+        size = len(json.dumps(entry, ensure_ascii=False)) + 1
+        if used + size > room:
+            break
+        kept.append(entry)
+        used += size
+    if len(kept) == len(sections):
+        return sections
+    if not kept:
+        kept = [sections[0]]
+    kept.append({"headings_not_shown": len(sections) - len(kept)})
+    return kept
 
 
 async def navigate(
@@ -1417,6 +1476,11 @@ async def navigate(
     # could read anything — five books opened, no answer. The extra rounds
     # are the price of the smaller prompt, and only charged when it applies.
     max_rounds = MAX_ROUNDS + (2 if abbreviated else 0)
+    hint = await _hint_or_nothing(words_ahead) if abbreviated else ""
+    # Whether the index handed over section ids. When it did, open_document has
+    # nothing left to tell the agent, and the tool is withheld for the opening
+    # rounds — see where `tools` is built.
+    hinted_sections = "read_section(doc=" in hint
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": _system},
         {
@@ -1424,14 +1488,21 @@ async def navigate(
             "content": (
                 f"DOCUMENTS:\n{catalogue}\n\n"
                 + (
-                    "This list is SHORTENED: it shows each document's top-level "
-                    "headings only, without the sections inside them or their "
-                    "opening lines. Call open_document on the one that looks "
-                    "right to see its contents in full, then read from there.\n\n"
+                    (
+                        "This list is SHORTENED: it shows each document's "
+                        "top-level headings only. The sections you need are "
+                        "already named below — read those.\n\n"
+                        if hinted_sections
+                        else "This list is SHORTENED: it shows each document's "
+                        "top-level headings only, without the sections inside "
+                        "them or their opening lines. Call open_document on the "
+                        "one that looks right to see its contents in full, then "
+                        "read from there.\n\n"
+                    )
                     if abbreviated
                     else ""
                 )
-                + (await _hint_or_nothing(words_ahead) if abbreviated else "")
+                + hint
                 + f"{_where_named_things_live(question, documents, trees)}"
                 + _why_these_documents(routing, documents)
                 + f"QUESTION: {question}"
@@ -1488,7 +1559,19 @@ async def navigate(
             tools = [_TOOLS[0], _HYBRID_TOOL, *([_NEIGHBOURS_TOOL] if can_hop else []), _TOOLS[1]]
         else:
             tools = list(_TOOLS)
-        if abbreviated:
+        # open_document is offered when the catalogue was shortened AND the
+        # index has not already handed over section ids.
+        #
+        # When the hint fired, everything open_document would return is already
+        # in the prompt — and the round it costs is not free: on a 3,604-section
+        # book that outline is the largest single thing in the conversation.
+        # Measured, the agent opened the document anyway and the question never
+        # finished. Withdrawing the tool is the only reliable way to stop it;
+        # saying "you do not need this" in the prompt was not enough.
+        #
+        # It comes BACK once reading has happened and has not settled the
+        # question, so a wrong hint cannot trap the agent with no way to explore.
+        if abbreviated and (not hinted_sections or read):
             tools = [*tools, _OPEN_TOOL]
         if looks < MAX_LOOKS and any(page_counts.values()):
             # Reading first is NOT the waste it looks like. Offering the page
