@@ -173,7 +173,7 @@ async def test_a_page_that_was_looked_at_becomes_a_citation_carrying_its_page(
     looked = [p for p in passages if p.page == 2]
     assert looked, "the page passage did not survive into the hits"
     assert "| Revenue | 41 | 52 |" in looked[0].text
-    assert [s.action for s in outcome.steps] == ["read", "looked", "answered"]
+    assert [s.action for s in outcome.steps] == ["opened", "read", "looked", "answered"]
 
 
 async def test_a_page_that_does_not_show_it_is_recorded_and_not_cited(db, monkeypatch):
@@ -487,7 +487,7 @@ async def test_a_prose_answer_about_ordinary_text_is_left_alone(db, monkeypatch)
     monkeypatch.setattr("packages.core.pages.count", one_page)
     outcome, _ = await navigator.navigate(db, SCOPE, "What was revenue in 2025?")
 
-    assert [s.action for s in outcome.steps] == ["read", "answered"]
+    assert [s.action for s in outcome.steps] == ["opened", "read", "answered"]
 
 
 def test_the_page_reader_is_asked_about_shapes_not_only_text():
@@ -615,7 +615,7 @@ async def test_a_text_document_is_not_dragged_into_a_vision_call(db, monkeypatch
     monkeypatch.setattr("packages.core.llm.chat_with_tools", lambda *a, **k: next(rounds))
 
     outcome, _ = await navigator.navigate(db, SCOPE, "What was revenue in 2025?")
-    assert [s.action for s in outcome.steps] == ["read", "answered"]
+    assert [s.action for s in outcome.steps] == ["opened", "read", "answered"]
 
 
 def test_a_reading_says_where_on_the_page_it_came_from():
@@ -674,3 +674,134 @@ def test_a_reading_with_no_regions_is_still_a_reading():
     text, regions = _regions_in("The table lists every element by weight.")
     assert text == "The table lists every element by weight."
     assert regions == []
+
+
+async def test_even_a_picture_is_read_before_it_is_looked_at(db, monkeypatch):
+    """Offering the page tool from the opening round LOOKS like free speed: a
+    picture's text is only a description, so why read it first?
+
+    Measured, it cost two of twenty answers. Without a read the agent does not
+    yet know WHICH document it needs — it looked at the wrong one, spent a look
+    on NOT_ON_THIS_PAGE, and answered from a third document entirely. Asked
+    which elements are liquid, it described a chart of support tickets.
+
+    The read is what establishes where. This test exists so the shortcut is not
+    re-invented on the same reasoning.
+    """
+    await put_item(
+        db,
+        Item(
+            id="",
+            scope=SCOPE,
+            title="Periodic table",
+            body="<!-- page 1 -->\n# Periodic table\n\nA colour-coded chart.",
+            source=SourceRef(source="upload", locator="table.jpg"),
+        ),
+    )
+    await db.commit()
+
+    offered: list[list[str]] = []
+    monkeypatch.setattr("packages.core.pages.available", lambda: True)
+
+    async def one_page(workspace_id, item_id_, locator=""):
+        return 1
+
+    monkeypatch.setattr("packages.core.pages.count", one_page)
+
+    def fake_chat(messages, tools, **kwargs):
+        offered.append([t["function"]["name"] for t in tools])
+        return {"content": "nothing yet", "tool_calls": []}
+
+    monkeypatch.setattr("packages.core.llm.chat_with_tools", fake_chat)
+    monkeypatch.setattr(navigator, "MAX_ROUNDS", 1)
+    await navigator.navigate(db, SCOPE, "which elements are liquid?")
+
+    assert offered, "the model was never called"
+    assert "look_at_page" not in offered[0], "not before a read, pictures included"
+
+
+async def test_a_pdf_still_has_to_be_read_before_it_is_looked_at(db, monkeypatch):
+    """The exception is for pictures only. A PDF has text of its own, and
+    looking before reading would spend the most expensive call in the system to
+    skip the cheapest one."""
+    item_id = await _seed(db, _TABLE_PAGE)
+    offered: list[list[str]] = []
+    monkeypatch.setattr("packages.core.pages.available", lambda: True)
+
+    async def one_page(workspace_id, item_id_, locator=""):
+        return 1
+
+    monkeypatch.setattr("packages.core.pages.count", one_page)
+    rounds = iter(
+        [
+            {"content": "", "tool_calls": [_call("read_section", doc=item_id, section="n002")]},
+            {"content": "Revenue was 52.", "tool_calls": []},
+        ]
+    )
+
+    def fake_chat(messages, tools, **kwargs):
+        offered.append([t["function"]["name"] for t in tools])
+        return next(rounds)
+
+    monkeypatch.setattr("packages.core.llm.chat_with_tools", fake_chat)
+    await navigator.navigate(db, SCOPE, "what was revenue in 2025?")
+
+    assert "look_at_page" not in offered[0], "a PDF is read first, as before"
+
+
+async def test_the_same_page_read_for_the_same_thing_is_not_paid_for_twice(monkeypatch):
+    """The most expensive call in the system, for a string we already have."""
+    from packages.core import pages
+
+    navigator._READ_CACHE.clear()
+    calls: list[str] = []
+
+    monkeypatch.setattr("packages.core.pages.available", lambda: True)
+
+    async def fake_image(workspace_id, item_id, page):
+        return b"pretend png"
+
+    monkeypatch.setattr("packages.core.pages.image", fake_image)
+    monkeypatch.setattr("packages.core.pages.vision_model", lambda: "vision-test")
+    monkeypatch.setattr(
+        "packages.core.llm.look",
+        lambda png, prompt, model, **k: calls.append(prompt) or "Mercury and Bromine.",
+    )
+
+    first = await navigator._read_page("w", "doc", 1, "which elements are liquid")
+    second = await navigator._read_page("w", "doc", 1, "Which Elements  Are Liquid")
+    assert first == second == "Mercury and Bromine."
+    assert len(calls) == 1, "the second read must come from the cache"
+
+    # A different question about the same page is a different reading: the page
+    # is read WITH the question in hand, so serving one for the other would
+    # trade the expensive call for a wrong answer.
+    await navigator._read_page("w", "doc", 1, "how many sides has the shape")
+    assert len(calls) == 2
+
+    assert pages.available()  # the guard above is what made any of this run
+
+
+async def test_a_refusal_is_never_cached(monkeypatch):
+    """NOT_ON_THIS_PAGE is the model failing, not a fact about the page —
+    measured at 0 refusals in 5 on a page that had refused once. Cached, that
+    one failure would be pinned to the page for the life of the process and the
+    question could never recover."""
+    navigator._READ_CACHE.clear()
+    replies = iter([navigator._NOT_ON_PAGE, "Mercury and Bromine are the liquids."])
+
+    monkeypatch.setattr("packages.core.pages.available", lambda: True)
+    monkeypatch.setattr("packages.core.pages.vision_model", lambda: "vision-test")
+
+    async def fake_image(workspace_id, item_id, page):
+        return b"pretend png"
+
+    monkeypatch.setattr("packages.core.pages.image", fake_image)
+    monkeypatch.setattr("packages.core.llm.look", lambda *a, **k: next(replies))
+
+    first = await navigator._read_page("w", "doc", 1, "which elements are liquid")
+    assert first.startswith(navigator._NOT_ON_PAGE)
+
+    # Asked again, it must reach the model rather than be handed the refusal.
+    second = await navigator._read_page("w", "doc", 1, "which elements are liquid")
+    assert second == "Mercury and Bromine are the liquids."

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -20,6 +21,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from apps.api.auth_routes import router as auth_router
 from apps.common.consolidation import enabled as consolidation_enabled
 from apps.common.consolidation import interval_seconds as consolidation_interval
+from apps.common.summaries import coverage as summary_coverage_for
+from apps.common.summaries import missing_cards
 from packages.core import audit, blobs, graph, pages, tree
 from packages.core.answer import answer
 from packages.core.chunks import by_ids as chunks_by_ids
@@ -284,12 +287,50 @@ async def retrieve(
     }
 
 
+# The longest a single question may take before the caller is told it failed.
+#
+# Neither answer path had a bound, and one query proved what that costs: asked
+# which elements are liquid, a streamed vectorless answer stayed open for over
+# twelve minutes with the connection alive, no error, and a spinner that never
+# stopped. The work is genuinely slow — a vision-escalated answer measured 36s
+# honestly — so the bound has to sit well above that, but it has to exist.
+#
+# Nothing else can supply it. The provider timeout only bounds ONE call and the
+# navigator makes several; and every call runs inside asyncio.to_thread, so
+# cancelling the task cannot interrupt a thread parked in a socket read. This is
+# the only place that can promise the caller an ending.
+ANSWER_DEADLINE_SECONDS = float(os.getenv("ANSWER_DEADLINE_SECONDS", "300"))
+
+
+def _too_slow() -> str:
+    return (
+        f"The answer took longer than {int(ANSWER_DEADLINE_SECONDS)}s and was given "
+        "up on. Anything shown above was found before that. Try hybrid mode, which "
+        "does not read pages as images."
+    )
+
+
+def _sse(event: dict[str, Any]) -> str:
+    # ensure_ascii=False so accented text survives the wire as itself. Escaping
+    # it is not wrong, but it makes a stored answer about Kutuzov or Helene
+    # unreadable in a log and unequal to the same string read back from PG.
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+
 @app.get("/api/answer")
 async def answer_question(
     q: str = Query(min_length=1),
     limit: int = Query(8, ge=1, le=20),
     mode: str = Query("agentic", pattern="^(hybrid|vectorless|agentic)$"),
     sources: list[str] | None = Query(None),
+    doc: list[str] | None = Query(
+        None,
+        description=(
+            "Restrict the answer to these document ids. Repeatable: "
+            "?doc=a&doc=b. Omitted, the store decides which documents the "
+            "question is about."
+        ),
+    ),
     scope: Scope = Depends(workspace_scope),
     principal: dict[str, Any] = Depends(resolve_caller),
     session: AsyncSession = Depends(db),
@@ -324,7 +365,19 @@ async def answer_question(
     entirely on it.
     """
     cfg = RetrievalConfig(limit=limit, sources=tuple(sources or ()))
-    result, trace = await answer(session, scope, q, cfg, mode=mode)
+    try:
+        result, trace = await asyncio.wait_for(
+            answer(session, scope, q, cfg, mode=mode, item_ids=tuple(doc or ())),
+            timeout=ANSWER_DEADLINE_SECONDS,
+        )
+    except TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                f"The answer took longer than {int(ANSWER_DEADLINE_SECONDS)}s and was "
+                "given up on. Try hybrid mode, which does not read pages as images."
+            ),
+        ) from None
 
     # Recorded once, under the retrieval that produced it: an answer whose
     # retrieval cannot be inspected is not one anybody can argue with.
@@ -352,6 +405,14 @@ async def answer_stream(
     limit: int = Query(8, ge=1, le=20),
     mode: str = Query("agentic", pattern="^(hybrid|vectorless|agentic)$"),
     sources: list[str] | None = Query(None),
+    doc: list[str] | None = Query(
+        None,
+        description=(
+            "Restrict the answer to these document ids. Repeatable: "
+            "?doc=a&doc=b. Omitted, the store decides which documents the "
+            "question is about."
+        ),
+    ),
     scope: Scope = Depends(workspace_scope),
     principal: dict[str, Any] = Depends(resolve_caller),
     session: AsyncSession = Depends(db),
@@ -378,7 +439,10 @@ async def answer_stream(
             # coroutine only drains it. They share the session, but only this
             # one touches the database, so there is a single writer throughout.
             try:
-                result, trace = await answer(session, scope, q, cfg, mode=mode, emit=emit)
+                result, trace = await answer(
+                    session, scope, q, cfg, mode=mode, emit=emit,
+                    item_ids=tuple(doc or ()),
+                )
                 await record(
                     session,
                     scope,
@@ -406,14 +470,37 @@ async def answer_stream(
                 await queue.put(None)
 
         task = asyncio.create_task(run())
+        deadline = time.monotonic() + ANSWER_DEADLINE_SECONDS
         try:
             while True:
-                event = await queue.get()
+                # Waited on with a deadline rather than indefinitely. Without
+                # one, an answer that never finishes is a stream that never
+                # closes: the steps already sent stay on screen, the spinner
+                # keeps turning, and nothing ever tells the reader it is over.
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    yield _sse({"type": "error", "detail": _too_slow()})
+                    break
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=remaining)
+                except TimeoutError:
+                    yield _sse({"type": "error", "detail": _too_slow()})
+                    break
                 if event is None:
                     break
-                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                yield _sse(event)
         finally:
-            await task
+            # A reader who closes the tab should not leave the agent running.
+            # Cancelling cannot reach a provider call already inside a thread —
+            # only that call's own timeout ends it — but it does stop the loop
+            # from starting another round on someone who has gone.
+            #
+            # Only the unfinished task is cancelled. Awaiting unconditionally is
+            # what the deadline was added to escape: on the timeout path the
+            # task is by definition still running, so `await task` re-blocks for
+            # exactly as long as the deadline just refused to wait.
+            if not task.done():
+                task.cancel()
 
     return StreamingResponse(
         events(),
@@ -1201,39 +1288,83 @@ async def collection_mapping(
 @app.post("/api/collections/{collection_id}/summarize")
 async def summarize_now(
     collection_id: str,
+    rebuild: bool = Query(
+        False,
+        description=(
+            "Re-summarise documents that already have a card. Off by default: "
+            "summarising is one model call per section plus one for the card, "
+            "so a rebuild of a large collection is expensive and is almost "
+            "never what you want."
+        ),
+    ),
     principal: dict[str, Any] = Depends(resolve_caller),
     session: AsyncSession = Depends(db),
 ) -> dict[str, Any]:
-    """Queue index-summary generation for every document in this collection.
+    """Queue index-summary generation for this collection, now.
+
+    By default this fills GAPS — documents with no card — and leaves the rest
+    alone. It used to pass force=True for every document every time, re-buying
+    summaries that were already correct: on a hundred-document collection that
+    is roughly 1,300 model calls to end up where it started. Pass
+    ``rebuild=true`` when you actually want them regenerated (a prompt changed,
+    a model changed).
 
     The work runs in the worker, never here: summarising is many model calls per
     document, and doing it inline would block the API for the whole collection.
     Each document is handed to the same background ``summarize_item`` job that
     runs after an upload, so a slow or failing model call can never reach — let
-    alone stall — the request thread. Returns how many documents were queued.
+    alone stall — the request thread.
+
+    A cron does this continuously (see apps/common/summaries.py); this endpoint
+    exists for when you do not want to wait for it.
     """
     require_write(principal)
     enforce_binding(principal, collection_id)
     workspace = str(principal["company_id"])
+    scope = Scope(workspace_id=workspace, collection_id=collection_id)
 
-    item_rows = (
-        await session.execute(
-            text(
-                "SELECT item_id FROM kb_items "
-                "WHERE workspace_id = :w AND collection_id = :c AND status = 'active'"
-            ),
-            {"w": workspace, "c": collection_id},
-        )
-    ).all()
+    if rebuild:
+        item_rows = (
+            await session.execute(
+                text(
+                    "SELECT item_id FROM kb_items "
+                    "WHERE workspace_id = :w AND collection_id = :c AND status = 'active'"
+                ),
+                {"w": workspace, "c": collection_id},
+            )
+        ).all()
+        targets = [r.item_id for r in item_rows]
+    else:
+        targets = await missing_cards(scope)
 
-    for item in item_rows:
+    for item_id in targets:
         # force=True: an explicit "generate now" runs regardless of the
-        # SUMMARIES_ENABLED cron gate, like consolidate_now.
+        # SUMMARIES_ENABLED cron gate, like consolidate_now. Whether a document
+        # NEEDED doing was already decided above.
         await app.state.queue.enqueue_job(
-            "summarize_item", workspace, collection_id, item.item_id, True
+            "summarize_item", workspace, collection_id, item_id, True
         )
 
-    return {"documents": len(item_rows), "queued": len(item_rows)}
+    return {"queued": len(targets), "rebuild": rebuild, **await summary_coverage_for(scope)}
+
+
+@app.get("/api/collections/{collection_id}/summaries/coverage")
+async def summaries_coverage(
+    collection_id: str,
+    principal: dict[str, Any] = Depends(resolve_caller),
+    session: AsyncSession = Depends(db),
+) -> dict[str, Any]:
+    """How much of this collection has a card.
+
+    Worth its own route because it is a retrieval-quality number, not a cosmetic
+    one: a document without a card competes on the weaker of the two routing
+    signals, and on a store larger than the catalogue window that decides
+    whether it is considered at all. Nobody should have to infer that from
+    answers coming back wrong.
+    """
+    enforce_binding(principal, collection_id)
+    scope = Scope(workspace_id=str(principal["company_id"]), collection_id=collection_id)
+    return await summary_coverage_for(scope)
 
 
 @app.get("/api/chunks/{chunk_id}")

@@ -373,8 +373,16 @@ class Collection:
         mode: str = "agentic",
         limit: int = 8,
         sources: list[str] | None = None,
+        documents: list[str | Document] | None = None,
     ) -> Answer:
         """Retrieval, then a written answer built only from what was retrieved.
+
+        `documents` restricts the answer to those documents and nothing else —
+        pass ids or Document objects. Leave it off and the store decides which
+        documents the question is about, which is what you want unless you
+        already know: on a collection larger than the catalogue window it ranks
+        every document against the question rather than falling back to the
+        most recently uploaded.
 
         Check `answer.grounded` before trusting the text: it is False when the
         store had nothing to answer from. `mode` is one of:
@@ -392,6 +400,11 @@ class Collection:
         params: dict[str, Any] = {"q": question, "mode": mode, "limit": limit}
         if sources:
             params["sources"] = sources
+        if documents:
+            # Accepts either, because you usually have the Document already —
+            # from list(), files() or add() — and reaching into it for .id is
+            # busywork the caller should not have to write.
+            params["doc"] = [d.id if isinstance(d, Document) else d for d in documents]
         return Answer.from_json(
             self._mv._request("GET", "/api/answer", params=params, headers=self._headers)
         )

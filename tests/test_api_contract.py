@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from fastapi import Header
 from httpx import ASGITransport, AsyncClient
@@ -148,24 +150,56 @@ async def test_sdk_search_is_identified_and_its_trace_can_be_opened(client):
     assert detail.json()["via"] == "sdk:javascript/0.2.0"
 
 
-async def test_the_answer_route_defaults_to_vectorless(client, monkeypatch):
+async def test_the_answer_route_defaults_to_agentic(client, monkeypatch):
     """The default is part of the contract callers depend on, so it is checked
     at the boundary rather than only in the engine."""
-    seen: dict[str, str] = {}
+    seen: dict[str, Any] = {}
 
-    async def fake_answer(session, scope, question, cfg=None, mode="vectorless"):
+    # **extra rather than a fixed parameter list. A double that mirrors every
+    # argument of the real function has to be edited each time the real one
+    # gains a keyword, and it fails with a TypeError from inside the route —
+    # which reads like a broken endpoint, not a stale test. This one records
+    # what it was given and stays out of the way.
+    async def fake_answer(session, scope, question, cfg=None, mode="agentic", **extra):
         from packages.core.answer import Answer
         from packages.core.search import Trace, new_trace_id
 
         seen["mode"] = mode
+        seen.update(extra)
         trace = Trace(trace_id=new_trace_id(), query=question, config={}, filters={})
         return Answer(question=question, text="", mode=mode, grounded=False), trace
 
     monkeypatch.setattr("apps.api.main.answer", fake_answer)
     response = await client.get("/api/answer", params={"q": "anything"})
     assert response.status_code == 200
-    assert seen["mode"] == "vectorless"
-    assert response.json()["mode"] == "vectorless"
+    assert seen["mode"] == "agentic"
+    assert response.json()["mode"] == "agentic"
+    # No document filter unless one was asked for: an empty tuple means "the
+    # store decides", and anything else here would silently scope every
+    # unfiltered question.
+    assert seen.get("item_ids") == ()
+
+
+async def test_the_answer_route_passes_a_document_filter_through(client, monkeypatch):
+    """?doc= is the explicit filter. It has to reach the engine as given —
+    a filter that is accepted at the boundary and dropped on the way in is
+    worse than one that was never offered."""
+    seen: dict[str, Any] = {}
+
+    async def fake_answer(session, scope, question, cfg=None, mode="agentic", **extra):
+        from packages.core.answer import Answer
+        from packages.core.search import Trace, new_trace_id
+
+        seen.update(extra)
+        trace = Trace(trace_id=new_trace_id(), query=question, config={}, filters={})
+        return Answer(question=question, text="", mode=mode, grounded=False), trace
+
+    monkeypatch.setattr("apps.api.main.answer", fake_answer)
+    response = await client.get(
+        "/api/answer", params={"q": "anything", "doc": ["item-a", "item-b"]}
+    )
+    assert response.status_code == 200
+    assert seen.get("item_ids") == ("item-a", "item-b")
 
 
 async def test_an_unknown_retrieval_mode_is_refused(client):

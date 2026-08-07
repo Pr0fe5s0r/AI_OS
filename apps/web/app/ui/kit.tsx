@@ -460,7 +460,9 @@ export function VectorField({
 
 export function useToast() {
   const [msg, setMsg] = useState<string | null>(null);
-  const timer = useRef<ReturnType<typeof setTimeout>>();
+  // React 19 requires useRef to be given an initial value — an ref with no
+  // argument is no longer implicitly undefined. Same behaviour, said out loud.
+  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const toast = (m: string) => {
     setMsg(m);
     clearTimeout(timer.current);

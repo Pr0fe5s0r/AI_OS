@@ -53,13 +53,44 @@ def project(points: list[dict[str, Any]]) -> dict[str, Any]:
     matrix = matrix / np.where(norms == 0, 1, norms)
 
     centred = matrix - matrix.mean(axis=0)
-    # SVD rather than an eigendecomposition of the covariance matrix: it is the
-    # numerically stable route, and at these sizes the cost is irrelevant.
-    _, singular, components = np.linalg.svd(centred, full_matrices=False)
 
-    coords = centred @ components[:2].T
-    total = float((singular**2).sum())
-    explained = float((singular[:2] ** 2).sum() / total) if total > 0 else 0.0
+    # Decomposed through the Gram matrix rather than by SVD of the full data.
+    # "At these sizes the cost is irrelevant" was wrong: the economy SVD of a
+    # 200x1536 matrix measured **4.3 to 5.4 seconds** here, because this image's
+    # numpy has no tuned LAPACK behind it. The Gram route is 0.24s for the same
+    # answer.
+    #
+    # It is the same decomposition seen from the other side. For centred = U S Vᵀ,
+    # the Gram matrix G = centred·centredᵀ = U S² Uᵀ — so eigenvectors of G are U
+    # and its eigenvalues are S². The coordinates PCA wants, centred·V[:2]ᵀ,
+    # equal U[:, :2]·S[:2], which is exactly what falls out below.
+    #
+    # This is only the cheaper side while there are fewer points than
+    # dimensions, which MAX_NODES guarantees: at most 400 nodes against 1536
+    # dimensions, so G is 400x400 at its largest.
+    gram = centred @ centred.T
+    eigenvalues, eigenvectors = np.linalg.eigh(gram)
+    # eigh returns ascending; PCA wants the largest first.
+    order = eigenvalues.argsort()[::-1]
+    eigenvalues = eigenvalues[order]
+    eigenvectors = eigenvectors[:, order]
+
+    # Rounding can push a zero eigenvalue just below zero, and the square root
+    # of that is a NaN in every coordinate downstream.
+    spread = np.sqrt(np.clip(eigenvalues[:2], 0, None))
+    coords = eigenvectors[:, :2] * spread
+
+    # An eigenvector's sign is arbitrary, so the same collection could come back
+    # mirrored between runs — which would break the one property this projection
+    # was chosen for. Pinning the largest-magnitude coordinate positive makes the
+    # layout reproducible rather than merely repeatable.
+    for axis in range(coords.shape[1]):
+        column = coords[:, axis]
+        if column[np.abs(column).argmax()] < 0:
+            coords[:, axis] = -column
+
+    total = float(np.clip(eigenvalues, 0, None).sum())
+    explained = float(np.clip(eigenvalues[:2], 0, None).sum() / total) if total > 0 else 0.0
 
     # Normalised to a unit box so the client can scale to whatever space it
     # has without knowing anything about the embedding model.

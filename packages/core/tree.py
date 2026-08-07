@@ -219,13 +219,83 @@ _CAPTION = re.compile(
 )
 
 
+# Structure a plain-text document carries in its own words rather than in
+# Markdown. Two ranks: a part-level word that contains chapters, and a
+# chapter-level word that contains prose.
+#
+# This is not a novel-reading feature. A statute has ARTICLEs, a tender has
+# SECTIONs, a government circular has ANNEXUREs and SCHEDULEs — none of which
+# survive as Markdown when the source is a .txt or a PDF whose text layer lost
+# its formatting.
+_PART_WORDS = r"BOOK|PART|VOLUME"
+_CHAPTER_WORDS = r"CHAPTER|SECTION|ARTICLE|CLAUSE|ANNEX|ANNEXURE|APPENDIX|SCHEDULE"
+# Anchored to a whole line, because the same words appear constantly mid
+# sentence ("under section 5 of the Act") and matching those would shred a
+# document into hundreds of false sections. A heading sits alone on its line,
+# and the trailing text is capped so a sentence that merely BEGINS with the
+# word cannot qualify.
+_PLAIN_HEADING = re.compile(
+    rf"^[ \t]*((?:{_PART_WORDS})|(?:{_CHAPTER_WORDS}))\b[ \t]*([^\n]{{0,60}}?)[ \t]*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+# Below this many hits the pattern is more likely noise than structure, and
+# arbitrary blocks are the more honest answer.
+MIN_PLAIN_HEADINGS = 3
+
+
+def _plain_sections(body: str) -> list[dict[str, Any]]:
+    """Sections from a document whose headings are text, not Markdown.
+
+    Found on a real book: a Project Gutenberg War and Peace has 730 lines
+    beginning CHAPTER and 30 beginning BOOK, and **zero** Markdown headings. The
+    outline fell through to arbitrary blocks, so the agent's table of contents
+    read "Part 1 of 1475", "Part 2 of 1475", … — 1,475 rows that say nothing
+    about what is in them. Catalogue reasoning had nothing to reason over, and
+    the honest result was that it could not find anything.
+
+    Titles carry their parent, so they are addresses rather than labels. A novel
+    has thirty-four chapters called "CHAPTER I" and a bare title cannot pick one
+    out; "BOOK TWO: 1805 › CHAPTER I" can.
+    """
+    matches = list(_PLAIN_HEADING.finditer(body))
+    if len(matches) < MIN_PLAIN_HEADINGS:
+        return []
+
+    part_words = set(_PART_WORDS.split("|"))
+    sections: list[dict[str, Any]] = []
+    parent = ""
+    for index, match in enumerate(matches):
+        word = match.group(1).upper()
+        label = " ".join(match.group(0).split())
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(body)
+        text = body[start:end].strip()
+
+        if word in part_words:
+            # A part heading names what follows; its own body is usually just
+            # the chapter beneath it, so it is recorded as context rather than
+            # as a section with content of its own.
+            parent = label
+            if len(text) < 200:
+                continue
+        sections.append(
+            {
+                "title": f"{parent} › {label}" if parent and word not in part_words else label,
+                "text": text,
+                "start_line": body.count("\n", 0, match.start()) + 1,
+            }
+        )
+    return sections
+
+
 def _fallback_sections(body: str) -> list[dict[str, Any]]:
     """Readable units for a document with no headings.
 
     Pages first: a PDF has them, they are what its own numbering refers to, and
-    "page 4" is a citation someone can check against the original file. Failing
-    that, blocks of whole paragraphs, named by position so a reader at least
-    knows where in the document they are.
+    "page 4" is a citation someone can check against the original file. Then
+    headings the document states in words rather than in Markdown. Only failing
+    both, blocks of whole paragraphs named by position — which tells a reader
+    where they are and nothing about what is there.
     """
     pages = list(_PAGE.finditer(body))
     if pages:
@@ -249,6 +319,11 @@ def _fallback_sections(body: str) -> list[dict[str, Any]]:
     stripped = body.strip()
     if not stripped:
         return []
+
+    spoken = _plain_sections(stripped)
+    if spoken:
+        return spoken
+
     if len(stripped) <= FALLBACK_CHARS:
         return [{"title": "(whole document)", "text": stripped}]
 

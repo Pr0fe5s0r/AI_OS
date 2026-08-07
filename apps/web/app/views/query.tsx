@@ -86,6 +86,7 @@ const EMPTY_LIVE: Live = { activity: [], reasoning: "", draft: "" };
 function describeCall(event: Extract<api.StreamEvent, { type: "tool_call" }>): string {
   if (event.tool === "read_section") return `Reading section ${event.args.section ?? ""}`.trim();
   if (event.tool === "hybrid_search") return `Searching “${event.args.query ?? ""}”`;
+  if (event.tool === "write_answer") return `Writing from ${event.args.passages ?? 0} passages`;
   return `Calling ${event.tool}`;
 }
 

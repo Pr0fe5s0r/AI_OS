@@ -4,11 +4,12 @@ import asyncio
 import re
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core import support
 from packages.core.search import DEFAULT, RetrievalConfig, Trace, search_traced
 from packages.shared.schema import Hit, Passage, Scope
 
@@ -376,8 +377,15 @@ async def answer(
     cfg: RetrievalConfig = DEFAULT,
     mode: str = "agentic",
     emit: EmitFn | None = None,
+    item_ids: tuple[str, ...] = (),
 ) -> tuple[Answer, Trace]:
     """Retrieve, then write an answer from what was retrieved.
+
+    ``item_ids`` restricts every mode to the named documents. It is applied at
+    the retrieval layer, never by filtering results afterwards: a filter that
+    discards hits after ranking gives you the best of everything and then throws
+    most of it away, so a question scoped to one document would end up answered
+    from whatever fraction of it happened to place in the global top ten.
 
     Two public modes, and the writing is identical for both:
 
@@ -421,7 +429,7 @@ async def answer(
         from packages.core.navigator import navigate
 
         walk, trace = await navigate(
-            session, scope, question, hybrid=(mode == "agentic"), emit=emit
+            session, scope, question, hybrid=(mode == "agentic"), emit=emit, only=item_ids
         )
         result = Answer(
             question=question,
@@ -486,8 +494,25 @@ async def answer(
         result.took_ms = int((time.perf_counter() - started) * 1000)
         return result, trace
     else:
+        # Hybrid used to stream nothing at all until the first word of the
+        # answer — measured at 1.3 to 4.3 seconds of a spinner that said
+        # "searching…" and never changed. The work is real and it is
+        # describable, so it is described: a progress line that never moves is
+        # indistinguishable from a hang, and the whole point of offering a
+        # streamed delivery was to stop making people guess.
+        #
+        # Three lines cover that stretch, and all three ride the emit protocol
+        # rather than a second step channel: `start` (the client renders it as
+        # "Searching passages…"), `retrieved` below (documents and passages
+        # matched), and the writing line further down.
         if emit is not None:
             await emit({"type": "start", "mode": mode})
+        if item_ids:
+            # Pushed into the config so it reaches BOTH arms of the fusion —
+            # the vector query and the keyword query filter alike. Narrowing
+            # only one of them would let the other quietly reintroduce a
+            # document the caller excluded.
+            cfg = replace(cfg, item_ids=tuple(item_ids))
         hits, trace = await search_traced(session, scope, question, cfg)
         degraded = trace.degraded
 
@@ -523,6 +548,20 @@ async def answer(
         )
         result.took_ms = int((time.perf_counter() - started) * 1000)
         return result, trace
+
+    # The last silent stretch: retrieval has reported, and the first token is
+    # still a model round-trip away. Hybrid has no route to narrate — it ranks
+    # and hands over — so the only thing left to announce is the writing.
+    # Vectorless has already been narrating tool by tool and does not need it.
+    if mode != "vectorless" and emit is not None:
+        await emit(
+            {
+                "type": "tool_call",
+                "tool": "write_answer",
+                "args": {"passages": len(passages)},
+                "round": 1,
+            }
+        )
 
     try:
         raw = await _write(question, passages, emit)
@@ -573,7 +612,33 @@ async def answer(
         found = _attribute(result.text, passages)
         if found is not None:
             result.citations = [found]
-    result.grounded = bool(result.citations)
+
+    # A marker is not evidence. `grounded` used to mean "the model wrote [3]
+    # and [3] resolved", which is a check on formatting — and it passed the
+    # worst answer this store has produced: "Mercury (Hg) is liquid at room
+    # temperature [3]", cited to a periodic table that names mercury and never
+    # says "liquid". True in the world, absent from the source, and stamped
+    # grounded.
+    #
+    # So the answer is now read back against the passages it cites. Most cost
+    # nothing — the lexical gate in core.support settles them — and only an
+    # answer that introduces vocabulary its own source never uses is worth a
+    # second call.
+    if result.citations:
+        verdict = await support.check(
+            result.text, "\n\n".join(c.text for c in result.citations)
+        )
+        if not verdict.supported:
+            result.grounded = False
+            result.degraded = _join(
+                result.degraded,
+                "not supported by the cited passages"
+                + (f": {verdict.reason}" if verdict.reason else ""),
+            )
+        else:
+            result.grounded = True
+    else:
+        result.grounded = False
     await _attach_pages(session, scope, result.citations)
     result.took_ms = int((time.perf_counter() - started) * 1000)
     return result, trace

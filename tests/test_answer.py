@@ -250,13 +250,22 @@ def test_an_answer_defaults_to_grounded_with_no_degradation():
     assert blank.citations == [] and blank.degraded is None
 
 
-async def test_vectorless_is_the_default_retrieval(db, monkeypatch):
+async def test_agentic_is_the_default_retrieval(db, monkeypatch):
     """The default is a decision, so it is pinned. Changing it should require
-    changing this line, not discovering the change in production."""
-    seen: list[str] = []
+    changing this line, not discovering the change in production.
+
+    It moved from vectorless to agentic: the same catalogue reasoning, plus
+    hybrid_search and a graph hop, so it reaches a collection larger than the
+    catalogue window instead of answering from the part that fits. Both walk
+    the navigator — the difference is which tools the agent is handed.
+    """
+    seen: list[bool] = []
 
     async def spy(session, scope, question, **watching):
-        seen.append("vectorless")
+        # ``hybrid`` is what makes the walk agentic rather than vectorless, so
+        # that flag is the thing worth asserting on — recording a hardcoded
+        # string here would have passed no matter what the default became.
+        seen.append(bool(watching.get("hybrid")))
         from packages.core.navigator import Outcome
         from packages.core.search import Trace, new_trace_id
 
@@ -264,8 +273,8 @@ async def test_vectorless_is_the_default_retrieval(db, monkeypatch):
 
     monkeypatch.setattr("packages.core.navigator.navigate", spy)
     result, _ = await answer(db, SCOPE, "anything")
-    assert seen == ["vectorless"]
-    assert result.mode == "vectorless"
+    assert seen == [True], "the default walk must hand the agent its search tools"
+    assert result.mode == "agentic"
 
 
 async def test_the_route_the_agent_took_travels_with_the_answer(db, monkeypatch):

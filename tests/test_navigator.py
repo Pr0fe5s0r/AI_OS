@@ -342,7 +342,7 @@ async def test_an_answer_written_without_reading_is_sent_back(db, monkeypatch):
     )
     outcome, _ = await navigate(db, SCOPE, "how long do I have to submit receipts?")
 
-    assert [s.action for s in outcome.steps] == ["sent back", "read", "answered"]
+    assert [s.action for s in outcome.steps] == ["opened", "sent back", "read", "answered"]
     assert outcome.found is True
 
 
@@ -508,7 +508,7 @@ async def test_an_ordinary_question_answered_confidently_is_not_sent_back(db, mo
     )
     outcome, _ = await navigate(db, SCOPE, "how long do I have to submit receipts?")
 
-    assert [s.action for s in outcome.steps] == ["read", "answered"]
+    assert [s.action for s in outcome.steps] == ["opened", "read", "answered"]
     assert outcome.answer == "Within thirty days [1]."
 
 
@@ -552,6 +552,60 @@ def test_a_figure_that_is_in_no_document_is_not_invented():
     assert _where_named_things_live("what does Figure 42 show?", documents, trees) == ""
 
 
+def test_a_refusal_is_retried_only_where_it_cannot_mean_the_wrong_page(monkeypatch):
+    """A one-page picture is the narrow case where NOT_ON_THIS_PAGE cannot mean
+    "you picked the wrong page" — there is no other page to have picked. It can
+    only mean the reader declined, and asked which elements are liquid, the
+    periodic table declined about one run in three while the same page read
+    without a steer answered every time.
+
+    On a forty-page PDF the same refusal IS information — this page, not that
+    one — so re-asking there would spend the look twice to learn nothing.
+    """
+    from packages.core import navigator
+    from packages.core.navigator import _only_page_of_a_picture
+
+    monkeypatch.setattr(navigator, "_is_a_picture", lambda doc: doc.get("pic", False))
+
+    picture = {"item_id": "p", "title": "Download (2)", "pic": True}
+    report = {"item_id": "r", "title": "Report", "pic": False}
+
+    assert _only_page_of_a_picture(picture, 1) is True
+    assert _only_page_of_a_picture(picture, 14) is False, "a real page choice is real information"
+    assert _only_page_of_a_picture(report, 1) is False, "a text document has text to fall back on"
+    assert _only_page_of_a_picture(None, 1) is False
+
+
+def test_the_retry_drops_the_steer_rather_than_repeating_it():
+    """Re-asking the same narrowed question gets the same narrowed refusal. The
+    retry is only worth a call because it stops narrowing — the same lesson the
+    focused-look experiment taught, applied to the one path that can use it."""
+    from packages.core.navigator import _UNSTEERED
+
+    assert "page" in _UNSTEERED.lower()
+    for subject in ("table", "figure", "chart", "element", "question"):
+        assert subject not in _UNSTEERED.lower(), (
+            f"'{subject}' in the retry ask would narrow it again"
+        )
+
+
+def test_a_document_that_disclaims_the_question_is_not_left_answerable():
+    """The refusal used to end "answer from the text", which on a picture is a
+    trap: its only text is a description of the very page that just came back
+    empty. That sentence is how a support-tickets chart became the source of an
+    answer about chemical elements."""
+    import inspect
+
+    from packages.core import navigator
+
+    body = inspect.getsource(navigator.navigate)
+    assert "Do not answer from it" in body
+    assert "answer from the text." not in body, (
+        "a page that disclaimed the question must not send the agent to that "
+        "same document's text layer"
+    )
+
+
 async def test_steps_are_handed_over_as_they_happen(db, monkeypatch):
     """Most of the wait is spent READING, not writing — opening a section,
     looking at a page. So the steps arriving live are worth more than the words
@@ -571,7 +625,12 @@ async def test_steps_are_handed_over_as_they_happen(db, monkeypatch):
     )
 
     assert seen == [s.action for s in outcome.steps], "every step must be handed over"
-    assert seen and seen[0] == "read", "and in the order they happened"
+    # The first one goes out BEFORE the first model call, not after it. Choosing
+    # what to read is a round trip with every document's contents in the prompt,
+    # and on a slow provider that was 13.5 seconds of a spinner with nothing
+    # behind it — a wait no one could tell apart from a hang.
+    assert seen and seen[0] == "opened", "and in the order they happened"
+    assert seen[1] == "read"
 
 
 async def test_prose_is_streamed_when_someone_is_watching(db, monkeypatch):

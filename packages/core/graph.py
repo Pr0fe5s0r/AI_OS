@@ -345,7 +345,8 @@ async def replace_chunks(scope: Scope, item_id: str, chunks: list[dict]) -> int:
             c.title         = row.title,
             c.status        = $status,
             c.node_type     = 'fact',
-            c.stage         = 1
+            c.stage         = 1,
+            c.text_hash     = row.text_hash
         WITH c, row
         CALL db.create.setNodeVectorProperty(c, 'embedding', row.embedding)
         WITH c
@@ -360,6 +361,31 @@ async def replace_chunks(scope: Scope, item_id: str, chunks: list[dict]) -> int:
         status=str(Lifecycle.ACTIVE),
     )
     return rows[0]["n"] if rows else 0
+
+
+async def vectors_by_text_hash(scope: Scope, item_id: str) -> dict[str, list[float]]:
+    """The vectors this document already has, keyed by the text that produced them.
+
+    Editing one clause of a specification re-versions the whole document, and
+    the whole document was then re-embedded: 182 passages sent to the provider
+    to learn 181 things it had already told us. This is what makes the second
+    ingest of a document cost only what actually changed.
+
+    Keyed by content, not by chunk_id, because chunk_id carries the version and
+    the ordinal — both of which move when a paragraph is inserted near the top,
+    even though every passage after it is character-for-character the same.
+    """
+    clause, params = _scope_clause("c", scope)
+    rows = await _run(
+        f"""
+        MATCH (c:Chunk {{item_id: $item_id}})
+        WHERE {clause} AND c.text_hash IS NOT NULL AND c.embedding IS NOT NULL
+        RETURN c.text_hash AS text_hash, c.embedding AS embedding
+        """,
+        item_id=item_id,
+        **params,
+    )
+    return {row["text_hash"]: list(row["embedding"]) for row in rows}
 
 
 async def collection_chunk_vectors(
@@ -691,6 +717,103 @@ async def summary_coverage(scope: Scope) -> list[dict]:
                count(t) AS covers
         ORDER BY c.node_type, covers DESC
         """,
+        **params,
+    )
+
+
+async def has_near_edges(scope: Scope) -> bool:
+    """Does this collection actually have a similarity graph to walk?
+
+    :NEAR edges are written by consolidation, and consolidation is OFF by
+    default. So on an ordinary deployment there are none — and the agent was
+    still being handed a `neighbors` tool built to traverse them. Neo4j says so
+    on every call ("the missing relationship type is: NEAR") and returns an
+    empty result, which costs a full model round to learn nothing.
+
+    One indexed lookup with LIMIT 1, so asking is far cheaper than the round it
+    saves.
+    """
+    clause, params = _scope_clause("c", scope)
+    rows = await _run(
+        f"MATCH (c:Chunk)-[:NEAR]-(:Chunk) WHERE {clause} RETURN 1 AS ok LIMIT 1",
+        **params,
+    )
+    return bool(rows)
+
+
+async def documents_with_cards(scope: Scope) -> list[str]:
+    """Which documents already have a card.
+
+    The whole point of a backfill is not paying twice. Summarising a document
+    is one model call per section plus one for the card — on a twelve-section
+    circular that is thirteen calls, and the existing "summarize now" endpoint
+    re-ran every one of them for every document each time it was pressed. On a
+    hundred-document store that is roughly 1,300 calls to regenerate summaries
+    that were already correct.
+
+    So the pass asks this first and enqueues only what is missing.
+    """
+    clause, params = _scope_clause("c", scope)
+    rows = await _run(
+        f"""
+        MATCH (c:Chunk) WHERE {clause}
+          AND coalesce(c.node_type, 'fact') = 'card'
+          AND c.item_id IS NOT NULL
+        RETURN DISTINCT c.item_id AS item_id
+        """,
+        **params,
+    )
+    return [r["item_id"] for r in rows if r.get("item_id")]
+
+
+async def card_matches(scope: Scope, embedding: list[float], k: int = 20) -> list[dict]:
+    """Rank DOCUMENTS by how well their card matches a question.
+
+    The mirror image of ``vector_search``, which deliberately excludes cards
+    because a model-written summary must never be returned as a citation. That
+    exclusion is about ANSWERING. Choosing which document to open is a different
+    job, and it is the one job a card is actually good at: two or three
+    sentences saying what the whole file is about, which is what you want to
+    compare a question against when you have hundreds of documents and no idea
+    which one is relevant.
+
+    Scored EXACTLY, not through the ANN index, and that is the whole trick.
+
+    The obvious implementation — query the vector index and keep the rows that
+    happen to be cards — was written first and measured at returning **nothing**
+    on a real store. Cards are one node per document: 14 of 10,265 chunks, or
+    0.14%. Over-fetching the top 800 neighbours and filtering to that 0.14%
+    found zero cards, every time, because a question resembles the passages that
+    answer it far more closely than a summary of the file they sit in. Routing
+    silently fell back to passages alone and nothing looked broken.
+
+    Filter-after-ANN cannot work when the target class is that rare. So this
+    reads the cards — there are exactly as many as there are documents — and
+    scores every one. Exact, no recall cliff, and cheap for the same reason it
+    is necessary: the population is small by construction. A ten-thousand
+    document store is ten thousand comparisons, which Neo4j does in milliseconds.
+
+    Returns at most one row per document, each with the similarity that put it
+    there, so the caller can report WHY a document was opened rather than
+    presenting a routing decision as an oracle.
+    """
+    clause, params = _scope_clause("c", scope)
+    return await _run(
+        f"""
+        MATCH (c:Chunk) WHERE {clause}
+          AND coalesce(c.node_type, 'fact') = 'card'
+          AND c.item_id IS NOT NULL
+          AND c.embedding IS NOT NULL
+        WITH c, vector.similarity.cosine(c.embedding, $embedding) AS similarity
+        WHERE similarity IS NOT NULL
+        RETURN c.item_id AS item_id,
+               c.heading AS heading,
+               similarity AS similarity
+        ORDER BY similarity DESC
+        LIMIT $k
+        """,
+        k=k,
+        embedding=embedding,
         **params,
     )
 

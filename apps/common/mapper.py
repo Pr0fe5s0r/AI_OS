@@ -194,7 +194,7 @@ async def _map_collection(scope: Scope) -> int:
     )
     heading = seed_heading or "Mapped cluster"
 
-    from packages.core.summarize import _summarise, _SECTION_PROMPT
+    from packages.core.summarize import _SECTION_PROMPT, _summarise
 
     body = await _summarise(_SECTION_PROMPT, combined, fallback=combined[:400])
 

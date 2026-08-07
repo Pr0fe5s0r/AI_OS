@@ -96,7 +96,87 @@ def tidy(text: str) -> str:
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r" *\n *", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+    return mark_spoken_headings(text.strip())
+
+
+# Structure a document states in words instead of in Markdown. A .txt book, a
+# statute, a tender, a circular whose PDF text layer lost its formatting — all
+# carry their shape in lines like "CHAPTER I", "SECTION 4", "ANNEXURE B", and
+# none of it survives as a heading.
+# "TITLE" is deliberately absent: a line starting "Title:" is metadata far
+# more often than it is structure, and Project Gutenberg puts one at the top
+# of every book.
+_PART_WORDS = r"BOOK|PART|VOLUME"
+_CHAPTER_WORDS = r"CHAPTER|SECTION|ARTICLE|CLAUSE|ANNEX|ANNEXURE|APPENDIX|SCHEDULE"
+# Anchored to a whole line. These words appear constantly mid-sentence ("under
+# section 5 of the Act") and matching those would shred a document into
+# hundreds of false headings; a real heading sits alone on its line. The
+# trailing run is capped so a sentence that merely BEGINS with the word cannot
+# qualify, and a line already marked up is left alone.
+_SPOKEN_HEADING = re.compile(
+    rf"^((?:{_PART_WORDS})|(?:{_CHAPTER_WORDS}))\b([^\n]{{0,60}})$",
+    re.MULTILINE | re.IGNORECASE,
+)
+# Below this many hits the pattern is likelier noise than structure.
+MIN_SPOKEN_HEADINGS = 3
+
+
+def _names_a_part(rest: str) -> bool:
+    """Does what follows the structural word actually identify a part?"""
+    return bool(re.search(r"[0-9A-Za-z]", rest))
+
+
+def mark_spoken_headings(text: str) -> str:
+    """Promote text-stated headings to Markdown ones, once, at the door.
+
+    Found on a real book: a Project Gutenberg *War and Peace* has 730 lines
+    beginning CHAPTER and 30 beginning BOOK, and **zero** Markdown headings.
+    Everything downstream reads Markdown, so the whole 3.2 MB document was one
+    unstructured blob — the chunker gave all 4,296 passages an empty heading,
+    section summaries collapsed from ~700 into 1, and the agent's table of
+    contents read "Part 1 of 1475". Catalogue reasoning had nothing to reason
+    over and answered that the store did not cover the question.
+
+    Done HERE rather than in the tree, because the tree is not the only reader:
+    the chunker parses headings independently, and a fix that only taught the
+    outline would leave every stored passage still headingless — which is
+    exactly what happened on the first attempt.
+
+    Conservative by construction. It refuses unless the pattern occurs at least
+    MIN_SPOKEN_HEADINGS times, and never touches a document that already has
+    Markdown headings — one that does has real structure, and guessing more on
+    top of it can only damage what its author wrote.
+    """
+    if re.search(r"(?m)^#{1,6} ", text):
+        return text
+
+    # A heading names WHICH part: "BOOK ONE", "SECTION 4", "ANNEXURE B". A bare
+    # word is a sentence that happened to end a line — a real book has lines
+    # reading just "book." and promoting those produced headings like
+    # "book. > CHAPTER X" in the stored index.
+    matches = [m for m in _SPOKEN_HEADING.finditer(text) if _names_a_part(m.group(2))]
+    if len(matches) < MIN_SPOKEN_HEADINGS:
+        return text
+
+    parts = set(_PART_WORDS.split("|"))
+
+    def promote(match: re.Match[str]) -> str:
+        # Part-level words nest above chapter-level ones, so a book's chapters
+        # end up INSIDE the book — which is what makes "BOOK TWO > CHAPTER I"
+        # an address rather than one of thirty-four identical labels.
+        level = "#" if match.group(1).upper() in parts else "##"
+        return f"{level} {match.group(0).strip()}"
+
+    # Rebuilt from the accepted matches rather than re-run as a global sub,
+    # so the ones filtered out above stay filtered out.
+    out: list[str] = []
+    last = 0
+    for match in matches:
+        out.append(text[last : match.start()])
+        out.append(promote(match))
+        last = match.end()
+    out.append(text[last:])
+    return "".join(out)
 
 
 def despace(text: str) -> str:
@@ -422,6 +502,7 @@ __all__ = [
     "TextParser",
     "UnsupportedFormat",
     "can_parse",
+    "mark_spoken_headings",
     "despace",
     "normalise",
     "normalise_text",

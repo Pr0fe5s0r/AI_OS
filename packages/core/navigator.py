@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -11,13 +13,28 @@ from typing import Any
 from sqlalchemy import text as sql
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core import tree
+from packages.core import graph, tree
+from packages.core import routing as route
 from packages.core.search import RetrievalConfig, Trace, new_trace_id, search_traced
 from packages.shared.schema import Hit, Lifecycle, Passage, Scope, SourceRef
 
 # A progress sink: the navigator calls it with one event dict per step when a
 # caller wants to watch the loop work. Async so the sink can be an SSE queue.
 EmitFn = Callable[[dict[str, Any]], Awaitable[None]]
+
+
+def _int_env(name: str, default: int) -> int:
+    """An operator override that a typo cannot turn into a broken store.
+
+    Zero is allowed through rather than clamped, because for MAX_DOCUMENTS zero
+    is a meaningful value — "no count limit" — and not a mistake. Negatives are
+    a mistake and become zero, which is the safe reading of "I did not want a
+    cap here".
+    """
+    try:
+        return max(0, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
 
 # ---------------------------------------------------------------------------
 # THE NAVIGATOR — an agent that reads its way to an answer.
@@ -51,10 +68,55 @@ EmitFn = Callable[[dict[str, Any]], Awaitable[None]]
 # reference to a section nobody opened, and that marker is dropped downstream.
 # ---------------------------------------------------------------------------
 
-# How many documents' outlines go in front of the model at once. Past this the
-# catalogue itself stops fitting, and choosing from a list nobody can read is
-# guesswork wearing a suit.
-MAX_DOCUMENTS = 40
+# How many documents' outlines go in front of the model at once.
+#
+# This was 40, and 40 was the wrong KIND of limit. It was a stand-in for "the
+# catalogue stops fitting in the prompt" — but the catalogue budget measures
+# that directly now, in characters, and shortens to fit. Two guards for one
+# problem, and the count-based one bit first and silently: a store of a hundred
+# documents showed the agent the forty most recently uploaded and the other
+# sixty did not exist as far as the answer was concerned.
+#
+# Measured on 12-section policy documents, what the model actually receives
+# after the budget shortens it:
+#
+#      10 docs    30,710 ch full  ->  1,470 ch sent
+#      40 docs   122,900 ch full  ->  5,940 ch sent
+#     100 docs   307,280 ch full  -> 14,880 ch sent      <- still inside 24,000
+#     200 docs   614,560 ch full  -> ~24,000 ch sent     <- the budget binds here
+#
+# So the prompt was never the reason for 40. The real per-document cost outside
+# the prompt is parsing its Markdown into a tree on every question, which is
+# CPU and grows linearly — that is what this number is for now, and it is set
+# where the budget takes over rather than far below it.
+#
+# Routing still ranks documents (core.routing), so on a store past this the
+# ones shown are the ones the question is about, not the newest.
+#
+# DEFAULT IS 0, MEANING NO COUNT LIMIT. The store itself has never had a size
+# limit and this was never one — it bounded how many outlines go into a single
+# prompt, which is a different thing that happened to be written as a document
+# count. Written as a count it kept being mistaken for a ceiling on the store,
+# and every value anyone picked (40, then 250) was arbitrary.
+#
+# What genuinely cannot be unbounded is the BYTES pulled out of Postgres to
+# build those outlines, because every document's full body is loaded and parsed
+# on every question. That is bounded below, by MAX_CATALOGUE_BYTES, which is the
+# real constraint stated in the units the constraint is actually in: a thousand
+# small circulars all fit; one War and Peace at 3.3 MB costs what 3.3 MB costs.
+MAX_DOCUMENTS = _int_env("MAX_DOCUMENTS", 0)
+
+# The real bound: how much document text may be loaded to build one catalogue.
+#
+# 64 MB. Chosen against what a body actually costs — War and Peace is 3.3 MB of
+# Markdown, a policy circular is 30–130 KB — so this is roughly twenty novels or
+# several thousand ordinary documents in one question's working set, and it
+# fails by showing fewer documents rather than by exhausting the container.
+#
+# Documents are loaded in ranked order, so when the budget runs out what is
+# dropped is what routing scored lowest, not whatever the database returned
+# last.
+MAX_CATALOGUE_BYTES = _int_env("MAX_CATALOGUE_BYTES", 64 * 1024 * 1024)
 # Each round is one model call. Enough to open a document, read two or three
 # sections and answer; short enough that a model looping on itself stops.
 MAX_ROUNDS = 6
@@ -68,6 +130,10 @@ MAX_LOOKS = 2
 # to cover a figure that appears in two or three places, few enough that the
 # agent still reads rather than dumps.
 MAX_HYBRID_HITS = 4
+# How much of the prompt the table of contents may take. Chosen from what real
+# collections measure: two documents of 16 sections come to 4,048 characters
+# and are unaffected; ten ordinary documents come to 111,858 and are not.
+CATALOGUE_BUDGET = 24_000
 
 _SYSTEM = (
     "You answer questions from a document store by navigating it, like a person "
@@ -76,11 +142,21 @@ _SYSTEM = (
     "1. You are given every document's title and its table of contents.\n"
     "2. Call read_section on the sections most likely to hold the answer. Judge "
     "by what a section CONTAINS, not by words it shares with the question.\n"
-    "3. Read more than one when unsure. Reading a section that turns out to be "
+    "3. READ SEVERAL SECTIONS IN THE SAME TURN. Issue three or four "
+    "read_section calls at once rather than one, waiting, then another — every "
+    "turn is a round trip, and reading three sections in one turn costs the "
+    "same wait as reading one. Reading a section that turns out to be "
     "irrelevant costs nothing; missing one loses the answer.\n"
-    "4. If what you read is not enough, read another section before answering.\n"
-    "5. Call submit_answer when you can answer, or when nothing in the store "
+    "4. Do NOT walk a document in order. Chapter I, then II, then III is not "
+    "navigation, it is reading the whole book slowly. Pick the sections that "
+    "look right, wherever they are.\n"
+    "5. If what you read is not enough, read another batch before answering.\n"
+    "6. Call submit_answer when you can answer, or when nothing in the store "
     "can.\n\n"
+    "A document marked is_a_picture has no text of its own — a photograph, a "
+    "screenshot, a scan. Its sections are a DESCRIPTION of the image, written "
+    "by looking at it once, so anything precise about it should come from "
+    "look_at_page rather than from that description.\n\n"
     "Two things do not survive a PDF's text layer. Tables come out as a run of "
     "numbers with no rows. Figures and diagrams do not come out AT ALL — the "
     "text carries their caption and nothing of what they show. When either is "
@@ -142,9 +218,17 @@ _HYBRID_NOTE = (
     "about where an answer lives, and hybrid_search when the answer is a "
     "specific figure, name or identifier that no heading would announce. "
     "Passages it returns are numbered exactly like sections you read, and you "
-    "cite them the same way. When one is close but not the whole answer, call "
-    "neighbors with its chunk_id to read the passages nearest it in the store's "
-    "graph — the rest of the answer often sits one hop away."
+    "cite them the same way."
+)
+
+# Appended only when the collection HAS a similarity graph. Split out of the
+# note above because describing a tool the agent was not given is an invitation
+# to call it — and it would be handed back an empty result, having spent a
+# round.
+_NEIGHBOURS_NOTE = (
+    " When a passage is close but not the whole answer, call neighbors with its "
+    "chunk_id to read the passages nearest it in the store's graph — the rest of "
+    "the answer often sits one hop away."
 )
 
 _HYBRID_TOOL = {
@@ -197,10 +281,48 @@ _NEIGHBOURS_TOOL = {
     },
 }
 
+# Offered only when the catalogue had to be shortened. On a collection that
+# fits, this tool does not exist as far as the model is concerned — which keeps
+# the small case byte-identical to what it was before the budget existed, so it
+# cannot regress.
+_OPEN_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "open_document",
+        "description": (
+            "Show what is inside a document, or inside one part of it. The list "
+            "you were given is shortened — top-level headings only, without the "
+            "sections nested under them.\n"
+            "Give `doc` alone to see that document's top-level parts. Give "
+            "`section` as well to see what is inside ONE of those parts, which "
+            "is how you reach a chapter in a long document. Reading a whole "
+            "top-level part instead is how you run out of rounds."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "doc": {"type": "string", "description": "The document id."},
+                "section": {
+                    "type": "string",
+                    "description": "Optional section id to look inside, e.g. 'n003'.",
+                },
+            },
+            "required": ["doc"],
+        },
+    },
+}
+
 # What the page reader is asked for. A transcription, not an answer: the
 # navigator does the reasoning, and a vision model that both reads AND
 # concludes gives you a conclusion with no way back to what was on the page.
 _LOOK_PROMPT = (
+    # Narrowing this to "only what bears on the question" was measured and
+    # rejected. It is three times faster on a dense page — 7.8s to 2.7s — and
+    # it cost two of twenty answers: a pentagon came back as "a quadrilateral,
+    # four sides", and the periodic table came back as NOT_ON_THIS_PAGE, after
+    # which the agent answered from a different document altogether. Whatever
+    # a model hears in "report only what is relevant", it is not "be equally
+    # careful about less". Buy speed somewhere it cannot cost an answer.
     "Report what this page shows, faithfully and completely, focusing on: "
     "{looking_for}\n\n"
     "Rules:\n"
@@ -287,39 +409,97 @@ _TOOLS = [
 
 
 async def _documents(
-    session: AsyncSession, scope: Scope, limit: int = MAX_DOCUMENTS
+    session: AsyncSession,
+    scope: Scope,
+    limit: int = MAX_DOCUMENTS,
+    item_ids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
+    """The documents to lay out for the agent.
+
+    ``item_ids`` names them explicitly — from an explicit filter, or from the
+    router having chosen. The order given is preserved, because it is a ranking:
+    a router that ranks and then hands back an arbitrary order has thrown away
+    the half of its work that says which document is most likely.
+
+    Without it, the newest ``limit`` documents. That default is only ever
+    correct when the store holds no more than ``limit``; see core.routing for
+    why, and for what happens when it holds more.
+
+    ``limit`` of 0 means no count limit, which is the default. The bound that
+    always applies is MAX_CATALOGUE_BYTES, enforced after the rows come back:
+    documents are taken in order until the body budget is spent. Ordered by
+    rank when routing chose them, so what falls off the end is what scored
+    lowest rather than whatever the database happened to return last.
+    """
     clause = "AND collection_id = :c" if scope.collection_id else ""
-    rows = (
-        await session.execute(
-            sql(
-                f"""
-                SELECT item_id, title, body, source, locator, url
-                FROM kb_items
-                WHERE workspace_id = :w AND status = :active {clause}
-                ORDER BY created_at DESC
-                LIMIT :limit
-                """  # noqa: S608 - clause is a fixed literal, not input
-            ),
+    params: dict[str, Any] = {
+        "w": scope.workspace_id,
+        "c": scope.collection_id,
+        "active": str(Lifecycle.ACTIVE),
+        # SQL has no "no limit" parameter, so 0 becomes a number no store will
+        # reach. The real guard is the byte budget below.
+        "limit": limit if limit > 0 else 1_000_000,
+    }
+    if item_ids:
+        params["ids"] = list(item_ids)
+        rows = (
+            await session.execute(
+                sql(
+                    f"""
+                    SELECT item_id, title, body, source, locator, url
+                    FROM kb_items
+                    WHERE workspace_id = :w AND status = :active {clause}
+                      AND item_id = ANY(:ids)
+                    LIMIT :limit
+                    """  # noqa: S608 - clause is a fixed literal, not input
+                ),
+                params,
+            )
+        ).all()
+        # Restored to the caller's order — SQL returned a set, not a ranking.
+        rank = {item_id: n for n, item_id in enumerate(item_ids)}
+        rows = sorted(rows, key=lambda r: rank.get(r.item_id, len(rank)))
+    else:
+        rows = (
+            await session.execute(
+                sql(
+                    f"""
+                    SELECT item_id, title, body, source, locator, url
+                    FROM kb_items
+                    WHERE workspace_id = :w AND status = :active {clause}
+                    ORDER BY created_at DESC
+                    LIMIT :limit
+                    """  # noqa: S608 - clause is a fixed literal, not input
+                ),
+                params,
+            )
+        ).all()
+    # The bound that actually protects the process. Stated in bytes because
+    # that is the unit the cost is in: a thousand 30 KB circulars are cheaper
+    # to lay out than ten novels, and any limit written as a document count
+    # gets one of those two cases badly wrong.
+    #
+    # The first document is always taken, whatever it weighs. A store whose
+    # single document is larger than the budget must still be answerable from
+    # it — returning nothing would report an empty collection.
+    out: list[dict[str, Any]] = []
+    spent = 0
+    for r in rows:
+        body = r.body or ""
+        if out and spent + len(body) > MAX_CATALOGUE_BYTES:
+            break
+        spent += len(body)
+        out.append(
             {
-                "w": scope.workspace_id,
-                "c": scope.collection_id,
-                "active": str(Lifecycle.ACTIVE),
-                "limit": limit,
-            },
+                "item_id": r.item_id,
+                "title": r.title,
+                "body": body,
+                "source": r.source,
+                "locator": r.locator,
+                "url": r.url,
+            }
         )
-    ).all()
-    return [
-        {
-            "item_id": r.item_id,
-            "title": r.title,
-            "body": r.body,
-            "source": r.source,
-            "locator": r.locator,
-            "url": r.url,
-        }
-        for r in rows
-    ]
+    return out
 
 
 # Words that name a thing a page SHOWS rather than says. A question using one
@@ -453,6 +633,17 @@ def _stream_round(
     return done
 
 
+# Readings already paid for. Keyed by the page AND by what was asked of it,
+# because the reading is steered: a page read for "the revenue table" is not
+# the answer to "which vertex has the right angle", and serving one for the
+# other would trade the most expensive call in the system for a wrong answer.
+# That makes this a cache for repeats — the same question asked twice, the same
+# question in both retrieval modes — and nothing else, which is the only
+# version of it that cannot cost accuracy.
+_READ_CACHE: OrderedDict[tuple[str, str, int, str], str] = OrderedDict()
+_READ_CACHE_SIZE = 256
+
+
 async def _read_page(
     workspace_id: str, item_id: str, page: int, looking_for: str
 ) -> str | None:
@@ -472,6 +663,14 @@ async def _read_page(
     if png is None:
         return None
 
+    key = (workspace_id, item_id, page, " ".join(looking_for.lower().split()))
+    cached = _READ_CACHE.get(key)
+    if cached is not None:
+        # Reading the page again would cost the most expensive call this
+        # system makes to produce a string it already has.
+        _READ_CACHE.move_to_end(key)
+        return cached
+
     from packages.core.llm import look
 
     try:
@@ -483,7 +682,18 @@ async def _read_page(
         )
     except Exception:
         return None
-    return (seen or "").strip() or None
+
+    reading = (seen or "").strip() or None
+    # A refusal is the one answer that must never be cached. NOT_ON_THIS_PAGE
+    # is the model failing, not a fact about the page — measured at 0 out of 5
+    # on a page that had once refused — and caching it would pin that failure
+    # to the page for the life of the process, so the same question could never
+    # recover. Cache readings; retry refusals.
+    if reading is not None and not reading.startswith(_NOT_ON_PAGE):
+        _READ_CACHE[key] = reading
+        while len(_READ_CACHE) > _READ_CACHE_SIZE:
+            _READ_CACHE.popitem(last=False)
+    return reading
 
 
 @dataclass(slots=True)
@@ -552,43 +762,335 @@ def _where_named_things_live(
     )
 
 
-def _catalogue(documents: list[dict[str, Any]], trees: dict[str, tree.Node]) -> str:
-    """Every document and its sections. Titles and openings, never full text.
+def _why_these_documents(
+    routing: route.Routing, documents: list[dict[str, Any]]
+) -> str:
+    """Tell the agent this list was narrowed, and on what evidence.
+
+    Two failures this prevents, both seen before it existed.
+
+    A narrowed list looks exactly like a small store. Given eight documents out
+    of two hundred and no word about it, an agent that fails to find the answer
+    concludes the STORE does not hold it — and says so, confidently, which is
+    the one sentence a knowledge base must not get wrong. It has to know it is
+    looking through a window.
+
+    The other is subtler: told only that the list was narrowed, the agent starts
+    treating the top-ranked document as the answer and stops reading. So the
+    reasons are given per document and named as what they are — a similarity
+    score, not a finding. Ranking says where to look first, never what is true.
+    """
+    if routing.how == "everything":
+        return ""
+    if routing.how == "named":
+        return (
+            "THESE DOCUMENTS WERE NAMED IN THE REQUEST. Answer only from them. "
+            "If they do not contain the answer, say so — do not reason about "
+            "documents you were not given.\n\n"
+        )
+
+    lines = [
+        f"- {doc['item_id']} ({doc['title'][:60]}): "
+        f"{routing.because.get(doc['item_id'], 'matched the question')}"
+        for doc in documents
+    ]
+    return (
+        f"HOW THIS LIST WAS CHOSEN: the store holds {routing.available} documents, "
+        f"too many to lay out at once, so these {len(documents)} were selected by "
+        "matching the question against the index. That is a RANKING, not a "
+        "finding — it says where to look first, and nothing about what is true. "
+        "Read and judge for yourself, and if the answer is not in these, say it "
+        "was not found in the documents you were given rather than that the "
+        "store does not hold it.\n" + "\n".join(lines) + "\n\n"
+    )
+
+
+# What a page is asked for when the steered ask came back empty. Deliberately
+# has no subject in it: the whole point is to stop narrowing.
+_UNSTEERED = "everything on this page"
+
+
+def _only_page_of_a_picture(document: dict[str, Any] | None, total_pages: int) -> bool:
+    """Is this page the entire document, and is that document a picture?
+
+    The narrow case where a refusal cannot mean "wrong page" — there is no other
+    page. It can only mean the reader declined, and a reader that declines is
+    worth asking twice. On a forty-page PDF a refusal is genuine information
+    (this page, not that one) and re-asking would just spend the look again.
+    """
+    return document is not None and total_pages <= 1 and _is_a_picture(document)
+
+
+def _node_holding(root: tree.Node, text: str) -> tree.Node | None:
+    """The deepest section whose text contains this passage.
+
+    Located by content, not by heading. A novel has thirty-four chapters called
+    "Chapter I", so a title is not an address — and the whole point of this
+    lookup is to hand back something the agent can actually read_section on.
+    """
+    probe = " ".join(text.split())[:120]
+    if len(probe) < 24:
+        return None
+    best: tree.Node | None = None
+    for node in root.walk():
+        if probe in " ".join(node.text.split()):
+            if best is None or node.level > best.level:
+                best = node
+    return best
+
+
+async def _words_in_parallel(
+    scope: Scope, question: str, trees: dict[str, tree.Node]
+) -> str:
+    """``_where_the_words_are`` on its own database session, so it can be
+    started early and awaited late.
+
+    Its own session because two coroutines sharing one would interleave
+    statements on a connection that assumes it is used by one caller at a time.
+    Failure is swallowed for the same reason it is inside the hint itself: a
+    hint that cannot be produced is not an error, it is one fewer hint.
+    """
+    from packages.core.db import Session
+
+    try:
+        async with Session() as session:
+            return await _where_the_words_are(session, scope, question, trees)
+    except Exception:
+        return ""
+
+
+async def _where_the_words_are(
+    session: AsyncSession,
+    scope: Scope,
+    question: str,
+    trees: dict[str, tree.Node],
+    limit: int = 6,
+) -> str:
+    """Sections the index already matched, named so they can be opened.
+
+    Only used when the catalogue had to be shortened, and it exists because of
+    what a shortened catalogue costs. Choosing a section means reading its
+    title, and in a novel every title is "Chapter XIX" — no amount of structure
+    helps, because the author never labelled where anything is. Asked which
+    peasant Pierre meets in captivity, the agent drilled correctly into the
+    right book, read six chapters by guessing at numerals, and ran out.
+
+    The store already knows: the same embeddings and keyword index hybrid uses
+    to answer that question in three seconds. So on a corpus too large to lay
+    out, the search runs first and its hits are handed over as addresses. The
+    agent still decides what to read and still reads it for itself — this
+    replaces guesswork about titles, not the reading.
+    """
+    from packages.core.search import RetrievalConfig, search
+
+    try:
+        # Scoped to the laid-out documents for the same reason the search tool
+        # is: a hint pointing at a document the agent was not given is not a
+        # hint, it is a dead end it will spend a round on.
+        hits = await search(
+            session, scope, question, RetrievalConfig(limit=limit, item_ids=tuple(trees))
+        )
+    except Exception:
+        # A hint that cannot be produced is not an error. The agent navigates
+        # the way it did before.
+        return ""
+
+    lines: list[str] = []
+    for hit in hits:
+        root = trees.get(hit.item_id)
+        if root is None:
+            continue
+        for passage in hit.passages[:2]:
+            node = _node_holding(root, passage.text)
+            if node is None:
+                continue
+            line = (
+                f"- {hit.item_id} section {node.node_id} ({node.title[:60]}) "
+                f"— matched on: {' '.join(passage.text.split())[:90]}…"
+            )
+            if line not in lines:
+                lines.append(line)
+        if len(lines) >= limit:
+            break
+
+    if not lines:
+        return ""
+    return (
+        "SECTIONS THE INDEX ALREADY MATCHED TO THIS QUESTION. Read these FIRST, "
+        "in one turn, before opening anything else — they were found by "
+        "searching the full text by meaning and by exact wording, which is a "
+        "far better guide than a chapter title. They are candidates, not the "
+        "answer: read them and judge. If they do not settle it, then explore "
+        "the contents.\n"
+        # The previous wording — "a starting point, not the answer, and not
+        # necessarily complete" — was accurate and useless. Measured: the hint
+        # named the exact section holding the answer, and the agent ignored it,
+        # opened Book One and read Chapter I, II, III, IV, V, VI in order, one
+        # per round. Honest hedging that reads as "this is unreliable" gets the
+        # evidence thrown away. The hedge is still here; it no longer leads.
+        + "\n".join(lines[:limit])
+        + "\n\n"
+    )
+
+
+def _entry(doc: dict[str, Any], sections: list[dict[str, Any]]) -> dict[str, Any]:
+    """One document's line in the catalogue.
 
     When index summaries exist for a document (a card and section summaries
-    generated at ingest or by the mapper), they are injected: a ``blurb`` on
-    the document and a ``summary`` on each section. The agent reads these to
+    generated at ingest or by the mapper), they are injected here: a ``blurb``
+    on the document and a ``summary`` on each section. The agent reads these to
     decide where to look, rather than guessing from headings alone. When a
     document has no summaries yet, the bare outline is still present — the
     agent navigates as before, and the mapper will catch up in the background.
-    """
-    # The summary data was pre-fetched and attached to each document dict by
-    # the caller (navigate) — see the ``_enrich_catalogue`` call there. If not
-    # present, the field is simply absent and the fallback is the old outline.
-    entries: list[dict[str, Any]] = []
-    for doc in documents:
-        entry: dict[str, Any] = {
-            "doc": doc["item_id"],
-            "title": doc["title"],
-            "sections": trees[doc["item_id"]].outline().get("sections", []),
-        }
-        # Inject the card blurb when present.
-        if doc.get("_card"):
-            entry["blurb"] = doc["_card"]
-        # Inject per-section descriptions when present.
-        if doc.get("_section_summaries"):
-            by_heading: dict[str, str] = {
-                s["heading"]: s["body"]
-                for s in doc["_section_summaries"]
-                if s.get("heading") and s.get("body")
-            }
-            for section in entry["sections"]:
-                desc = by_heading.get(section.get("title", ""))
-                if desc:
-                    section["summary"] = desc
-        entries.append(entry)
-    return json.dumps(entries, ensure_ascii=False)
 
+    The summary data was pre-fetched and attached to each document dict by the
+    caller (navigate) — see the ``_enrich_catalogue`` call there. Absent, the
+    fields are simply omitted and the fallback is the plain outline.
+
+    Injected at THIS level, not in _catalogue, so the blurbs survive the budget:
+    a shortened catalogue loses openings and nesting, and a one-line description
+    of what a document is about is worth more per character than either.
+    """
+    entry: dict[str, Any] = {
+        "doc": doc["item_id"],
+        "title": doc["title"],
+        # A picture has no text of its own: what follows is a description of
+        # it, written by looking. Saying so is what lets the agent go straight
+        # to the page instead of reading a paraphrase and then being sent back
+        # for it.
+        **({"is_a_picture": True} if _is_a_picture(doc) else {}),
+        "sections": sections,
+    }
+    if doc.get("_card"):
+        entry["blurb"] = doc["_card"]
+    if doc.get("_section_summaries"):
+        by_heading: dict[str, str] = {
+            s["heading"]: s["body"]
+            for s in doc["_section_summaries"]
+            if s.get("heading") and s.get("body")
+        }
+        for section in entry["sections"]:
+            desc = by_heading.get(section.get("title", ""))
+            if desc:
+                section["summary"] = desc
+    return entry
+
+
+def _headings_only(sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Top-level titles, no openings and no children.
+
+    What survives when a document is too big to lay out in full: enough to
+    choose a part of it, and nothing more.
+    """
+    trimmed = []
+    for section in sections:
+        entry: dict[str, Any] = {"id": section["id"], "title": section["title"]}
+        inside = section.get("sections") or []
+        if inside:
+            entry["contains"] = len(inside)
+        trimmed.append(entry)
+    return trimmed
+
+
+def _catalogue(
+    documents: list[dict[str, Any]], trees: dict[str, tree.Node], budget: int = CATALOGUE_BUDGET
+) -> tuple[str, bool]:
+    """Every document and its sections. Titles and openings, never full text.
+
+    Returns the catalogue and whether it had to be shortened.
+
+    This grew without a limit and it was the single worst thing in the system
+    at scale. MAX_DOCUMENTS caps how many documents go in front of the model;
+    nothing capped how many SECTIONS did, and the reasoning behind that cap —
+    "choosing from a list nobody can read is guesswork wearing a suit" — is
+    exactly as true of sections. Measured: two copies of one novel came to
+    1,491 sections and **270,062 characters, about 67,500 tokens, sent again on
+    every round of every question**. A collection of ten ordinary documents
+    came to 28,000 tokens.
+
+    Under the budget nothing changes — the same bytes as before, so a small
+    collection cannot regress. Over it, each document keeps its top-level
+    headings and loses its openings, and the agent is given open_document to
+    fetch any one outline in full. A table of contents, then the chapter list
+    for the book you actually want.
+    """
+    full = [_entry(doc, trees[doc["item_id"]].outline().get("sections", [])) for doc in documents]
+    rendered = json.dumps(full, ensure_ascii=False)
+    if len(rendered) <= budget:
+        return rendered, False
+
+    short = [
+        _entry(doc, _headings_only(trees[doc["item_id"]].outline().get("sections", [])))
+        for doc in documents
+    ]
+    for entry, doc in zip(short, documents, strict=True):
+        entry["sections_in_full"] = tree.count(trees[doc["item_id"]])
+
+    rendered = json.dumps(short, ensure_ascii=False)
+    if len(rendered) <= budget:
+        return rendered, True
+
+    # Headings alone can still overflow: a novel whose 730 chapters sit at the
+    # top level has no shallower shape to fall back on. Each document keeps an
+    # equal share of what is left and says how many it is not showing, so the
+    # list stays a fair sample of the whole rather than an alphabetical prefix
+    # that quietly stops at chapter forty.
+    share = max(1, budget // max(len(short), 1) // 90)
+    for entry in short:
+        sections = entry["sections"]
+        if len(sections) > share:
+            entry["sections"] = sections[:share]
+            entry["headings_not_shown"] = len(sections) - share
+    return json.dumps(short, ensure_ascii=False), True
+
+
+def _outline_of(
+    document: dict[str, Any], root: tree.Node, budget: int, section_id: str = ""
+) -> str:
+    """What is inside a document, or inside one part of it.
+
+    ``section_id`` is what makes this a drill-down rather than a second look at
+    the same thing. Without it the first version handed back the top-level
+    headings the catalogue had already shown — measured: asked who Natasha
+    elopes with, the agent opened the novel, got its 34 book titles again, then
+    read five whole BOOKS looking for a scene and ran out of rounds. It could
+    see the shelf and never the chapters.
+
+    So a part can be opened too, and one part of a document is small enough to
+    lay out properly: titles, openings, and what each contains.
+    """
+    if section_id:
+        found = tree.find(root, [section_id])
+        if not found:
+            return json.dumps({"error": "no section with that id", "doc": document["item_id"]})
+        node = found[0]
+        inside = node.outline().get("sections", [])
+        rendered = json.dumps(
+            {
+                "doc": document["item_id"],
+                "section": section_id,
+                "title": node.title,
+                "sections": inside or _headings_only(inside),
+            },
+            ensure_ascii=False,
+        )
+        if len(rendered) <= budget:
+            return rendered
+        return json.dumps(
+            {
+                "doc": document["item_id"],
+                "section": section_id,
+                "title": node.title,
+                "sections": _headings_only(inside),
+            },
+            ensure_ascii=False,
+        )
+
+    sections = root.outline().get("sections", [])
+    rendered = json.dumps(_entry(document, sections), ensure_ascii=False)
+    if len(rendered) <= budget:
+        return rendered
+    return json.dumps(_entry(document, _headings_only(sections)), ensure_ascii=False)
 
 
 async def navigate(
@@ -599,8 +1101,14 @@ async def navigate(
     on_token: Callable[[str], None] | None = None,
     hybrid: bool = False,
     emit: EmitFn | None = None,
+    only: tuple[str, ...] = (),
 ) -> tuple[Outcome, Trace]:
     """Let the model read its way to an answer, and record every step.
+
+    ``only`` restricts the whole walk to the named documents — the explicit
+    filter. Empty means "decide", which on a store larger than MAX_DOCUMENTS
+    means core.routing picks the documents this question is about instead of
+    the ones most recently uploaded.
 
     The callbacks are for watching it happen rather than waiting for it. Most of
     the time here is spent READING, not writing — opening a section, looking at
@@ -639,18 +1147,55 @@ async def navigate(
         if on_step is not None:
             on_step(step)
 
-    # One past the cap so a collection larger than the catalogue window is
-    # detectable: catalogue retrieval can only read what fits in the prompt, and
-    # an answer drawn from a partial view has to say so rather than look whole.
-    documents = await _documents(session, scope, limit=MAX_DOCUMENTS + 1)
-    catalogue_truncated = len(documents) > MAX_DOCUMENTS
-    documents = documents[:MAX_DOCUMENTS]
+    # WHICH documents, before HOW MANY. The cap has always been MAX_DOCUMENTS;
+    # what changed is that on a store bigger than the cap the forty shown are
+    # now the forty this question is about, rather than the forty uploaded most
+    # recently. On a store that fits, routing does not run and this is the same
+    # query it always was.
+    routing = await route.choose(session, scope, question, only=only, limit=MAX_DOCUMENTS)
+    if routing.item_ids:
+        documents = await _documents(
+            session, scope, limit=MAX_DOCUMENTS, item_ids=routing.item_ids
+        )
+    else:
+        documents = await _documents(session, scope, limit=MAX_DOCUMENTS)
+    # Truncation is measured by comparing what was LOADED against what exists,
+    # not by arithmetic on the cap.
+    #
+    # It used to fetch one past the cap and slice back with documents[:cap],
+    # which is correct for any positive cap and catastrophic for a cap of 0 —
+    # and 0 is now the default, meaning "no count limit". documents[:0] is the
+    # empty list, so every catalogue walk was handed an empty store and reported
+    # that the collection did not answer the question. Fast, confident, and
+    # wrong about a book that was sitting right there. Comparing counts says the
+    # same thing without depending on the cap being a positive number.
+    catalogue_truncated = len(documents) < routing.available
+    trace.config["routing"] = routing.as_dict()
+    if routing.how != "everything":
+        record(
+            Step(
+                0,
+                "narrowed" if routing.routed else "filtered",
+                f"{len(documents)} of {routing.available} documents"
+                + (" — named in the request" if routing.how == "named" else ""),
+            )
+        )
     if not documents:
         trace.timings_ms["total"] = int((time.perf_counter() - started) * 1000)
         return outcome, trace
 
     trees = {doc["item_id"]: tree.build(doc["body"], doc["title"]) for doc in documents}
     by_id = {doc["item_id"]: doc for doc in documents}
+
+    # Started here, awaited when the prompt is assembled. It is an embedding
+    # call plus a search — measured at 1.4 seconds — and it needs nothing that
+    # the enrichment below produces, so running it in front of them made every
+    # question wait 1.4s longer than it had to. Everything between this line
+    # and the await is now free.
+    #
+    # Uses its own session: two coroutines sharing one AsyncSession would
+    # interleave statements on a connection that does not expect it.
+    words_ahead = asyncio.ensure_future(_words_in_parallel(scope, question, trees))
 
     # Enrich the catalogue with index summaries when they exist. Each document
     # gets a ``_card`` blurb and ``_section_summaries`` list that _catalogue
@@ -697,6 +1242,24 @@ async def navigate(
     outcome.documents_considered = len(documents)
     outcome.sections_available = sum(tree.count(t) for t in trees.values())
 
+    # Said before the first model call, not after it. Choosing what to read is
+    # one round trip with every document's contents in the prompt, and on a
+    # slow provider that was 13.5 seconds of a spinner with nothing behind it —
+    # a wait indistinguishable from a hang. This costs nothing and is true the
+    # moment it is printed.
+    #
+    # Both channels carry it: `record` puts it in outcome.steps for the trace
+    # and the on_step sink, `emit` puts it on the wire for a watching browser.
+    # They are the same fact told to two different audiences, and dropping
+    # either one leaves one of them staring at nothing.
+    record(
+        Step(
+            0,
+            "opened",
+            f"the index of {len(documents)} document{'s' if len(documents) != 1 else ''}, "
+            f"{outcome.sections_available} sections",
+        )
+    )
     if emit is not None:
         await emit(
             {
@@ -709,15 +1272,43 @@ async def navigate(
 
     from packages.core.llm import astream_chat_with_tools, chat_with_tools
 
-    _system = _SYSTEM + _HYBRID_NOTE if hybrid else _SYSTEM
+    # Only offer the graph hop where there is a graph to hop. Asked once, per
+    # question, because the answer is a property of the collection rather than
+    # of the round.
+    can_hop = bool(hybrid) and await graph.has_near_edges(scope)
+    _system = _SYSTEM + _HYBRID_NOTE + (_NEIGHBOURS_NOTE if can_hop else "") if hybrid else _SYSTEM
+
+    catalogue, abbreviated = _catalogue(documents, trees)
+    if not abbreviated:
+        # The hint only goes in the prompt when the catalogue had to be
+        # shortened, and whether it was is not known until now. Started
+        # speculatively so its 1.4s overlaps the work above; cancelled here when
+        # it turns out not to be wanted, rather than left to finish into nobody.
+        words_ahead.cancel()
+    # Reaching a chapter through a shortened catalogue costs two rounds the
+    # flat one never spent: open the document, open the part. Measured
+    # without this, the agent used them on navigation and ran out before it
+    # could read anything — five books opened, no answer. The extra rounds
+    # are the price of the smaller prompt, and only charged when it applies.
+    max_rounds = MAX_ROUNDS + (2 if abbreviated else 0)
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": _system},
         {
             "role": "user",
             "content": (
-                f"DOCUMENTS:\n{_catalogue(documents, trees)}\n\n"
-                f"{_where_named_things_live(question, documents, trees)}"
-                f"QUESTION: {question}"
+                f"DOCUMENTS:\n{catalogue}\n\n"
+                + (
+                    "This list is SHORTENED: it shows each document's top-level "
+                    "headings only, without the sections inside them or their "
+                    "opening lines. Call open_document on the one that looks "
+                    "right to see its contents in full, then read from there.\n\n"
+                    if abbreviated
+                    else ""
+                )
+                + (await words_ahead if abbreviated else "")
+                + f"{_where_named_things_live(question, documents, trees)}"
+                + _why_these_documents(routing, documents)
+                + f"QUESTION: {question}"
             ),
         },
     ]
@@ -753,7 +1344,7 @@ async def navigate(
     pressed_to_read = False
 
     mark = time.perf_counter()
-    for round_number in range(1, MAX_ROUNDS + 1):
+    for round_number in range(1, max_rounds + 1):
         outcome.rounds = round_number
         # read_section, [hybrid_search], submit_answer — search sits between
         # reading and answering because that is the order the agent uses them
@@ -761,12 +1352,29 @@ async def navigate(
         # document that actually has pages. Before that the tool does not exist
         # as far as the model is concerned, which is a stronger guarantee than
         # telling it not to.
-        tools = (
-            [_TOOLS[0], _HYBRID_TOOL, _NEIGHBOURS_TOOL, _TOOLS[1]]
-            if hybrid
-            else list(_TOOLS)
-        )
+        # Built by appending rather than by rebuilding from _TOOLS each time:
+        # the gates are independent, and an agentic question against a shortened
+        # catalogue needs hybrid_search, neighbors AND open_document at once.
+        # neighbors only where :NEAR edges exist. Offering a tool that can only
+        # ever return nothing costs a full round to discover that, and on a
+        # store without consolidation running it can NEVER return anything.
+        if hybrid:
+            tools = [_TOOLS[0], _HYBRID_TOOL, *([_NEIGHBOURS_TOOL] if can_hop else []), _TOOLS[1]]
+        else:
+            tools = list(_TOOLS)
+        if abbreviated:
+            tools = [*tools, _OPEN_TOOL]
         if looks < MAX_LOOKS and any(page_counts.values()):
+            # Reading first is NOT the waste it looks like. Offering the page
+            # tool from the opening round — on the reasoning that a picture's
+            # text is only a description anyway — made the agent look before it
+            # knew which document it needed: it looked at the wrong one, spent
+            # a look on NOT_ON_THIS_PAGE, then answered from a third document
+            # entirely. Asked which elements are liquid, it described a chart
+            # of support tickets. Two of twenty answers went that way.
+            #
+            # The read is what establishes WHERE. It costs a round and it earns
+            # it.
             tools = [*tools, _LOOK_TOOL]
         try:
             if emit is not None:
@@ -806,7 +1414,7 @@ async def navigate(
             break
 
         calls = reply.get("tool_calls") or []
-        if not calls and not read and not pressed_to_read and round_number < MAX_ROUNDS:
+        if not calls and not read and not pressed_to_read and round_number < max_rounds:
             # It answered without opening anything — and what it had to go on
             # was the CATALOGUE, which holds each section's title and its first
             # line. Asked for two figures out of a table, it read the openings,
@@ -840,7 +1448,7 @@ async def navigate(
             and not pressed_to_look
             and any(page_counts.values())
             and (_about_a_picture(question) or read_a_picture)
-            and round_number < MAX_ROUNDS
+            and round_number < max_rounds
         ):
             # The same press as below, on the path that was skipping it.
             #
@@ -917,6 +1525,62 @@ async def navigate(
                     }
                 )
 
+            if call["name"] == "open_document":
+                doc_id = str(args.get("doc") or "")
+                if doc_id not in by_id:
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call["id"],
+                            "content": "No document has that id. Use one from the list.",
+                        }
+                    )
+                    record(Step(round_number, "missed", f"document {doc_id[:12]}"))
+                    if emit is not None:
+                        await emit(
+                            {
+                                "type": "tool_result",
+                                "tool": "open_document",
+                                "ok": False,
+                                "detail": "no document with that id",
+                            }
+                        )
+                    continue
+                section_id = str(args.get("section") or "")
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call["id"],
+                        "content": _outline_of(
+                            by_id[doc_id], trees[doc_id], CATALOGUE_BUDGET, section_id
+                        ),
+                    }
+                )
+                record(
+                    Step(
+                        round_number,
+                        "opened",
+                        f"{by_id[doc_id]['title'][:34]}"
+                        + (
+                            f" > {section_id}"
+                            if section_id
+                            else f" — {tree.count(trees[doc_id])} sections"
+                        ),
+                    )
+                )
+                if emit is not None:
+                    await emit(
+                        {
+                            "type": "tool_result",
+                            "tool": "open_document",
+                            "ok": True,
+                            "title": by_id[doc_id]["title"],
+                            "heading": section_id,
+                            "count": tree.count(trees[doc_id]),
+                        }
+                    )
+                continue
+
             if call["name"] == "submit_answer":
                 said_found = bool(args.get("found"))
 
@@ -924,7 +1588,7 @@ async def navigate(
                     not said_found
                     and not read
                     and not pressed_to_read
-                    and round_number < MAX_ROUNDS
+                    and round_number < max_rounds
                 ):
                     # "Not here", decided without opening anything. Identical in
                     # substance to answering in prose without reading, so it
@@ -952,7 +1616,7 @@ async def navigate(
                     and looks == 0
                     and not pressed_to_look
                     and any(page_counts.values())
-                    and round_number < MAX_ROUNDS
+                    and round_number < max_rounds
                     and (not said_found or _about_a_picture(question) or read_a_picture)
                 ):
                     # Two ways an answer about a picture goes wrong, and only
@@ -1034,6 +1698,22 @@ async def navigate(
                 doc_id = str(args.get("doc") or "")
                 if doc_id not in page_counts and len(page_counts) == 1:
                     doc_id = next(iter(page_counts))
+
+                # A picture can be looked at without being read first, so its
+                # page count may not have been learned yet. Found now rather
+                # than at the start: counting means fetching the original, and
+                # doing that for every document in the store to answer a
+                # question about one of them is forty fetches wasted.
+                if doc_id not in page_counts and doc_id in by_id:
+                    from packages.core import pages as page_store
+
+                    page_counts[doc_id] = (
+                        await page_store.count(
+                            scope.workspace_id, doc_id, by_id[doc_id]["locator"] or ""
+                        )
+                        if page_store.available()
+                        else 0
+                    )
                 total = page_counts.get(doc_id, 0)
                 try:
                     page_number = int(args.get("page") or 0)
@@ -1089,21 +1769,70 @@ async def navigate(
                     continue
 
                 if seeing.startswith(_NOT_ON_PAGE):
+                    # A refusal on a document that IS this page is not evidence
+                    # about the page — it is the steer failing. The agent read
+                    # the document's description and chose this page on purpose;
+                    # there is no other page it could have meant. Asked which
+                    # elements are liquid, the periodic table came back
+                    # NOT_ON_THIS_PAGE roughly one run in three, and the same
+                    # page read without a steer answered every time.
+                    #
+                    # So the steer is dropped and the page is read plainly, once.
+                    # Same lesson as the focused-prompt experiment above: telling
+                    # a vision model what to care about is what makes it stop
+                    # looking at the rest.
+                    if _only_page_of_a_picture(by_id.get(doc_id), page_counts.get(doc_id, 0)):
+                        again = await _read_page(
+                            scope.workspace_id, doc_id, page_number, _UNSTEERED
+                        )
+                        if again is not None and not again.startswith(_NOT_ON_PAGE):
+                            seeing = again
+
+                if seeing.startswith(_NOT_ON_PAGE):
+                    title = by_id[doc_id]["title"] if doc_id in by_id else doc_id
+                    # "Answer from the text" is what this used to say, and on a
+                    # picture that sentence is a trap: the document's only text
+                    # IS a description of the page that just came back empty.
+                    # Asked which elements are liquid, the agent looked at a
+                    # support-tickets chart, was told the page had nothing to do
+                    # with the question, then read that same chart's description
+                    # and wrote a paragraph about support tickets. A document
+                    # that has just disclaimed the question must not become the
+                    # source of the answer to it.
+                    ruled_out = (
+                        doc_id in by_id
+                        and _is_a_picture(by_id[doc_id])
+                        and page_counts.get(doc_id, 0) <= 1
+                    )
                     messages.append(
                         {
                             "role": "tool",
                             "tool_call_id": call["id"],
                             "content": (
-                                f"Page {page_number} does not show that. Try another "
-                                "page, or answer from the text."
+                                f"Page {page_number} of {title} has nothing to do "
+                                "with the question."
+                                + (
+                                    " That document is a picture and that was its "
+                                    "only page, so it cannot answer this — its "
+                                    "stored text is only a description of the page "
+                                    "you just saw. Do not answer from it. Choose a "
+                                    "different document."
+                                    if ruled_out
+                                    else " Try another page, or another document."
+                                )
                             ),
                         }
                     )
                     # Recorded, not hidden: a look that came back empty is the
                     # reader's evidence that the page was checked and did not
-                    # hold the answer.
+                    # hold the answer. Named, too — "page 1 — not there" over a
+                    # store where every picture has a page 1 says nothing.
                     record(
-                        Step(round_number, "looked", f"page {page_number} — not there")
+                        Step(
+                            round_number,
+                            "looked",
+                            f"{title[:40]} page {page_number} — not there",
+                        )
                     )
                     continue
 
@@ -1158,8 +1887,16 @@ async def navigate(
                 # passages across the returned documents become citable reads,
                 # numbered in the same sequence as sections, so downstream sees
                 # one uniform shape however the evidence was found.
+                # Scoped to the documents in front of the agent. Without this
+                # the search tool reaches the WHOLE store and hands back a
+                # passage from a document the router (or an explicit filter)
+                # already excluded — the agent then cites it, and a question
+                # scoped to one document is answered from another.
                 hybrid_hits, _ = await search_traced(
-                    session, scope, found_query, RetrievalConfig(limit=5)
+                    session,
+                    scope,
+                    found_query,
+                    RetrievalConfig(limit=5, item_ids=tuple(by_id)),
                 )
                 pairs = [(p, h) for h in hybrid_hits for p in h.passages]
                 pairs.sort(key=lambda pr: pr[0].score, reverse=True)
@@ -1271,8 +2008,12 @@ async def navigate(
                 # it. The neighbour manifest carries ids and headings but not
                 # text, so the bodies are hydrated from Postgres and turned into
                 # citable reads, numbered in the same sequence as everything else.
+                # `graph` is imported at module level (the catalogue enrichment
+                # above needs it). A second import HERE would rebind it as a
+                # local for the whole of navigate, and the enrichment — which
+                # runs hundreds of lines earlier — would raise UnboundLocalError
+                # before this line was ever reached.
                 from packages.core import chunks as chunk_store
-                from packages.core import graph
 
                 neighbours = await graph.chunk_neighbours(scope, origin, limit=MAX_HYBRID_HITS)
                 hydrated = await chunk_store.by_ids(
@@ -1528,16 +2269,27 @@ async def navigate(
         )
         record(Step(outcome.rounds, "gave up", "out of rounds"))
 
-    # A catalogue-only answer over a collection too big for the prompt read just
-    # the newest MAX_DOCUMENTS documents. Say so — silently answering from a
-    # partial view is the failure this store treats as its most dangerous.
-    # Agentic needs no such warning: its hybrid_search reaches the rest, so this
-    # is scoped to the vectorless path and never clobbers a real degradation.
+    # A catalogue-only answer over a collection too big to lay out saw part of
+    # it. Say so — silently answering from a partial view is the failure this
+    # store treats as its most dangerous. Agentic needs no such warning: its
+    # hybrid_search reaches the rest, so this is scoped to the vectorless path
+    # and never clobbers a real degradation.
+    #
+    # The wording follows what actually happened. "The most recent" was true
+    # when the cut was by upload date; it is a lie once routing has ranked the
+    # documents against the question, and a warning that misdescribes the
+    # shortfall is worse than none — it sends people looking in the wrong place.
     if catalogue_truncated and not hybrid and outcome.degraded is None:
         outcome.degraded = (
-            f"This collection has more than {MAX_DOCUMENTS} documents; catalogue "
-            f"retrieval read only the {MAX_DOCUMENTS} most recent. Ask again with "
-            "agentic or hybrid retrieval to reach the whole collection."
+            f"This collection has {routing.available} documents; catalogue "
+            f"retrieval read {len(documents)} of them, "
+            + (
+                "chosen by matching the question against the index."
+                if routing.routed
+                else "the most recently added."
+            )
+            + " Ask again with agentic or hybrid retrieval to reach the whole"
+            " collection."
         )
 
     trace.timings_ms["navigate"] = int((time.perf_counter() - mark) * 1000)

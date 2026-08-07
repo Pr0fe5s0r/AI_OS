@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import AsyncIterator, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from typing import Any
 
@@ -16,11 +17,74 @@ from packages.adapter import ProviderConfig, resolve_provider
 
 EMBED_DIM = 1536
 
+# How many embedding batches may be in flight at once. Measured on 1024 texts
+# (16 batches), median of three runs each:
+#
+#     1  27.0s     <- what this used to do
+#     2   5.9s
+#     4   6.9s
+#     8   6.0s
+#    16   6.4s
+#
+# Sequential is latency-bound: sixteen round trips at roughly 1.7s each. Past
+# concurrency 2 the provider's own throughput ceiling takes over and the curve
+# is flat, so more concurrency buys nothing and only widens the burst against
+# the rate limit. Four sits clear of the knee without reaching for that.
+#
+# Do not read a single before/after pair as evidence here. Two runs twelve
+# minutes apart differed by 5x on identical code, and the first attempt to
+# measure this reported 1.2x — the real figure is 3.9x, and it only became
+# visible by interleaving the arms in one window and taking medians.
+#
+# Set EMBED_CONCURRENCY=1 to get the old sequential behaviour back.
+EMBED_CONCURRENCY = 4
+
+
+def _embed_concurrency() -> int:
+    try:
+        return max(1, int(os.getenv("EMBED_CONCURRENCY", str(EMBED_CONCURRENCY))))
+    except ValueError:
+        return EMBED_CONCURRENCY
+
+
+# How long any single provider call may take, and how many times the SDK may
+# retry it before giving up.
+#
+# These were unset, which meant the SDK defaults: 600 seconds, retried twice, so
+# a single wedged call could hold a worker thread for half an hour.
+#
+# Nothing here is protecting against that from above. Every provider call runs
+# inside asyncio.to_thread, because the SDK client is blocking, and arq's
+# job_timeout cancels COROUTINES — a cancellation cannot interrupt a thread
+# parked in a socket read. So a call that never returns is a job that never
+# ends, and job_timeout=300 will not fire. The call's own timeout is the only
+# thing that can end it, which is why it belongs here.
+#
+# The numbers come from measurement, and the spread is the whole difficulty.
+# Ingesting the same 146KB image took 32.9s once and 193.6s another time — one
+# vision call, six times the duration, same file. 120 seconds sits above the
+# common case with room to spare, and one retry keeps the worst case at 240s,
+# inside the 300s job timeout, so a stuck call fails loudly and the queue
+# retries it rather than the whole thing going quiet.
+#
+# This does mean an unusually slow call can now be cut off where it would have
+# eventually succeeded. That is the trade being made deliberately: a bounded
+# failure that gets retried and logged beats an unbounded wait that looks
+# exactly like a lost upload — which is precisely how this was found.
+LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "120"))
+LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "1"))
+
 
 @lru_cache(maxsize=1)
 def _client() -> tuple[OpenAI, ProviderConfig]:
     cfg = resolve_provider()
-    return OpenAI(base_url=cfg.base_url, api_key=cfg.api_key), cfg
+    client = OpenAI(
+        base_url=cfg.base_url,
+        api_key=cfg.api_key,
+        timeout=LLM_TIMEOUT_SECONDS,
+        max_retries=LLM_MAX_RETRIES,
+    )
+    return client, cfg
 
 
 def embed(text: str) -> list[float]:
@@ -53,21 +117,42 @@ def embed_many(texts: list[str], batch: int = 64) -> list[list[float]]:
     if not texts:
         return []
     client, cfg = _client()
-    out: list[list[float]] = []
-    for start in range(0, len(texts), batch):
-        window = texts[start : start + batch]
+
+    def run(window: list[str]) -> list[list[float]]:
         kwargs: dict[str, Any] = {"model": cfg.embedding_model, "input": window}
         if cfg.supports_dimensions:
             kwargs["dimensions"] = EMBED_DIM
         data = sorted(client.embeddings.create(**kwargs).data, key=lambda d: d.index)
+        vectors = []
         for entry in data:
             if len(entry.embedding) != EMBED_DIM:
                 raise ValueError(
                     f"Embedding model {cfg.embedding_model!r} returned "
                     f"{len(entry.embedding)} dims; expected {EMBED_DIM}."
                 )
-            out.append(entry.embedding)
-    return out
+            vectors.append(entry.embedding)
+        return vectors
+
+    windows = [texts[start : start + batch] for start in range(0, len(texts), batch)]
+    if len(windows) == 1:
+        return run(windows[0])
+
+    # The batches do not depend on each other, so waiting for one before
+    # starting the next spends wall-clock on nothing. A 182-passage document
+    # is three batches and took 14.5 seconds to index, of which two thirds was
+    # this loop holding still. Measured after: see EMBED_CONCURRENCY.
+    #
+    # Order is still the contract. The pool is indexed, not appended to, so a
+    # batch that finishes early cannot move ahead of one that started before
+    # it — the caller zips these against its passages and a reordering would
+    # attach the wrong vector to the wrong text, silently.
+    #
+    # Bounded because the ceiling here is the provider's rate limit, not ours:
+    # firing forty batches at once buys a 429 and a retry, which is slower than
+    # having waited. Concurrency is the one knob, and it is an env var because
+    # the right value belongs to whoever is paying for the account.
+    with ThreadPoolExecutor(max_workers=min(_embed_concurrency(), len(windows))) as pool:
+        return [vector for chunk in pool.map(run, windows) for vector in chunk]
 
 
 def chat(

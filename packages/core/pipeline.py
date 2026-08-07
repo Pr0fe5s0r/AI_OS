@@ -1,15 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import mimetypes
 import os
 from datetime import datetime
 from typing import Any
-
-
-def _summaries_enabled() -> bool:
-    return os.getenv("SUMMARIES_ENABLED", "false").lower() in ("1", "true", "yes")
 
 from arq.connections import RedisSettings
 
@@ -27,6 +24,25 @@ from packages.core.normalise import (
 )
 from packages.core.store import get_item, put_item, record_failure, stable_item_id
 from packages.shared.schema import Item, Scope, SourceRef
+
+
+def _summaries_enabled() -> bool:
+    """Whether a document gets a card and section summaries after it is indexed.
+
+    ON by default, which it was not. It was an optional navigation nicety when
+    the only thing it fed was a richer catalogue. It stopped being optional when
+    retrieval started ROUTING on it: on a store larger than the catalogue window
+    the card is what decides which documents a question is even allowed to see,
+    and a store with no cards falls back to ranking on passages alone.
+
+    The cost is real and is one model call per section plus one for the card —
+    thirteen or so for a typical circular, not one. It runs in the worker, after
+    indexing, and a failure there never touches the document that was uploaded.
+    Set SUMMARIES_ENABLED=false to turn it off; retrieval still works, with the
+    weaker routing signal, and says so via ``fell_back``.
+    """
+    return os.getenv("SUMMARIES_ENABLED", "true").lower() in ("1", "true", "yes")
+
 
 # ---------------------------------------------------------------------------
 # The ingestion pipeline. Everything the KB is given enters through here, and
@@ -293,13 +309,32 @@ async def embed_item(
     if not passages:
         return {"item_id": item.id, "outcome": "empty", "chunks": 0}
 
-    # One call for the lot. Passage-level embedding multiplies the number of
-    # vectors per document by an order of magnitude, so doing them one at a
-    # time would turn a 28-passage document into 28 round trips.
-    vectors = await asyncio.to_thread(
-        embed_many,
-        [chunk_module.embedding_text(p.heading, p.text, item.title) for p in passages],
-    )
+    texts = [chunk_module.embedding_text(p.heading, p.text, item.title) for p in passages]
+    hashes = [hashlib.sha256(t.encode("utf-8")).hexdigest() for t in texts]
+
+    # What this document was embedded as last time. A re-ingest usually changes
+    # a handful of passages and leaves the rest untouched, and re-embedding the
+    # untouched ones is the single largest avoidable cost in the system:
+    # embedding is ~98% of ingest wall-clock, and on a 182-passage spec a
+    # one-clause edit was paying for all 182 again.
+    #
+    # Reuse is also MORE consistent than re-embedding, not less. The provider
+    # is not deterministic — the same text embedded twice comes back with
+    # cosine 0.9999, not 1.0 — so keeping the vector a passage already has is
+    # what stops unchanged text drifting in the index for no reason.
+    reusable = await graph.vectors_by_text_hash(scope, item.id)
+    missing = [i for i, h in enumerate(hashes) if h not in reusable]
+
+    fresh: list[list[float]] = []
+    if missing:
+        # One call for the lot. Passage-level embedding multiplies the number
+        # of vectors per document by an order of magnitude, so doing them one
+        # at a time would turn a 28-passage document into 28 round trips.
+        fresh = await asyncio.to_thread(embed_many, [texts[i] for i in missing])
+
+    vectors: list[list[float]] = [reusable.get(h, []) for h in hashes]
+    for slot, vector in zip(missing, fresh, strict=True):
+        vectors[slot] = vector
 
     written = await graph.replace_chunks(
         scope,
@@ -310,9 +345,10 @@ async def embed_item(
                 "ordinal": p.ordinal,
                 "heading": p.heading,
                 "title": item.title,
+                "text_hash": text_hash,
                 "embedding": vector,
             }
-            for p, vector in zip(passages, vectors, strict=True)
+            for p, text_hash, vector in zip(passages, hashes, vectors, strict=True)
         ],
     )
     # Index summaries: a navigable semantic layer over the passages. Enqueued
@@ -324,7 +360,16 @@ async def embed_item(
             "summarize_item", workspace_id, collection_id, item.id
         )
 
-    return {"item_id": item.id, "outcome": "embedded", "chunks": written}
+    # embedded/reused are what the vector-reuse work is measured by: a re-index
+    # that changed one clause should report almost every passage reused, and
+    # without the counts here that claim cannot be checked from outside.
+    return {
+        "item_id": item.id,
+        "outcome": "embedded",
+        "chunks": written,
+        "embedded": len(missing),
+        "reused": len(passages) - len(missing),
+    }
 
 
 async def classify_new_item(
