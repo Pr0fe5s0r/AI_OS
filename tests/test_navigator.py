@@ -762,3 +762,51 @@ async def test_streaming_emits_the_work_as_it_happens(db, monkeypatch):
     assert any(e["type"] == "tool_result" and e.get("ok") for e in events)
     assert any(e["type"] == "answer" for e in events)
     assert outcome.found is True and outcome.hits
+
+
+def test_an_image_already_read_is_not_read_again():
+    """A picture whose transcription IS its text must not force a second look.
+
+    The press exists because a PDF's text layer holds a figure's caption but
+    not what the figure SHOWS. For an image document there is no text layer:
+    everything indexed came out of the vision model reading the whole picture
+    at ingest, so forcing another look re-derives what is already in the body
+    -- at the price of a vision call on the request path.
+
+    Measured on a six-document store: 65.5s of a 77.1s walk and 28.7s of a
+    33.9s one, both spent re-reading a diagram whose transcription already
+    ended in an explicit colour legend naming every component. The same
+    question with no picture involved took 3.4s. After the fix the two walks
+    ran in 12.7s and 6.5s and still named all ten components, with none of the
+    green or orange ones wrongly included.
+    """
+    from packages.core.navigator import TRANSCRIBED_ENOUGH, _already_transcribed
+
+    # The readiness-overlay diagram indexed at 3,630 characters.
+    assert _already_transcribed({"body": "x" * 3630}) is True
+    # The thin case the guard was written for: a photo described in one line.
+    assert _already_transcribed({"body": "A photograph of a whiteboard."}) is False
+    assert _already_transcribed({"body": ""}) is False
+    assert _already_transcribed({}) is False
+    # Comfortably between a caption and a reading.
+    assert 200 < TRANSCRIBED_ENOUGH < 3630
+
+
+def test_a_pdf_is_never_treated_as_already_transcribed():
+    """The premise still holds for a PDF, and the fix must not reach it.
+
+    Its text layer and its page pictures are genuinely different things, so a
+    long PDF section is no evidence at all that its figures have been read.
+    _already_transcribed is only ever consulted behind _is_a_picture, and this
+    pins that pairing: length alone must not stand in for having looked.
+    """
+    import inspect
+
+    from packages.core import navigator
+
+    source = inspect.getsource(navigator)
+    for line in source.splitlines():
+        if "_already_transcribed(" in line and "def " not in line:
+            assert "_is_a_picture" in line or "if not _already_transcribed" in line, (
+                f"unguarded use of _already_transcribed: {line.strip()}"
+            )

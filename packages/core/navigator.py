@@ -612,6 +612,36 @@ def _is_a_picture(document: dict[str, Any]) -> bool:
     return pages.is_image("", document.get("locator") or "")
 
 
+# Above this many characters, what was indexed for an image is a READING of
+# it, not a caption. Measured: the readiness-overlay diagram indexed at 3,630
+# characters, ending in an explicit "Color Coding and Legend Mapping" section
+# that named every green, orange and red component. The thin case this guard
+# was written for — a photo whose description is one line — falls far below.
+TRANSCRIBED_ENOUGH = 1_200
+
+
+def _already_transcribed(document: dict[str, Any]) -> bool:
+    """Has this picture's own content already been read into its text?
+
+    The press that follows exists because a PDF's text layer holds a figure's
+    caption but not what the figure SHOWS, so answering from prose alone means
+    answering about a picture nobody looked at. For an image document that
+    premise is simply false: there is no text layer, and everything indexed
+    for it came out of the vision model reading the whole picture at ingest.
+
+    Forcing a second look there re-derives what is already in the body, at the
+    price of a vision call on the request path. Measured on a six-document
+    store: 65.5s of a 77.1s walk, and 28.7s of a 33.9s one, both spent
+    re-reading a diagram whose transcription already carried the answer
+    verbatim. The same question with no picture involved took 3.4s.
+
+    The model may still CHOOSE to look — the tool stays offered, and a
+    question-directed look can pull detail a general transcription missed.
+    What stops is the machine forcing one it does not need.
+    """
+    return len(document.get("body") or "") >= TRANSCRIBED_ENOUGH
+
+
 def _has_pictures(document: dict[str, Any]) -> bool:
     """Can a page of this document be shown as a picture?
 
@@ -2608,7 +2638,8 @@ async def navigate(
                 )
 
             if read_any and _is_a_picture(by_id[doc_id]):
-                read_a_picture = True
+                if not _already_transcribed(by_id[doc_id]):
+                    read_a_picture = True
 
             # Now that this document has been opened, find out whether it has
             # pages to fall back on — and say so only if it does. An offer of
@@ -2625,7 +2656,24 @@ async def navigate(
                         if page_store.available()
                         else 0
                     )
-                if page_counts[doc_id] and looks < MAX_LOOKS:
+                if _already_transcribed(by_id[doc_id]) and _is_a_picture(by_id[doc_id]):
+                    # Say what this text IS, rather than offering a second look
+                    # at the thing it already came from.
+                    #
+                    # The offer below is written for a PDF, where the text layer
+                    # and the page picture are genuinely different things. Given
+                    # verbatim about an image it is not just useless but untrue —
+                    # it implies detail is being held back — and the model took
+                    # it up: 51.9s of a 63.5s walk spent looking at a diagram
+                    # whose reading was already in front of it. Nothing forced
+                    # that one; the offer invited it.
+                    offer = (
+                        "\n\n(The text above is a vision model's reading of this "
+                        "whole image, made when it was indexed — it is not an "
+                        "extracted text layer. Looking at the page again shows "
+                        "the same picture this was read from.)"
+                    )
+                elif page_counts[doc_id] and looks < MAX_LOOKS:
                     offer = (
                         f"\n\n(This document has {page_counts[doc_id]} pages. If the "
                         "text above is there but unusable — a table whose columns "
