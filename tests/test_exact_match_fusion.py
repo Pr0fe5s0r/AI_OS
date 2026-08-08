@@ -120,3 +120,25 @@ def test_a_named_winner_that_is_not_in_the_group_is_ignored():
     kept = _keep_the_exact_matches(group, must_keep={"a-chunk-of-another-doc"})
     assert len(kept) <= 5
     assert kept, "an unmatched hint must not empty the document"
+
+
+def test_recency_alone_cannot_make_a_document_a_result():
+    """A document that matched nothing is not an answer, however new it is.
+
+    Recency is 30% of the score and unconditional, so anything recently added
+    floors near 0.29 on relevance of exactly zero -- above the default
+    min_score of 0.0, and therefore cited. Measured: "Server requirement" on a
+    three-document store returned the Bitcoin paper third at 0.2961, with
+    sem=0.000 kw=0.000 on the document AND on its one passage. It was cited
+    for being new.
+
+    The floor is compared against MIN_RELEVANCE rather than zero because the
+    arms return a tiny non-zero float for everything they looked at -- the
+    first version of this guard used "> 0" and the Bitcoin paper cleared it.
+    """
+    from packages.core.search import MIN_RELEVANCE
+
+    # Far under the weakest genuine match measured (0.744, "Room of
+    # Requirement" against "Server requirement" -- a real English collision
+    # that must keep coming back), and far over the noise that must not.
+    assert 4e-5 < MIN_RELEVANCE < 0.744

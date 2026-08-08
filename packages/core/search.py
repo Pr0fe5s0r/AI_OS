@@ -189,6 +189,13 @@ def _filters(scope: Scope, cfg: RetrievalConfig) -> tuple[str, dict[str, Any]]:
     return " AND ".join(clauses), params
 
 
+# Below this, an arm did not match a document — it returned a float near zero
+# because it returns a float for everything it looked at. Deliberately far
+# under any real cosine (the weakest genuine match measured here is 0.744) and
+# far over the noise (the strongest false one, 4e-5).
+MIN_RELEVANCE = 0.01
+
+
 def _keep_the_exact_matches(
     group: list[Passage],
     slots: int = 2,
@@ -500,6 +507,32 @@ async def search_traced(
             "kept": score >= cfg.min_score,
         }
         if score < cfg.min_score:
+            scored.append((None, detail))  # type: ignore[arg-type]
+            continue
+        # A document that matched NOTHING is not a result, however new it is.
+        #
+        # Recency is 30% of the score and is unconditional, so a recently added
+        # document floors around 0.29 on relevance of exactly zero — above
+        # min_score, and therefore cited. Measured: "Server requirement" on a
+        # three-document store returned the Bitcoin paper third, scoring 0.2961
+        # with sem=0.000 and kw=0.000 on both the document and its one passage.
+        # It was cited for being new.
+        #
+        # Recency is meant to separate documents that ALL answer the question,
+        # which is a real problem in a store holding five revisions of one
+        # spec. It was never meant to admit one that does not. So relevance
+        # becomes a precondition rather than a weight, and the ranking below is
+        # left exactly as it was.
+        # Against a floor rather than zero: the arms return tiny non-zero
+        # floats for passages they did not really match, so "> 0" is satisfied
+        # by noise. The Bitcoin paper cleared it on 4e-5 and was cited anyway.
+        matched = relevance > MIN_RELEVANCE or any(
+            p.semantic > MIN_RELEVANCE or p.keyword > MIN_RELEVANCE
+            for p in ranked_passages
+        )
+        if not matched:
+            detail["kept"] = False
+            detail["dropped"] = "no relevance — recency alone"
             scored.append((None, detail))  # type: ignore[arg-type]
             continue
         # The keyword arm's highlighted version is preferred, but only when it
