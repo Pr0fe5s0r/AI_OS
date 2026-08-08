@@ -11,7 +11,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core import chunks, graph
+from packages.core import chunks, expand, graph
 from packages.core.llm import embed
 from packages.shared.schema import Hit, Lifecycle, Passage, Scope, SourceRef
 
@@ -56,6 +56,10 @@ class RetrievalConfig:
     period_to: datetime | None = None
     include_superseded: bool = False
     recall_multiplier: int = 4  # candidates fetched per arm before fusing
+    # Ask the model what words the answer would contain, and search those too.
+    # A caller that must be deterministic — a benchmark, a reproducible export
+    # — turns it off and gets exactly the old behaviour.
+    expand_query: bool = True
 
     def candidates(self) -> int:
         base = max(self.limit * self.recall_multiplier, self.limit)
@@ -77,6 +81,7 @@ class RetrievalConfig:
             "period_to": self.period_to.isoformat() if self.period_to else None,
             "include_superseded": self.include_superseded,
             "recall_multiplier": self.recall_multiplier,
+            "expand_query": self.expand_query,
         }
 
 
@@ -98,6 +103,10 @@ class Trace:
     filters: dict[str, Any]
     semantic: list[dict[str, Any]] = field(default_factory=list)
     keyword: list[dict[str, Any]] = field(default_factory=list)
+    # Terms the model suggested and the keyword arm was additionally run on.
+    # Recorded because a result nobody can attribute to a query is not
+    # explainable, and expansion adds queries the user never typed.
+    expanded: list[str] = field(default_factory=list)
     fused: list[dict[str, Any]] = field(default_factory=list)
     returned: list[str] = field(default_factory=list)
     timings_ms: dict[str, int] = field(default_factory=dict)
@@ -180,7 +189,12 @@ def _filters(scope: Scope, cfg: RetrievalConfig) -> tuple[str, dict[str, Any]]:
     return " AND ".join(clauses), params
 
 
-def _keep_the_exact_matches(group: list[Passage], slots: int = 2, keep: int = 5) -> list[Passage]:
+def _keep_the_exact_matches(
+    group: list[Passage],
+    slots: int = 2,
+    keep: int = 5,
+    must_keep: set[str] | None = None,
+) -> list[Passage]:
     """Return a document's best passages, never dropping every exact match.
 
     The passage score is ``max(semantic, min(keyword * 2, 0.6))`` — a keyword-
@@ -200,12 +214,32 @@ def _keep_the_exact_matches(group: list[Passage], slots: int = 2, keep: int = 5)
     the reader gets to see where.
     """
     top = group[:keep]
-    if any(p.keyword > 0 for p in top):
+
+    # Passages the caller has named as one-per-hypothesis winners come first —
+    # see the expansion block, where each guessed term contributes its own best
+    # match rather than competing on rank with the others.
+    if must_keep:
+        named = [p for p in group if p.chunk_id in must_keep][:keep]
+        have = {p.chunk_id for p in named}
+        return (named + [p for p in top if p.chunk_id not in have])[:keep]
+
+    # The strongest lexical matches, whether or not the top already holds one.
+    #
+    # The first version asked "does the top-5 contain ANY keyword match" and
+    # returned early if so. That is satisfied by a passage matching a common
+    # word — one scored 0.698 on "Harry Potter", which appears on nearly every
+    # page — while the passages naming Hedwig were still cut. A weak match
+    # present is not the same as the best match present.
+    best = sorted(
+        (p for p in group if p.keyword > 0), key=lambda p: p.keyword, reverse=True
+    )[:slots]
+    if not best:
         return top
-    exact = [p for p in group if p.keyword > 0][:slots]
-    if not exact:
+    have = {p.chunk_id for p in top}
+    missing = [p for p in best if p.chunk_id not in have]
+    if not missing:
         return top
-    return (top[: max(0, keep - len(exact))] + exact) or top
+    return top[: max(0, keep - len(missing))] + missing
 
 
 async def search(
@@ -260,6 +294,16 @@ async def search_traced(
     # loop. A vector store outage degrades the call to keyword-only rather
     # than failing it — but the trace says so, because a degraded answer that
     # looks identical to a healthy one is the worst kind.
+    # Started here so its model call overlaps the embedding rather than
+    # following it. Both are network-bound and neither needs the other, so run
+    # together the expansion costs almost no wall-clock. It touches no database
+    # session, which is why it is safe to run as a task alongside this one.
+    expansion = (
+        asyncio.ensure_future(expand.terms(query))
+        if cfg.expand_query and expand.enabled()
+        else None
+    )
+
     mark = time.perf_counter()
     semantic: list[dict[str, Any]] = []
     try:
@@ -304,6 +348,48 @@ async def search_traced(
     # --- keyword arm ----------------------------------------------------
     mark = time.perf_counter()
     passages = await chunks.keyword_search(session, scope, query, limit=k)
+
+    # The question as asked, then the words the answer would probably contain.
+    #
+    # Only the keyword arm is expanded. The semantic arm already generalises —
+    # that is what an embedding does — and re-embedding a guess would be paying
+    # a second provider call to blur the query. What the keyword arm cannot do
+    # is match a word the question never used, and that is exactly the gap:
+    # "Harry owl name" shares no word with the 182 passages saying "Hedwig".
+    #
+    # Appended, never substituted. Every result of the original query is still
+    # here and still scored the same way; these are extra candidates, and a
+    # term the store does not contain simply returns nothing.
+    expanded_terms: list[str] = []
+    # expansion term -> the chunk it matched best. One slot per hypothesis.
+    per_term_best: dict[str, str] = {}
+    if expansion is not None:
+        try:
+            expanded_terms = await expansion
+        except Exception:
+            expanded_terms = []
+        seen_chunks = {row["chunk_id"] for row in passages}
+        for term in expanded_terms:
+            try:
+                extra = await chunks.keyword_search(session, scope, term, limit=k)
+            except Exception:
+                continue
+            # The best passage for THIS term is remembered by term, not pooled.
+            #
+            # Pooling them and taking the highest-ranked lets one common term
+            # crowd out every other hypothesis: expanding "Harry owl name" gave
+            # "Hedwig", "snowy owl" and "Harry Potter", and "Harry Potter" —
+            # which appears on nearly every page — scored 1.000 and took both
+            # reserved slots off the contents page. Hedwig, the actual answer,
+            # was cut again. Each guess is a separate question and gets its own
+            # look.
+            if extra:
+                per_term_best[term] = extra[0]["chunk_id"]
+            for row in extra:
+                if row["chunk_id"] not in seen_chunks:
+                    seen_chunks.add(row["chunk_id"])
+                    passages.append(row)
+    trace.expanded = list(expanded_terms)
     rank_by_id: dict[str, float] = {}
     excerpt_by_id: dict[str, str] = {}
     best_keyword_chunk: dict[str, str] = {}
@@ -387,7 +473,9 @@ async def search_traced(
         # "7. Deliverables" while quoting text from the connectors section,
         # which is a citation pointing at the wrong place — worse than no
         # citation, because it looks checkable and is not.
-        ranked_passages = _keep_the_exact_matches(per_item.get(row.item_id, []))
+        ranked_passages = _keep_the_exact_matches(
+            per_item.get(row.item_id, []), must_keep=set(per_term_best.values())
+        )
         winner = ranked_passages[0] if ranked_passages else None
         detail = {
             "item_id": row.item_id,

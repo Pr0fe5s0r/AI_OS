@@ -1033,7 +1033,16 @@ async def _where_the_words_are(
         # is: a hint pointing at a document the agent was not given is not a
         # hint, it is a dead end it will spend a round on.
         hits = await search(
-            session, scope, question, RetrievalConfig(limit=limit, item_ids=tuple(trees))
+            session,
+            scope,
+            question,
+            # No expansion. This hint decides which sections the agent READS,
+            # and guessed terms widen it: expanding "Server requirement" to
+            # "hardware, specification" pulled a novel back into a server
+            # question, and agentic went from 7s to 88s reading what the extra
+            # terms found. The agent has hybrid_search of its own for when the
+            # hint is not enough — one-shot search is where a guess pays.
+            RetrievalConfig(limit=limit, item_ids=tuple(trees), expand_query=False),
         )
     except Exception:
         # A hint that cannot be produced is not an error. The agent navigates
@@ -2220,7 +2229,13 @@ async def navigate(
                     session,
                     scope,
                     found_query,
-                    RetrievalConfig(limit=5, item_ids=tuple(by_id)),
+                    # No expansion here. The agent has already CHOSEN these
+                    # words — that is what the tool is for — so asking a model
+                    # what else to look for is guessing at a deliberate query.
+                    # Measured: agentic went from 5s to 70s once every search
+                    # the agent made spent its own expansion call, and the
+                    # cache cannot help because each of its queries is new.
+                    RetrievalConfig(limit=5, item_ids=tuple(by_id), expand_query=False),
                 )
                 pairs = [(p, h) for h in hybrid_hits for p in h.passages]
                 pairs.sort(key=lambda pr: pr[0].score, reverse=True)
