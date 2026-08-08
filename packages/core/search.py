@@ -212,6 +212,13 @@ def _keep_the_exact_matches(
     the cap would move every ranking in the system to fix one; this leaves the
     order alone and only guarantees that if a document matched a word exactly,
     the reader gets to see where.
+
+    Permanent, and deliberately not configurable. It arrived with query
+    expansion and reads like part of it — ``must_keep`` comes from the
+    expansion block — but it is a correctness fix, not a recall feature. With
+    QUERY_EXPANSION=false that set is empty and the keyword slots below carry
+    the guarantee alone. tests/test_exact_match_fusion.py pins both paths, so
+    do not fold this into the expansion switch.
     """
     top = group[:keep]
 
