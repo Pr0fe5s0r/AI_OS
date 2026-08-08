@@ -63,10 +63,20 @@ _CLEAN = re.compile(r"[^\w\s'-]")
 
 
 def enabled() -> bool:
-    """On by default. It is one model call, it runs concurrently with the
-    embedding, and it is cached per question — so the common case costs
-    nothing measurable, and the case it fixes is otherwise unanswerable."""
-    return os.getenv("QUERY_EXPANSION", "true").lower() in ("1", "true", "yes")
+    """Off by default, and the default is the interesting part.
+
+    It works: with it on, every benchmark query answered correctly, including
+    the terse one neither arm could reach. The cost is precision, and it is
+    not a rounding error — the guessed terms are real words, so they match in
+    documents the question was not about. "Server requirement" expanded to
+    "hardware, specification", found both in a novel, and cited three
+    documents where it had cited one. A wider citation list reads as a worse
+    answer even when the answer is right.
+
+    So this is left to the operator rather than assumed: on for a store of
+    short, keyword-poor queries, off for one where the sources are read.
+    """
+    return os.getenv("QUERY_EXPANSION", "false").lower() in ("1", "true", "yes")
 
 
 def _asked(question: str) -> set[str]:
