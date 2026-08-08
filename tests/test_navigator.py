@@ -810,3 +810,64 @@ def test_a_pdf_is_never_treated_as_already_transcribed():
             assert "_is_a_picture" in line or "if not _already_transcribed" in line, (
                 f"unguarded use of _already_transcribed: {line.strip()}"
             )
+
+
+def test_the_first_reading_round_stays_in_one_document():
+    """Read one document before deciding you need another.
+
+    read_section takes ONE doc per call, so a model that wants three documents
+    issues three calls in a single round -- and on a generic question it does.
+    Measured on a six-document store asked "what are the two surfaces of the
+    user experience?": five sections arrived within 0.2s of each other, from
+    the vision document, a casino SOW, and the one that actually answered. Two
+    of the three contributed nothing and were still cited.
+
+    The ranking was already in the prompt and stated firmly. Instruction alone
+    did not hold, so the first reading round is limited to the best-ranked
+    document asked for. 77.1s -> 6.5s, same answer.
+    """
+    import inspect
+
+    from packages.core import navigator
+
+    source = inspect.getsource(navigator.navigate)
+    assert "held back" in source
+
+    # FIRST round only. Gated on nothing having been read yet, so the very next
+    # round may read anything -- this buys ordering, not exclusion.
+    held = source[source.index("Which document the first round") :]
+    assert "if not read:" in held[: held.index("finished = False")]
+
+
+def test_a_held_back_document_is_deferred_rather_than_refused():
+    """A tool result the model cannot act on is how a walk stalls.
+
+    The deferred call has to come back as something it can read AND retry, or
+    the sections it had already chosen are lost and it must navigate again.
+    """
+    import inspect
+
+    from packages.core import navigator
+
+    source = inspect.getsource(navigator.navigate)
+    # The whole block, not just the sentence — the reply and the id that
+    # carries it are the two halves of the same guarantee.
+    block = source[source.index("if first_document and doc_id in deferred") :][:900]
+    assert "ask for these sections again" in block
+    assert "will be read" in block
+    # It is answered on its own tool_call_id: the protocol requires one reply
+    # per call, and a skipped id hangs the exchange.
+    assert "tool_call_id" in block
+
+
+def test_the_best_ranked_document_is_the_one_that_is_read():
+    """Of the documents asked for at once, the one served is the one routing
+    put highest -- not whichever the model happened to list first. A document
+    routing never ranked sorts last rather than crashing the lookup."""
+    import inspect
+
+    from packages.core import navigator
+
+    source = inspect.getsource(navigator.navigate)
+    assert "by_rank = {doc: n for n, doc in enumerate(routing.order)}" in source
+    assert "min(distinct, key=lambda d: by_rank.get(d, len(by_rank)))" in source

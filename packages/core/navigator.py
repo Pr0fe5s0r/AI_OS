@@ -1864,6 +1864,52 @@ async def navigate(
             }
         )
 
+        # Which document the first round of reading is allowed to touch.
+        #
+        # read_section takes ONE doc per call, so a model that wants three
+        # documents issues three calls in one round — and that is what it does.
+        # Measured on a six-document store, asked "what are the two surfaces of
+        # the user experience?": five sections arrived within 0.2s of each
+        # other, from the vision document, a casino SOW and the document that
+        # actually answered. Two of the three contributed nothing and were
+        # still cited. The question carries no distinctive word, so every
+        # document looked equally plausible from its title alone.
+        #
+        # The ranking was already in the prompt, and stated firmly ("Start with
+        # the first one. Do NOT read from a document far down this list to
+        # 'check' it"). Instruction was not enough, so the first reading round
+        # is held to one document — the best-ranked one it asked for.
+        #
+        # Deliberately only the FIRST round, and deliberately not a filter:
+        # nothing is hidden, every document stays in the catalogue, and the
+        # very next round may read any of them. All this buys is that the agent
+        # reads ONE document before concluding it needs another — which is what
+        # the ranking was telling it to do anyway.
+        if not read:
+            wanted = [
+                str(json.loads(c["arguments"] or "{}").get("doc") or "")
+                for c in calls
+                if c["name"] == "read_section"
+            ]
+            distinct = [d for d in dict.fromkeys(wanted) if d]
+            if len(distinct) > 1:
+                by_rank = {doc: n for n, doc in enumerate(routing.order)}
+                first_document = min(distinct, key=lambda d: by_rank.get(d, len(by_rank)))
+                deferred = [d for d in distinct if d != first_document]
+                record(
+                    Step(
+                        round_number,
+                        "held back",
+                        f"{len(deferred)} other document(s) until one is read",
+                    )
+                )
+            else:
+                first_document = ""
+                deferred = []
+        else:
+            first_document = ""
+            deferred = []
+
         finished = False
         for call in calls:
             try:
@@ -2503,6 +2549,27 @@ async def navigate(
                 continue
 
             doc_id = str(args.get("doc") or "")
+
+            # Deferred, not refused, and told plainly why — a tool result the
+            # model cannot act on is how a walk stalls. It keeps the section
+            # ids, so taking this up costs one round and no re-navigation.
+            if first_document and doc_id in deferred:
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call["id"],
+                        "content": (
+                            "Not yet — read one document before opening several. "
+                            f"You asked for {len(deferred) + 1} documents at once; "
+                            "the highest-ranked one is being read now and its text "
+                            "follows. If it answers the question, answer. If it "
+                            "does not, ask for these sections again in the next "
+                            "round and they will be read."
+                        ),
+                    }
+                )
+                continue
+
             # One id or several. Reading three sections used to cost three
             # rounds — three model round trips — to fetch text the loop could
             # have returned in one. Measured: pages 3325, 3326 and 3327 read
