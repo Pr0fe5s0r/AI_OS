@@ -76,7 +76,31 @@ def enabled() -> bool:
     So this is left to the operator rather than assumed: on for a store of
     short, keyword-poor queries, off for one where the sources are read.
     """
-    return os.getenv("QUERY_EXPANSION", "false").lower() in ("1", "true", "yes")
+    return _flag("QUERY_EXPANSION", "false")
+
+
+def enabled_in_navigator() -> bool:
+    """On by default, and for the opposite reason to the switch above.
+
+    The two callers are not paying the same price. A hybrid search SHOWS what
+    it retrieved, so a guessed term that matches somewhere irrelevant becomes
+    a document in the citation list and the reader sees a worse answer. The
+    navigator's searches are internal: expansion moves which SECTION the agent
+    is pointed at, and the agent then reads it and decides. A bad suggestion
+    costs a read; a missing one costs the answer.
+
+    Measured with expansion off everywhere, on a store holding the novels:
+    "Harry owl name" walked to two sections, never reached the passage naming
+    her, and answered that the owl has no name. "What is the name of Harry
+    Potter's owl?" answered Hedwig in 3.41s. The gap between those two is
+    exactly what expansion closes, and closing it here costs the citation list
+    nothing, because these searches are never what gets cited.
+    """
+    return _flag("QUERY_EXPANSION_AGENTIC", "true")
+
+
+def _flag(name: str, default: str) -> bool:
+    return os.getenv(name, default).lower() in ("1", "true", "yes")
 
 
 def _asked(question: str) -> set[str]:
@@ -138,8 +162,13 @@ async def terms(question: str) -> list[str]:
     Off the event loop because the client blocks. Intended to be gathered with
     the semantic arm, which is also network-bound — run that way it adds no
     wall-clock to a search that was already waiting on an embedding.
+
+    Deliberately does NOT consult a switch. There are two of them now and this
+    function cannot know which caller it is serving, so the decision belongs
+    at the call site — reaching for a switch here would silently make one of
+    the two wrong.
     """
-    if not enabled() or not question.strip():
+    if not question.strip():
         return []
     return list(await asyncio.to_thread(_cached, question))
 

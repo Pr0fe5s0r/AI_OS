@@ -210,8 +210,83 @@ def _words(text: str) -> list[str]:
     return re.findall(r"[a-z0-9]+", text.lower())
 
 
+# A capitalised word of three letters or more: the SHAPE of a proper noun,
+# which on its own proves nothing — every sentence starts with one.
+_CAPITALISED = re.compile(r"\b[A-Z][A-Za-z'’-]{2,}\b")
+
+
+def _used_as_a_name(text: str, word: str) -> bool:
+    """Does ``word`` appear capitalised MID-SENTENCE in this text?
+
+    This is what separates a name from a sentence opener, and the separation
+    has to be made in the PASSAGE rather than in the answer: a one-word answer
+    is its own sentence, so "Hedwig" and "Receipts" look identical there. In
+    running prose they do not. "carried Errol to Hedwig's cage" keeps its
+    capital in the middle of a clause because it is a name; "Receipts must be
+    filed." only has one because of where the sentence began.
+
+    Caught by an existing test, which is the only reason this is not simply
+    capitalisation: crediting "Receipts must be" to the one passage using
+    those words is the precise failure the strict rule was written to prevent.
+    """
+    for match in re.finditer(r"\b" + re.escape(word) + r"\b", text):
+        gap = text[: match.start()]
+        before = gap.rstrip()
+        if not before:
+            continue  # the very start of the passage
+        if before[-1] in ".!?:":
+            continue  # a new sentence, or the tail of a label
+        # A line break is a sentence boundary too, and missing that credited
+        # "Receipts must be" to the handbook: the passage reads
+        # "## 1. Expenses\n\nReceipts must be submitted…", so the word after
+        # the heading looked mid-sentence purely because headings carry no
+        # full stop. Any heading, list item or table cell would do the same.
+        if "\n" in gap[len(before) :]:
+            continue
+        return True
+    return False
+
+
+def _distinctive(
+    answer_words: list[str], text: str, passages: list[tuple[Passage, Hit]]
+) -> bool:
+    """Does this short answer carry something specific enough to trace?
+
+    A figure qualifies — a headcount, an amount, a date, a code.
+
+    So does a name, which the digit test alone used to miss. Asked "Harry owl
+    name" the store answered "Hedwig", correctly, off a passage sitting
+    directly beneath it, and the UI stamped the answer "not supported by the
+    collection" in red because a name contains no digit. Names, places and
+    product identifiers are the other large class of short factual answer, and
+    the warning firing on all of them is the warning firing on nothing.
+
+    A capital letter alone would be far too weak — "Yes", "The second one" and
+    "Receipts must be" are capitalised too, purely by position. So a candidate
+    has to clear two bars, and neither is negotiable:
+
+      used as a name   It appears capitalised MID-SENTENCE in the passage, not
+                       merely at the start of one. See _used_as_a_name.
+
+      unambiguous      Exactly one of the retrieved passages uses it that way.
+                       If two do there is no way to tell which was read, and
+                       the caller's whole contract is that a citation points
+                       somewhere checkable.
+
+    Both calibrate against the collection in front of them rather than against
+    a stop-word list nobody maintains: "Hedwig" is a name in one passage of
+    five; "yes" is a name in none of them, and nobody had to enumerate it.
+    """
+    if any(char.isdigit() for word in answer_words for char in word):
+        return True
+    for word in dict.fromkeys(_CAPITALISED.findall(text)):
+        if sum(1 for passage, _ in passages if _used_as_a_name(passage.text, word)) == 1:
+            return True
+    return False
+
+
 def _attribute_short(
-    answer_words: list[str], passages: list[tuple[Passage, Hit]]
+    answer_words: list[str], text: str, passages: list[tuple[Passage, Hit]]
 ) -> Citation | None:
     """Attribute an answer too short to have a seven-word run in it.
 
@@ -227,16 +302,16 @@ def _attribute_short(
     guessing would attach a checkable-looking reference to the wrong place —
     which is worse than leaving it uncited.
 
-    It also needs something DISTINCTIVE to match on, which in practice means a
-    figure: a headcount, an amount, a date, a code. A short answer made only of
-    ordinary words — "Receipts must be", "yes", "the second one" — shares those
-    words with half the collection, so matching on them would credit a passage
-    that merely uses the same vocabulary. Those stay uncited, which is the case
-    the strict rule was written for in the first place.
+    It also needs something DISTINCTIVE to match on — a figure or a name; see
+    _distinctive. A short answer made only of ordinary words — "Receipts must
+    be", "yes", "the second one" — shares those words with half the collection,
+    so matching on them would credit a passage that merely uses the same
+    vocabulary. Those stay uncited, which is the case the strict rule was
+    written for in the first place.
 
     Whole words, not substrings: "96" must not match "960".
     """
-    if not any(char.isdigit() for word in answer_words for char in word):
+    if not _distinctive(answer_words, text, passages):
         return None
 
     found: list[tuple[int, Passage, Hit]] = []
@@ -270,7 +345,7 @@ def _attribute(text: str, passages: list[tuple[Passage, Hit]]) -> Citation | Non
     """
     answer_words = _words(text)
     if len(answer_words) < _SHINGLE:
-        return _attribute_short(answer_words, passages)
+        return _attribute_short(answer_words, text, passages)
     shingles = {
         " ".join(answer_words[i : i + _SHINGLE])
         for i in range(len(answer_words) - _SHINGLE + 1)

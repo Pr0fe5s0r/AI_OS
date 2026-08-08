@@ -13,7 +13,7 @@ from typing import Any
 from sqlalchemy import text as sql
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core import graph, tree
+from packages.core import expand, graph, tree
 from packages.core import routing as route
 from packages.core.search import RetrievalConfig, Trace, new_trace_id, search_traced
 from packages.shared.schema import Hit, Lifecycle, Passage, Scope, SourceRef
@@ -1036,13 +1036,31 @@ async def _where_the_words_are(
             session,
             scope,
             question,
-            # No expansion. This hint decides which sections the agent READS,
-            # and guessed terms widen it: expanding "Server requirement" to
-            # "hardware, specification" pulled a novel back into a server
-            # question, and agentic went from 7s to 88s reading what the extra
-            # terms found. The agent has hybrid_search of its own for when the
-            # hint is not enough — one-shot search is where a guess pays.
-            RetrievalConfig(limit=limit, item_ids=tuple(trees), expand_query=False),
+            # Expansion belongs HERE, of all the places it could go.
+            #
+            # This hint decides which sections the agent reads first, and that
+            # single decision is what the terse-query failure turns on: with
+            # expansion off everywhere, "Harry owl name" walked to two
+            # sections, never reached the one naming her, and answered that
+            # the owl has no name — while "What is the name of Harry Potter's
+            # owl?" answered Hedwig in 3.41s off the same store. The hint
+            # needs the word "Hedwig" to point anywhere useful, and only
+            # expansion can supply it.
+            #
+            # It was turned off here once, for a real reason: expanding
+            # "Server requirement" to "hardware, specification" pulled a novel
+            # into a server question and agentic went 7s -> 88s. Two things
+            # have changed since that measurement. The hint now emits a
+            # ready-made call for the BEST-RANKED document only rather than
+            # every document the words appear in, so a stray term can no
+            # longer drag an unrelated document into the walk; and the search
+            # the agent runs for itself, below, stays unexpanded, which is
+            # where most of that 88s actually came from.
+            RetrievalConfig(
+                limit=limit,
+                item_ids=tuple(trees),
+                expand_query=expand.enabled_in_navigator(),
+            ),
         )
     except Exception:
         # A hint that cannot be produced is not an error. The agent navigates

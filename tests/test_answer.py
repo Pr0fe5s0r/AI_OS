@@ -434,7 +434,7 @@ def test_a_short_answer_matches_whole_words_not_substrings():
         passages=[],
     )
     passage = Passage(chunk_id="c", ordinal=0, heading="h", text="The figure is 960.", score=1.0)
-    assert _attribute_short(["96"], [(passage, hit)]) is None
+    assert _attribute_short(["96"], "96", [(passage, hit)]) is None
 
 
 def test_a_short_answer_of_ordinary_words_is_not_credited():
@@ -455,7 +455,12 @@ def test_a_short_answer_of_ordinary_words_is_not_credited():
     passage = Passage(
         chunk_id="c", ordinal=0, heading="h", text="Receipts must be filed.", score=1.0
     )
-    assert _attribute_short(["receipts", "must", "be"], [(passage, hit)]) is None
+    assert (
+        _attribute_short(
+            ["receipts", "must", "be"], "Receipts must be", [(passage, hit)]
+        )
+        is None
+    )
 
 
 def test_a_passage_is_located_on_the_page_it_came_from():
@@ -513,3 +518,82 @@ async def test_hybrid_citations_carry_their_page_too(db, monkeypatch):
     # decides where the passage starts, and pinning that would be testing the
     # chunker's size budget rather than this.
     assert result.citations[0].page is not None, "a hybrid citation must know its page"
+
+
+def _passages(*texts: str) -> list[tuple[Passage, Hit]]:
+    """The (passage, hit) pairs _distinctive scores against, one per text."""
+    out: list[tuple[Passage, Hit]] = []
+    for n, text in enumerate(texts):
+        passage = _passage(f"c{n}", text)
+        out.append((passage, _hit(f"i{n}", f"Doc {n}", [passage])))
+    return out
+
+def test_a_name_is_distinctive_enough_to_cite():
+    """A correct one-word answer must not be stamped "not supported".
+
+    Measured in the browser: asked "Harry owl name" the store answered
+    "Hedwig", correctly, off a passage sitting directly beneath it -- and the
+    UI printed "not supported by the collection" in red, because the
+    distinctiveness test was "contains a digit" and a name contains none.
+    Names, places and product identifiers are the other large class of short
+    factual answer; a warning that fires on all of them fires on nothing.
+    """
+    from packages.core.answer import _distinctive, _words
+
+    passages = _passages(
+        "Ron asked the cat. Definitely an owl?",
+        "A gray owl was soaring down toward Hermione.",
+        "Harry carried Errol to Hedwig's cage.",
+    )
+    assert _distinctive(_words("Hedwig"), "Hedwig", passages) is True
+
+
+def test_a_capital_letter_alone_is_not_enough():
+    """"Yes" and "The second one" are capitalised too. A candidate name must
+    also be RARE -- present in exactly one of the retrieved passages -- which
+    is the caller's own unambiguity rule applied per word, and calibrates
+    against the collection instead of a stop-word list nobody maintains."""
+    from packages.core.answer import _distinctive, _words
+
+    passages = _passages(
+        "Yes, said Ron, yes of course.",
+        "Yes -- Harry nodded. Yes.",
+        "She said yes before he finished.",
+    )
+    assert _distinctive(_words("Yes"), "Yes", passages) is False
+
+
+def test_an_ambiguous_name_stays_uncited():
+    """If two passages both contain the name there is no way to tell which was
+    used, and guessing attaches a checkable-looking reference to the wrong
+    place -- worse than leaving it uncited.
+
+    Asserted against _attribute_short rather than _distinctive, because that
+    is where the guarantee actually lives: _distinctive only decides whether
+    the answer carries something traceable at all, and the caller then demands
+    that exactly one passage hold every word of it. Testing the gate instead
+    of the contract would pass while the contract broke.
+    """
+    from packages.core.answer import _attribute_short, _words
+
+    passages = _passages(
+        "Harry carried Errol to Hedwig's cage.",
+        "Ron watched as Hedwig nipped his ear.",
+    )
+    assert _attribute_short(_words("Hedwig"), "Hedwig", passages) is None
+
+    # One passage, and it is credited.
+    single = _passages(
+        "Harry carried Errol to Hedwig's cage.",
+        "A gray owl soared down toward Hermione.",
+    )
+    assert _attribute_short(_words("Hedwig"), "Hedwig", single) is not None
+
+
+def test_a_figure_is_still_distinctive():
+    """The original rule, unchanged: the headcount case this path was written
+    for keeps working."""
+    from packages.core.answer import _distinctive, _words
+
+    passages = _passages("The team grew to 96 people.", "No numbers here at all.")
+    assert _distinctive(_words("96"), "96", passages) is True

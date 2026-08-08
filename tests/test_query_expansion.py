@@ -113,18 +113,49 @@ async def test_a_provider_failure_costs_the_terms_and_nothing_else(monkeypatch):
     assert await expand.terms("anything at all") == []
 
 
-@pytest.mark.asyncio
-async def test_it_can_be_turned_off_two_ways(monkeypatch):
-    """An operator switch, and a per-call one. A benchmark or a reproducible
-    export needs retrieval that does not consult a model about the query."""
-    monkeypatch.setenv("QUERY_EXPANSION", "false")
-    assert expand.enabled() is False
-    assert await expand.terms("a question") == []
+def test_the_two_callers_have_separate_switches(monkeypatch):
+    """Hybrid and the navigator are not paying the same price, so one switch
+    could not serve both.
 
+    A hybrid search SHOWS what it retrieved: a guessed term matching somewhere
+    irrelevant becomes a document in the citation list, and the reader sees a
+    worse answer. That is why it defaults off. The navigator's hint is
+    internal — expansion moves which section the agent is pointed at, the
+    agent reads it and decides, and nothing there is ever cited. A missing
+    suggestion there costs the answer outright: with expansion off everywhere,
+    "Harry owl name" answered that the owl has no name.
+    """
+    monkeypatch.delenv("QUERY_EXPANSION", raising=False)
+    monkeypatch.delenv("QUERY_EXPANSION_AGENTIC", raising=False)
+    assert expand.enabled() is False, "hybrid defaults off — precision"
+    assert expand.enabled_in_navigator() is True, "the hint defaults on — recall"
+
+    # Each moves without disturbing the other.
     monkeypatch.setenv("QUERY_EXPANSION", "true")
+    monkeypatch.setenv("QUERY_EXPANSION_AGENTIC", "false")
     assert expand.enabled() is True
-    assert DEFAULT.expand_query is True
+    assert expand.enabled_in_navigator() is False
+
+
+def test_a_caller_can_override_the_switch_in_both_directions(monkeypatch):
+    """None follows the operator switch; True and False override it. A
+    benchmark or a reproducible export needs retrieval that does not consult a
+    model about the query, whatever the environment says."""
+    assert DEFAULT.expand_query is None, "plain hybrid follows the switch"
     assert RetrievalConfig(expand_query=False).expand_query is False
+    assert RetrievalConfig(expand_query=True).expand_query is True
+
+
+@pytest.mark.asyncio
+async def test_terms_does_not_consult_a_switch_itself(monkeypatch):
+    """There are two switches now and this function cannot know which caller
+    it serves. Reaching for one here would silently make the other wrong, so
+    the decision stays at the call site."""
+    import inspect
+
+    source = inspect.getsource(expand.terms)
+    assert "enabled()" not in source
+    assert "enabled_in_navigator()" not in source
 
 
 def test_the_terms_are_recorded_on_the_trace():
@@ -137,3 +168,27 @@ def test_the_terms_are_recorded_on_the_trace():
     assert trace.expanded == []
     trace.expanded = ["Hedwig"]
     assert trace.expanded == ["Hedwig"]
+
+
+def test_the_hint_expands_but_the_agents_own_search_does_not():
+    """The two navigator searches are not the same kind of query.
+
+    The hint is a guess ABOUT the question, made before anything has been
+    read, and it decides which sections the agent opens first -- the one
+    decision the terse-query failure turns on.
+
+    The search the agent runs for itself is different: it has already CHOSEN
+    those words, which is what the tool is for, so asking a model what else to
+    look for is guessing at a deliberate query. It also cannot be cached,
+    because every query the agent writes is new -- measured at 5s -> 70s when
+    every agent search spent its own expansion call.
+    """
+    import inspect
+
+    from packages.core import navigator
+
+    hint = inspect.getsource(navigator._where_the_words_are)
+    assert "expand_query=expand.enabled_in_navigator()" in hint
+
+    walk = inspect.getsource(navigator)
+    assert "RetrievalConfig(limit=5, item_ids=tuple(by_id), expand_query=False)" in walk

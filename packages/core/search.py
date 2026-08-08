@@ -57,9 +57,10 @@ class RetrievalConfig:
     include_superseded: bool = False
     recall_multiplier: int = 4  # candidates fetched per arm before fusing
     # Ask the model what words the answer would contain, and search those too.
-    # A caller that must be deterministic — a benchmark, a reproducible export
-    # — turns it off and gets exactly the old behaviour.
-    expand_query: bool = True
+    # None follows the QUERY_EXPANSION operator switch; True and False override
+    # it either way. A caller that must be deterministic — a benchmark, a
+    # reproducible export — passes False and gets exactly the old behaviour.
+    expand_query: bool | None = None
 
     def candidates(self) -> int:
         base = max(self.limit * self.recall_multiplier, self.limit)
@@ -312,10 +313,14 @@ async def search_traced(
     # following it. Both are network-bound and neither needs the other, so run
     # together the expansion costs almost no wall-clock. It touches no database
     # session, which is why it is safe to run as a task alongside this one.
+    # None means "follow the operator switch", which is what a plain hybrid
+    # search does. The navigator sets it explicitly instead: it has its own
+    # switch, because expansion is worth different things to the two callers.
+    wants_expansion = (
+        expand.enabled() if cfg.expand_query is None else cfg.expand_query
+    )
     expansion = (
-        asyncio.ensure_future(expand.terms(query))
-        if cfg.expand_query and expand.enabled()
-        else None
+        asyncio.ensure_future(expand.terms(query)) if wants_expansion else None
     )
 
     mark = time.perf_counter()
