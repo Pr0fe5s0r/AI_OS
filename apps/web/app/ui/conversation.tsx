@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import * as api from "../api";
 import type { Point } from "../data";
 import { cx } from "../data";
@@ -170,6 +170,121 @@ export function renderAnswer(
   return out;
 }
 
+/** The citations under an answer, as the pressable row Query has always had. */
+export function CitationChips({
+  citations,
+  onOpen,
+}: {
+  citations: api.Citation[];
+  onOpen: (c: api.Citation) => void;
+}) {
+  if (citations.length === 0) return null;
+  return (
+    <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-edge pt-2.5">
+      <Label>from</Label>
+      {citations.map((c) => (
+        <button
+          key={c.chunk_id}
+          onClick={() => onOpen(c)}
+          className="max-w-[15rem] truncate rounded-md border border-accent/30 bg-accent/10 px-2 py-0.5 font-mono text-2xs text-accentSoft transition hover:border-accent/60"
+        >
+          [{c.marker}] {c.heading || c.title}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** The passage a citation points at, and the page it was read off.
+ *
+ *  The page picture is the whole argument for transcribing a table with
+ *  vision: the transcription is a CLAIM, and the page is the thing that claim
+ *  can be checked against. Without it a transcription is just a more confident
+ *  guess — which is why this panel belongs on any page that shows an answer,
+ *  not only on the one it happened to be written for. */
+export function FocusPanel({
+  focus,
+  onClose,
+}: {
+  focus: api.Citation;
+  onClose: () => void;
+}) {
+  return (
+    <div className="absolute inset-x-0 bottom-0 z-10 border-t border-edgeStrong bg-raised/97 backdrop-blur">
+      <div className="mx-auto max-w-3xl px-6 py-4">
+        <div className="mb-2 flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="truncate text-xs font-medium text-ink">{focus.title}</div>
+            {focus.heading && (
+              <div className="truncate font-mono text-2xs text-accentSoft">{focus.heading}</div>
+            )}
+          </div>
+          <button
+            onClick={onClose}
+            className="shrink-0 rounded-md border border-edge px-2 py-0.5 font-mono text-2xs text-subtle transition hover:text-ink"
+          >
+            close
+          </button>
+        </div>
+        <div className="flex gap-4">
+          <p className="max-h-56 min-w-0 flex-1 overflow-y-auto whitespace-pre-wrap text-xs leading-relaxed text-muted">
+            {focus.text}
+          </p>
+
+          {focus.page ? (
+            <figure className="hidden w-44 shrink-0 sm:block">
+              <a
+                href={api.pageImageUrl(focus.item_id, focus.page)}
+                target="_blank"
+                rel="noreferrer"
+                className="relative block overflow-hidden rounded-md border border-warn/30 transition hover:border-warn/60"
+              >
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={api.pageImageUrl(focus.item_id, focus.page)}
+                  alt={`Page ${focus.page} of ${focus.title}`}
+                  // The API is a different origin and the session is a cookie:
+                  // without this the browser sends no credentials and the page
+                  // comes back 401.
+                  crossOrigin="use-credentials"
+                  className="max-h-56 w-full bg-canvas object-cover object-top"
+                />
+                {/* Where on the page it was read from. A thumbnail says
+                    "somewhere in here"; the box says "this row". Percentages,
+                    so the same numbers hold at any drawn size. Outline and tint
+                    only — dimming the rest behind each box turned the page
+                    black once there were four of them. */}
+                {(focus.regions || []).map((box, index) => (
+                  <span
+                    key={index}
+                    title={box.label || "read from here"}
+                    className="pointer-events-none absolute rounded-[2px] border-2 border-warn bg-warn/25 ring-1 ring-canvas/70"
+                    style={{
+                      left: `${box.x}%`,
+                      top: `${box.y}%`,
+                      width: `${box.w}%`,
+                      height: `${box.h}%`,
+                    }}
+                  />
+                ))}
+              </a>
+              <figcaption className="mt-1 text-center font-mono text-2xs text-warn">
+                read from page {focus.page}
+                {(focus.regions?.length ?? 0) > 0 && (
+                  <span className="block text-subtle">
+                    {focus.regions!.length} highlighted{" "}
+                    {focus.regions!.length === 1 ? "area" : "areas"}
+                  </span>
+                )}
+              </figcaption>
+            </figure>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /** The evidence, in full, under the answer it produced.
  *
  *  Chips with the passage in a tooltip were not showing a citation, they were
@@ -248,6 +363,10 @@ export function LiveTrail({ live }: { live: Live }) {
 
 // --------------------------------- engine ---------------------------------
 
+// How many turns a saved conversation keeps. Enough to be a history,
+// bounded because every turn carries its passages and the quota is small.
+const HISTORY_LIMIT = 40;
+
 export type AskSettings = {
   limit?: number;
   mode?: api.AskMode;
@@ -260,7 +379,7 @@ export type AskSettings = {
  *  on a rewrite at ~30s and returns a bare 500 with nothing in the API log;
  *  agentic answers run 20-35s, astride that ceiling. A stream is bytes from the
  *  first step onward, so no idle timeout can fire. */
-export function useConversation(collectionId: string | undefined) {
+export function useConversation(collectionId: string | undefined, storageKey?: string) {
   const [turns, setTurns] = useState<Turn[]>([]);
   const [live, setLive] = useState<Live | null>(null);
   const [pending, setPending] = useState<string | null>(null);
@@ -324,10 +443,60 @@ export function useConversation(collectionId: string | undefined) {
     [collectionId]
   );
 
+  // ------------------------------- history -------------------------------
+  //
+  // Kept per view AND per collection. A question is only meaningful against
+  // the documents it was asked of, so carrying one collection's answers into
+  // another would show evidence that is not in the store you are looking at.
+
+  const key = storageKey ? `conversation:${storageKey}:${collectionId ?? "workspace"}` : "";
+
+  useEffect(() => {
+    if (!key) return;
+    try {
+      const saved = window.localStorage.getItem(key);
+      setTurns(saved ? (JSON.parse(saved) as Turn[]) : []);
+    } catch {
+      // Unreadable or from an older shape. An unusable history is not worth an
+      // error on screen; it is worth starting clean.
+      setTurns([]);
+    }
+  }, [key]);
+
+  useEffect(() => {
+    if (!key) return;
+    // Never write an EMPTY history from here. Restoring is asynchronous: this
+    // effect runs once with the pre-restore state still in hand, and saving
+    // then would wipe the very turns being loaded. Clearing is explicit, and
+    // removes the key itself.
+    if (turns.length === 0) return;
+    try {
+      window.localStorage.setItem(
+        key,
+        JSON.stringify(
+          // `raw` is the entire API response per turn and by far the largest
+          // thing here — dropped rather than risking the 5MB quota, which
+          // fails by throwing and would cost the whole history to keep one
+          // JSON dump nobody reloads a page to read.
+          turns.slice(-HISTORY_LIMIT).map(({ raw: _raw, ...rest }) => rest)
+        )
+      );
+    } catch {
+      /* quota, or private mode. The conversation on screen is unaffected. */
+    }
+  }, [turns, key]);
+
   const clear = useCallback(() => {
     setTurns([]);
     setError(null);
-  }, []);
+    if (key) {
+      try {
+        window.localStorage.removeItem(key);
+      } catch {
+        /* nothing to do — the turns are already gone from the screen */
+      }
+    }
+  }, [key]);
 
   return { turns, live, pending, busy, error, ask, clear, setError };
 }

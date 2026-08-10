@@ -3,7 +3,12 @@
 import { useEffect, useRef, useState } from "react";
 import * as api from "../api";
 import { Point, cx, ms } from "../data";
-import { renderAnswer, useConversation } from "../ui/conversation";
+import {
+  CitationChips,
+  FocusPanel,
+  renderAnswer,
+  useConversation,
+} from "../ui/conversation";
 import { Card, Chip, HeatLegend, Label, Mono, ScoreBar, VectorField } from "../ui/kit";
 
 const STARTER_QUESTIONS = [
@@ -32,7 +37,7 @@ export function Query({ active }: { active: string | null }) {
   // these are one conversation with different controls around it, and two
   // implementations of it is how the Playground ended up with a worse
   // rendering of citations than this page had all along.
-  const { turns, live, pending, busy, error, ask: run } = useConversation(collectionId);
+  const { turns, live, pending, busy, error, ask: run } = useConversation(collectionId, "query");
   // Remembered rather than reset every visit: a retrieval preference is a
   // standing choice about how you want the store to work, not a per-question
   // one. Agentic is the default — it reaches the whole collection.
@@ -164,21 +169,7 @@ export function Query({ active }: { active: string | null }) {
                         </p>
                       )}
 
-                      {t.citations.length > 0 && (
-                        <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-edge pt-2.5">
-                          <Label>from</Label>
-                          {t.citations.map((c) => (
-                            <button
-                              key={c.chunk_id}
-                              onClick={() => setFocus(c)}
-                              title={c.text.slice(0, 300)}
-                              className="max-w-[15rem] truncate rounded-md border border-accent/30 bg-accent/10 px-2 py-0.5 font-mono text-2xs text-accentSoft transition hover:border-accent/60"
-                            >
-                              [{c.marker}] {c.heading || c.title}
-                            </button>
-                          ))}
-                        </div>
-                      )}
+                      <CitationChips citations={t.citations} onOpen={setFocus} />
                     </div>
                   </div>
                 )}
@@ -402,96 +393,7 @@ export function Query({ active }: { active: string | null }) {
         {/* The passage behind a citation, in full. The point of a citation is
             that it can be checked, which means the actual text has to be
             reachable without leaving the answer. */}
-        {focus && (
-          <div className="absolute inset-x-0 bottom-0 z-10 border-t border-edgeStrong bg-raised/97 backdrop-blur">
-            <div className="mx-auto max-w-3xl px-6 py-4">
-              <div className="mb-2 flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="truncate text-xs font-medium text-ink">{focus.title}</div>
-                  {focus.heading && (
-                    <div className="truncate font-mono text-2xs text-accentSoft">
-                      {focus.heading}
-                    </div>
-                  )}
-                </div>
-                <button
-                  onClick={() => setFocus(null)}
-                  className="shrink-0 rounded-md border border-edge px-2 py-0.5 font-mono text-2xs text-subtle transition hover:text-ink"
-                >
-                  close
-                </button>
-              </div>
-              <div className="flex gap-4">
-                <p className="max-h-56 min-w-0 flex-1 overflow-y-auto whitespace-pre-wrap text-xs leading-relaxed text-muted">
-                  {focus.text}
-                </p>
-
-                {/* The page it was read off, beside the words that were read
-                    off it. This is the whole argument for transcribing a table
-                    with vision: the transcription is a claim, and the page is
-                    the thing the claim can be checked against. Without this
-                    picture it would just be a more confident guess. */}
-                {focus.page ? (
-                  <figure className="hidden w-44 shrink-0 sm:block">
-                    <a
-                      href={api.pageImageUrl(focus.item_id, focus.page)}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="relative block overflow-hidden rounded-md border border-warn/30 transition hover:border-warn/60"
-                    >
-                      {/* eslint-disable-next-line @next/next/no-img-element */}
-                      <img
-                        src={api.pageImageUrl(focus.item_id, focus.page)}
-                        alt={`Page ${focus.page} of ${focus.title}`}
-                        // The API is a different origin and the session is a
-                        // cookie: without this the browser sends no credentials
-                        // and the page comes back 401.
-                        crossOrigin="use-credentials"
-                        className="max-h-56 w-full bg-canvas object-cover object-top"
-                      />
-
-                      {/* Where on the page the answer was read from. A page
-                          thumbnail says "somewhere in here"; the box says
-                          "this row". Positioned in percentages, which is why
-                          the reader reports them that way — the same numbers
-                          hold at any size the picture is drawn.
-
-                          Only ever drawn when the reader placed something
-                          confidently. An empty overlay is the correct result
-                          for a page it read as a whole. */}
-                      {(focus.regions || []).map((box, index) => (
-                        <span
-                          key={index}
-                          title={box.label || `read from here`}
-                          // Outline and tint only. Dimming the rest of the page
-                          // behind each box looked better with one box and
-                          // turned the page black with four, because every box
-                          // laid down its own full-page shade.
-                          className="pointer-events-none absolute rounded-[2px] border-2 border-warn bg-warn/25 ring-1 ring-canvas/70"
-                          style={{
-                            left: `${box.x}%`,
-                            top: `${box.y}%`,
-                            width: `${box.w}%`,
-                            height: `${box.h}%`,
-                          }}
-                        />
-                      ))}
-                    </a>
-                    <figcaption className="mt-1 text-center font-mono text-2xs text-warn">
-                      read from page {focus.page}
-                      {(focus.regions?.length ?? 0) > 0 && (
-                        <span className="block text-subtle">
-                          {focus.regions!.length} highlighted{" "}
-                          {focus.regions!.length === 1 ? "area" : "areas"}
-                        </span>
-                      )}
-                    </figcaption>
-                  </figure>
-                ) : null}
-              </div>
-            </div>
-          </div>
-        )}
+        {focus && <FocusPanel focus={focus} onClose={() => setFocus(null)} />}
       </div>
 
       {/* the retrieval space */}

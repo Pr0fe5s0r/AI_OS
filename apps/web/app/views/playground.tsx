@@ -5,7 +5,8 @@ import * as api from "../api";
 import { cx, ms } from "../data";
 import type { Document } from "../data";
 import {
-  Evidence,
+  CitationChips,
+  FocusPanel,
   LiveTrail,
   renderAnswer,
   useConversation,
@@ -237,14 +238,14 @@ export function Playground({ active }: { active: string | null }) {
     ask,
     clear,
     setError,
-  } = useConversation(active ?? undefined);
+  } = useConversation(active ?? undefined, "playground");
   // Search returns passages rather than prose, so it is not a turn in the
   // conversation. Its response is shown on its own.
   const [searchRun, setSearchRun] = useState<{ q: string; raw: api.RawRun } | null>(null);
   const [openJson, setOpenJson] = useState<number | null>(null);
-  // Which passage is expanded, and on which turn. Keyed by both because two
-  // turns can cite the same marker and mean different passages.
-  const [openCite, setOpenCite] = useState<{ turn: number; marker: number } | null>(null);
+  // The passage being examined. One at a time and page-level rather than
+  // per-turn: it is a reading pane, and two open at once is two things to read.
+  const [focus, setFocus] = useState<api.Citation | null>(null);
   const foot = useRef<HTMLDivElement | null>(null);
 
   const answering = endpoint === "answer";
@@ -328,7 +329,7 @@ export function Playground({ active }: { active: string | null }) {
   return (
     <div className="flex h-full min-h-0">
       {/* ------------------------------ console ------------------------------ */}
-      <div className="flex min-w-0 flex-1 flex-col">
+      <div className="relative flex min-w-0 flex-1 flex-col">
         <div className="flex items-center justify-between gap-3 px-6 pb-3 pt-5">
           <div className="flex items-center gap-2">
             <h1 className="text-base font-semibold text-ink">Playground</h1>
@@ -403,13 +404,7 @@ export function Playground({ active }: { active: string | null }) {
                         turn.grounded ? "text-ink" : "text-muted"
                       )}
                     >
-                      {renderAnswer(turn.answer, turn.citations, (c) =>
-                        setOpenCite(
-                          openCite?.turn === n && openCite.marker === c.marker
-                            ? null
-                            : { turn: n, marker: c.marker }
-                        )
-                      )}
+                      {renderAnswer(turn.answer, turn.citations, setFocus)}
                     </p>
                     {!turn.grounded && (
                       <p className="mt-2 border-t border-hot/20 pt-2 font-mono text-2xs text-hot">
@@ -420,17 +415,7 @@ export function Playground({ active }: { active: string | null }) {
                       <p className="mt-2 font-mono text-2xs text-hot">{turn.degraded}</p>
                     )}
 
-                    <Evidence
-                      citations={turn.citations}
-                      open={openCite?.turn === n ? openCite.marker : null}
-                      onToggle={(marker) =>
-                        setOpenCite(
-                          openCite?.turn === n && openCite.marker === marker
-                            ? null
-                            : { turn: n, marker }
-                        )
-                      }
-                    />
+                    <CitationChips citations={turn.citations} onOpen={setFocus} />
 
                     <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-edge pt-2.5">
                       <Chip>{turn.mode}</Chip>
@@ -475,6 +460,8 @@ export function Playground({ active }: { active: string | null }) {
             </div>
           )}
         </div>
+
+        {focus && <FocusPanel focus={focus} onClose={() => setFocus(null)} />}
 
         {/* composer */}
         <div className="border-t border-edge px-6 py-4">
