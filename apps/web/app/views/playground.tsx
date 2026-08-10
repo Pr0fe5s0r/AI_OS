@@ -147,6 +147,99 @@ const PRESETS: Preset[] = [
   },
 ];
 
+/** Turn the `[n]` markers in an answer into references you can press.
+ *
+ *  A marker that resolves to nothing is REMOVED rather than shown: it points
+ *  at no passage, so leaving it in place would be a reference the reader
+ *  cannot follow — worse than none, because it looks checkable. */
+function renderAnswer(
+  text: string,
+  citations: api.Citation[],
+  onOpen: (marker: number) => void
+): React.ReactNode[] {
+  const byMarker = new Map(citations.map((c) => [c.marker, c]));
+  const out: React.ReactNode[] = [];
+  const pattern = /\[(\d+)\]/g;
+  let last = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = pattern.exec(text)) !== null) {
+    if (match.index > last) out.push(text.slice(last, match.index));
+    const cited = byMarker.get(Number(match[1]));
+    out.push(
+      cited ? (
+        <button
+          key={`${match.index}-${match[1]}`}
+          onClick={() => onOpen(cited.marker)}
+          title={`${cited.title}${cited.heading ? ` › ${cited.heading}` : ""}`}
+          className="mx-0.5 rounded bg-accent/20 px-1 align-super font-mono text-[0.6rem] text-accentSoft transition hover:bg-accent/40"
+        >
+          {match[1]}
+        </button>
+      ) : (
+        <span key={`${match.index}-x`} />
+      )
+    );
+    last = match.index + match[0].length;
+  }
+  if (last < text.length) out.push(text.slice(last));
+  return out;
+}
+
+/** The evidence, in full, under the answer it produced.
+ *
+ *  Chips with the passage in a tooltip were not showing a citation — they were
+ *  hiding one. The whole claim this store makes is that an answer can be
+ *  checked, and a claim you have to hover to verify is not one anybody checks.
+ *  So the passage text is on the page, with the document, the heading and the
+ *  page it was read off. */
+function Evidence({
+  citations,
+  open,
+  onToggle,
+}: {
+  citations: api.Citation[];
+  open: number | null;
+  onToggle: (marker: number) => void;
+}) {
+  if (citations.length === 0) return null;
+  return (
+    <div className="mt-3 space-y-1.5 border-t border-edge pt-3">
+      <Label>evidence · {citations.length}</Label>
+      {citations.map((c) => {
+        const showing = open === c.marker;
+        return (
+          <div key={c.marker} className="rounded-lg border border-edge bg-canvas/60">
+            <button
+              type="button"
+              onClick={() => onToggle(c.marker)}
+              className="flex w-full items-baseline gap-2 px-2.5 py-2 text-left"
+            >
+              <span className="rounded bg-accent/20 px-1 font-mono text-[0.6rem] text-accentSoft">
+                {c.marker}
+              </span>
+              <span className="min-w-0 flex-1 truncate text-2xs text-ink">
+                {c.title}
+                {c.heading ? <span className="text-subtle"> › {c.heading}</span> : null}
+              </span>
+              {c.page != null && <Mono className="text-2xs text-subtle">p{c.page}</Mono>}
+              <Mono className="text-2xs text-subtle">{c.score.toFixed(3)}</Mono>
+            </button>
+            <p
+              className={cx(
+                "whitespace-pre-wrap border-t border-edge px-2.5 py-2 text-2xs leading-relaxed text-muted",
+                showing ? "" : "line-clamp-2"
+              )}
+            >
+              {c.text}
+            </p>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function Toggle({
   on,
   onChange,
@@ -236,6 +329,9 @@ export function Playground({ active }: { active: string | null }) {
     }[]
   >([]);
   const [openJson, setOpenJson] = useState<number | null>(null);
+  // Which passage is expanded, and on which turn. Keyed by both because two
+  // turns can cite the same marker and mean different passages.
+  const [openCite, setOpenCite] = useState<{ turn: number; marker: number } | null>(null);
   const foot = useRef<HTMLDivElement | null>(null);
 
   const answering = endpoint === "answer";
@@ -435,7 +531,13 @@ export function Playground({ active }: { active: string | null }) {
                             turn.outcome.grounded ? "text-ink" : "text-muted"
                           )}
                         >
-                          {turn.outcome.answer}
+                          {renderAnswer(turn.outcome.answer, turn.outcome.citations, (marker) =>
+                            setOpenCite(
+                              openCite?.turn === n && openCite.marker === marker
+                                ? null
+                                : { turn: n, marker }
+                            )
+                          )}
                         </p>
                         {!turn.outcome.grounded && (
                           <p className="mt-2 border-t border-hot/20 pt-2 font-mono text-2xs text-hot">
@@ -451,17 +553,26 @@ export function Playground({ active }: { active: string | null }) {
                       </p>
                     )}
 
+                    {turn.outcome && (
+                      <Evidence
+                        citations={turn.outcome.citations}
+                        open={openCite?.turn === n ? openCite.marker : null}
+                        onToggle={(marker) =>
+                          setOpenCite(
+                            openCite?.turn === n && openCite.marker === marker
+                              ? null
+                              : { turn: n, marker }
+                          )
+                        }
+                      />
+                    )}
+
                     <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-edge pt-2.5">
                       <Chip>{turn.mode}</Chip>
                       {turn.vision && <Chip>vision</Chip>}
                       {turn.behaviourId !== "default" && <Chip>{turn.behaviourId}</Chip>}
                       {turn.docs > 0 && <Chip>{turn.docs} docs</Chip>}
                       <Mono className="text-2xs text-subtle">{ms(turn.raw.ms)}</Mono>
-                      {turn.outcome?.citations.map((c) => (
-                        <Chip key={c.marker} title={c.text.slice(0, 300)}>
-                          [{c.marker}] {c.title}
-                        </Chip>
-                      ))}
                       <Chip
                         onClick={() => setOpenJson(openJson === n ? null : n)}
                         active={openJson === n}
@@ -541,7 +652,11 @@ export function Playground({ active }: { active: string | null }) {
       </div>
 
       {/* ---------------------------- run settings ---------------------------- */}
-      <aside className="w-80 shrink-0 overflow-y-auto border-l border-edge bg-elevated/20 px-4 py-5">
+      {/* Hidden on a narrow viewport rather than squeezed. At 704px the rail
+          and the console were both unusable — the answer wrapped to four words
+          a line while the settings were still cut off. A panel that fits
+          nothing is worse than a panel you scroll to. */}
+      <aside className="hidden w-80 shrink-0 overflow-y-auto border-l border-edge bg-elevated/20 px-4 py-5 lg:block">
         <p className="mb-3 text-xs font-semibold text-ink">Run settings</p>
 
         <div className="rounded-xl border border-edge bg-elevated/50 p-3">
