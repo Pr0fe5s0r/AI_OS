@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import * as api from "../api";
 import { Point, cx, ms } from "../data";
+import { renderAnswer, useConversation } from "../ui/conversation";
 import { Card, Chip, HeatLegend, Label, Mono, ScoreBar, VectorField } from "../ui/kit";
 
 const STARTER_QUESTIONS = [
@@ -22,148 +23,16 @@ const STARTER_QUESTIONS = [
  *  citations are clickable and land on the passage, and an answer that cites
  *  nothing is marked as unsupported instead of being presented as fact. Prose
  *  you cannot trace is the thing worth refusing, not prose. */
-type Turn = {
-  question: string;
-  mode: api.AskMode;
-  answer: string;
-  citations: api.Citation[];
-  grounded: boolean;
-  matches: Point[];
-  tookMs: number;
-  traceId: string;
-  degraded: string | null;
-};
-
-/** Turn the [n] markers in an answer into buttons that open the passage.
- *
- *  Split rather than replaced into HTML: the answer is model output, and
- *  putting model output through anything that interprets markup is how a
- *  store starts rendering whatever a document happened to contain. */
-function renderAnswer(
-  text: string,
-  citations: api.Citation[],
-  onOpen: (c: api.Citation) => void
-): React.ReactNode[] {
-  const byMarker = new Map(citations.map((c) => [c.marker, c]));
-  const out: React.ReactNode[] = [];
-  const pattern = /\[(\d+)\]/g;
-  let last = 0;
-  let match: RegExpExecArray | null;
-
-  while ((match = pattern.exec(text)) !== null) {
-    if (match.index > last) out.push(text.slice(last, match.index));
-    const cited = byMarker.get(Number(match[1]));
-    out.push(
-      cited ? (
-        <button
-          key={`${match.index}-${match[1]}`}
-          onClick={() => onOpen(cited)}
-          title={cited.heading || cited.title}
-          className="mx-0.5 rounded bg-accent/20 px-1 align-super font-mono text-[0.6rem] text-accentSoft transition hover:bg-accent/40"
-        >
-          {match[1]}
-        </button>
-      ) : (
-        // A marker the answer invented. It points at nothing, so it is not
-        // shown as though it were checkable.
-        <span key={`${match.index}-x`} />
-      )
-    );
-    last = match.index + match[0].length;
-  }
-  if (last < text.length) out.push(text.slice(last));
-  return out;
-}
-
-/** One line in the live activity trail while an answer is being produced. */
-type Activity = { kind: "status" | "tool"; text: string; ok?: boolean };
-
-/** Everything the current in-flight turn has reported so far. */
-type Live = { activity: Activity[]; reasoning: string; draft: string };
-
-const EMPTY_LIVE: Live = { activity: [], reasoning: "", draft: "" };
-
-function describeCall(event: Extract<api.StreamEvent, { type: "tool_call" }>): string {
-  if (event.tool === "read_section") return `Reading section ${event.args.section ?? ""}`.trim();
-  if (event.tool === "hybrid_search") return `Searching “${event.args.query ?? ""}”`;
-  if (event.tool === "write_answer") return `Writing from ${event.args.passages ?? 0} passages`;
-  return `Calling ${event.tool}`;
-}
-
-function describeResult(event: Extract<api.StreamEvent, { type: "tool_result" }>): string {
-  if (event.tool === "read_section") {
-    if (!event.ok) return event.detail || "section not found";
-    const where = event.title ? `${event.title} › ${event.heading}` : event.heading || "";
-    return `${where} [${event.marker}]`;
-  }
-  if (event.tool === "hybrid_search") {
-    if (!event.ok) return "nothing new";
-    const heads = event.headings?.length ? `: ${event.headings.join(", ")}` : "";
-    return `found ${event.count} passage${event.count === 1 ? "" : "s"}${heads}`;
-  }
-  return "";
-}
-
-/** Fold one streamed event into the running live state. Pure, so the reducer
- *  reads as the event schema does and the render stays a plain projection. */
-function reduceLive(cur: Live, event: api.StreamEvent): Live {
-  switch (event.type) {
-    case "start":
-      return {
-        ...cur,
-        activity: [
-          ...cur.activity,
-          {
-            kind: "status",
-            text:
-              event.mode === "hybrid"
-                ? "Searching passages…"
-                : `Reading ${event.documents ?? 0} document${event.documents === 1 ? "" : "s"} · ${event.sections ?? 0} sections`,
-          },
-        ],
-      };
-    case "retrieved":
-      return {
-        ...cur,
-        activity: [
-          ...cur.activity,
-          {
-            kind: "status",
-            text: `${event.documents} document${event.documents === 1 ? "" : "s"}, ${event.passages} passage${event.passages === 1 ? "" : "s"}`,
-          },
-        ],
-      };
-    case "thinking":
-      return { ...cur, reasoning: cur.reasoning + event.delta };
-    case "tool_call":
-      return { ...cur, activity: [...cur.activity, { kind: "tool", text: describeCall(event) }] };
-    case "tool_result":
-      return {
-        ...cur,
-        activity: [...cur.activity, { kind: "tool", ok: event.ok, text: describeResult(event) }],
-      };
-    case "token":
-      return { ...cur, draft: cur.draft + event.delta };
-    case "answer":
-      return { ...cur, draft: event.text };
-    case "degraded":
-      return { ...cur, activity: [...cur.activity, { kind: "status", text: event.reason }] };
-    default:
-      return cur;
-  }
-}
-
 export function Query({ active }: { active: string | null }) {
   const collectionId = active ?? undefined;
   const [question, setQuestion] = useState("");
-  const [turns, setTurns] = useState<Turn[]>([]);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [focus, setFocus] = useState<api.Citation | null>(null);
-  // The in-flight turn's live trail, and the question that started it — shown
-  // while the answer is produced, cleared when it lands as a finished turn.
-  const [live, setLive] = useState<Live | null>(null);
-  const [pending, setPending] = useState<string | null>(null);
+  // The conversation itself — turns, the in-flight live trail, and the ask that
+  // produces both — is shared with the Playground. See ui/conversation.tsx:
+  // these are one conversation with different controls around it, and two
+  // implementations of it is how the Playground ended up with a worse
+  // rendering of citations than this page had all along.
+  const { turns, live, pending, busy, error, ask: run } = useConversation(collectionId);
   // Remembered rather than reset every visit: a retrieval preference is a
   // standing choice about how you want the store to work, not a per-question
   // one. Agentic is the default — it reaches the whole collection.
@@ -192,38 +61,8 @@ export function Query({ active }: { active: string | null }) {
   async function ask(text?: string) {
     const q = (text ?? question).trim();
     if (!q || busy) return;
-    setBusy(true);
-    setError(null);
     setQuestion("");
-    setPending(q);
-    setLive(EMPTY_LIVE);
-    try {
-      // Streamed: every step lands in `live` as it happens, and the resolved
-      // outcome is the same shape the non-streaming ask returned.
-      const out = await api.askStream(collectionId, q, 8, mode, (event) =>
-        setLive((cur) => reduceLive(cur ?? EMPTY_LIVE, event))
-      );
-      setTurns((t) => [
-        ...t,
-        {
-          question: q,
-          mode: out.mode,
-          answer: out.answer,
-          citations: out.citations,
-          grounded: out.grounded,
-          matches: out.matches,
-          tookMs: out.tookMs,
-          traceId: out.traceId,
-          degraded: out.degraded,
-        },
-      ]);
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setBusy(false);
-      setLive(null);
-      setPending(null);
-    }
+    await run(q, { mode });
   }
 
   return (

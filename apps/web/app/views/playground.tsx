@@ -4,6 +4,12 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import * as api from "../api";
 import { cx, ms } from "../data";
 import type { Document } from "../data";
+import {
+  Evidence,
+  LiveTrail,
+  renderAnswer,
+  useConversation,
+} from "../ui/conversation";
 import { Chip, Code, Label, Mono } from "../ui/kit";
 
 type Endpoint = "search" | "answer";
@@ -147,99 +153,6 @@ const PRESETS: Preset[] = [
   },
 ];
 
-/** Turn the `[n]` markers in an answer into references you can press.
- *
- *  A marker that resolves to nothing is REMOVED rather than shown: it points
- *  at no passage, so leaving it in place would be a reference the reader
- *  cannot follow — worse than none, because it looks checkable. */
-function renderAnswer(
-  text: string,
-  citations: api.Citation[],
-  onOpen: (marker: number) => void
-): React.ReactNode[] {
-  const byMarker = new Map(citations.map((c) => [c.marker, c]));
-  const out: React.ReactNode[] = [];
-  const pattern = /\[(\d+)\]/g;
-  let last = 0;
-  let match: RegExpExecArray | null;
-
-  while ((match = pattern.exec(text)) !== null) {
-    if (match.index > last) out.push(text.slice(last, match.index));
-    const cited = byMarker.get(Number(match[1]));
-    out.push(
-      cited ? (
-        <button
-          key={`${match.index}-${match[1]}`}
-          onClick={() => onOpen(cited.marker)}
-          title={`${cited.title}${cited.heading ? ` › ${cited.heading}` : ""}`}
-          className="mx-0.5 rounded bg-accent/20 px-1 align-super font-mono text-[0.6rem] text-accentSoft transition hover:bg-accent/40"
-        >
-          {match[1]}
-        </button>
-      ) : (
-        <span key={`${match.index}-x`} />
-      )
-    );
-    last = match.index + match[0].length;
-  }
-  if (last < text.length) out.push(text.slice(last));
-  return out;
-}
-
-/** The evidence, in full, under the answer it produced.
- *
- *  Chips with the passage in a tooltip were not showing a citation — they were
- *  hiding one. The whole claim this store makes is that an answer can be
- *  checked, and a claim you have to hover to verify is not one anybody checks.
- *  So the passage text is on the page, with the document, the heading and the
- *  page it was read off. */
-function Evidence({
-  citations,
-  open,
-  onToggle,
-}: {
-  citations: api.Citation[];
-  open: number | null;
-  onToggle: (marker: number) => void;
-}) {
-  if (citations.length === 0) return null;
-  return (
-    <div className="mt-3 space-y-1.5 border-t border-edge pt-3">
-      <Label>evidence · {citations.length}</Label>
-      {citations.map((c) => {
-        const showing = open === c.marker;
-        return (
-          <div key={c.marker} className="rounded-lg border border-edge bg-canvas/60">
-            <button
-              type="button"
-              onClick={() => onToggle(c.marker)}
-              className="flex w-full items-baseline gap-2 px-2.5 py-2 text-left"
-            >
-              <span className="rounded bg-accent/20 px-1 font-mono text-[0.6rem] text-accentSoft">
-                {c.marker}
-              </span>
-              <span className="min-w-0 flex-1 truncate text-2xs text-ink">
-                {c.title}
-                {c.heading ? <span className="text-subtle"> › {c.heading}</span> : null}
-              </span>
-              {c.page != null && <Mono className="text-2xs text-subtle">p{c.page}</Mono>}
-              <Mono className="text-2xs text-subtle">{c.score.toFixed(3)}</Mono>
-            </button>
-            <p
-              className={cx(
-                "whitespace-pre-wrap border-t border-edge px-2.5 py-2 text-2xs leading-relaxed text-muted",
-                showing ? "" : "line-clamp-2"
-              )}
-            >
-              {c.text}
-            </p>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
 function Toggle({
   on,
   onChange,
@@ -311,23 +224,23 @@ export function Playground({ active }: { active: string | null }) {
   const [library, setLibrary] = useState<Document[]>([]);
   const [limit, setLimit] = useState(8);
   const [q, setQ] = useState("");
-  const [busy, setBusy] = useState(false);
-  // What the walk is doing right now. A progress line that never moves is
-  // indistinguishable from a hang, and an agentic answer is a long half minute.
-  const [progress, setProgress] = useState("");
   const [showCode, setShowCode] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [turns, setTurns] = useState<
-    {
-      q: string;
-      outcome: api.AnswerOutcome | null;
-      raw: api.RawRun;
-      mode: api.AskMode;
-      vision: boolean;
-      behaviourId: string;
-      docs: number;
-    }[]
-  >([]);
+  // The conversation is the SAME conversation Query & chat runs — same stream,
+  // same turns, same live trail, same rendering of an answer and its evidence.
+  // The Playground only puts settings around it. See ui/conversation.tsx.
+  const {
+    turns,
+    live,
+    pending,
+    busy,
+    error,
+    ask,
+    clear,
+    setError,
+  } = useConversation(active ?? undefined);
+  // Search returns passages rather than prose, so it is not a turn in the
+  // conversation. Its response is shown on its own.
+  const [searchRun, setSearchRun] = useState<{ q: string; raw: api.RawRun } | null>(null);
   const [openJson, setOpenJson] = useState<number | null>(null);
   // Which passage is expanded, and on which turn. Keyed by both because two
   // turns can cite the same marker and mean different passages.
@@ -340,23 +253,23 @@ export function Playground({ active }: { active: string | null }) {
   const visionApplies = answering && mode === "agentic";
 
   useEffect(() => {
-    let live = true;
+    let alive = true;
     api
       .documents(active ?? undefined, 100)
-      .then((d) => live && setLibrary(d))
-      .catch(() => live && setLibrary([]));
+      .then((d) => alive && setLibrary(d))
+      .catch(() => alive && setLibrary([]));
     // The filter names document ids, and those belong to the collection that
     // was selected. Cleared rather than remapped: a filter pointing at another
     // collection's documents would silently return nothing.
     setDocs([]);
     return () => {
-      live = false;
+      alive = false;
     };
   }, [active]);
 
   useEffect(() => {
     foot.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [turns.length, busy]);
+  }, [turns.length, busy, live]);
 
   const path = useMemo(() => {
     if (!answering) {
@@ -390,63 +303,26 @@ export function Playground({ active }: { active: string | null }) {
 
   async function go() {
     if (!q.trim() || busy) return;
-    setBusy(true);
-    setError(null);
     const asked = q.trim();
-    const settings = { mode, vision: visionApplies && vision, behaviourId, docs: docs.length };
-    const options = { docs, vision: visionApplies ? vision : undefined, behaviour };
-    const started = performance.now();
-    setProgress("");
-    try {
-      if (!answering) {
-        // Search returns in well under a second and its JSON is the point, so
-        // it goes out as a plain request.
-        const raw = await api.run(path, active ?? undefined);
-        setTurns((t) => [...t, { q: asked, outcome: null, raw, ...settings }]);
-      } else {
-        // Answering STREAMS, and not for the animation.
-        //
-        // The blocking route dies at this proxy: Next gives up on a rewrite at
-        // ~30s and returns a bare 500 with nothing in the API log — the same
-        // failure already recorded in next.config.js for uploads. Agentic
-        // answers measured 20-35s on a six-document store, which is exactly
-        // astride that ceiling, and the first real run here hit it at 30.05s.
-        // A stream is bytes from the first step onward, so no idle timeout ever
-        // fires — which is why the rest of this app already streams.
-        // Kept from the terminal `done` event, which carries exactly the
-        // payload /api/answer returns — so the JSON shown below is still the
-        // API's own response and not something this page composed.
-        let body: unknown = null;
-        const outcome = await api.askStream(
-          active ?? undefined,
-          asked,
-          limit,
-          mode,
-          (event) => {
-            if (event.type === "start") setProgress("navigating…");
-            else if (event.type === "retrieved")
-              setProgress(`${event.documents} documents, ${event.passages} passages`);
-            else if (event.type === "tool_call") setProgress(`${event.tool}…`);
-            else if (event.type === "token") setProgress("writing…");
-            else if (event.type === "done") body = event.answer;
-          },
-          options
-        );
-        const raw: api.RawRun = {
-          status: 200,
-          ms: performance.now() - started,
-          ok: true,
-          body,
-        };
-        setTurns((t) => [...t, { q: asked, outcome, raw, ...settings }]);
+    setError(null);
+    if (!answering) {
+      // Search is sub-second and its JSON is the point, so it goes out as a
+      // plain request rather than through the conversation.
+      try {
+        setSearchRun({ q: asked, raw: await api.run(path, active ?? undefined) });
+        setQ("");
+      } catch (e) {
+        setError((e as Error).message);
       }
-      setQ("");
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setProgress("");
-      setBusy(false);
+      return;
     }
+    setSearchRun(null);
+    setQ("");
+    await ask(asked, {
+      limit,
+      mode,
+      options: { docs, vision: visionApplies ? vision : undefined, behaviour },
+    });
   }
 
   return (
@@ -462,8 +338,8 @@ export function Playground({ active }: { active: string | null }) {
             <Chip active={showCode} onClick={() => setShowCode((s) => !s)} title="The request as curl">
               &lt;&gt; Get code
             </Chip>
-            {turns.length > 0 && (
-              <Chip onClick={() => setTurns([])} title="Clear this session">
+            {(turns.length > 0 || searchRun) && (
+              <Chip onClick={clear} title="Clear this session">
                 clear
               </Chip>
             )}
@@ -477,7 +353,7 @@ export function Playground({ active }: { active: string | null }) {
             </div>
           )}
 
-          {turns.length === 0 && !busy ? (
+          {turns.length === 0 && !searchRun && !busy ? (
             <div className="mx-auto max-w-3xl py-6">
               <h2 className="text-2xl font-semibold text-ink">Ask your collection</h2>
               <p className="mt-1.5 max-w-xl text-xs leading-relaxed text-subtle">
@@ -514,65 +390,54 @@ export function Playground({ active }: { active: string | null }) {
             <div className="mx-auto max-w-3xl space-y-4 py-2">
               {turns.map((turn, n) => (
                 <div key={n}>
-                  <p className="mb-2 text-right text-sm text-muted">{turn.q}</p>
+                  <p className="mb-2 text-right text-sm text-muted">{turn.question}</p>
                   <div
                     className={cx(
                       "rounded-xl border p-4",
-                      turn.outcome && !turn.outcome.grounded
-                        ? "border-hot/30 bg-hot/5"
-                        : "border-edge bg-elevated/50"
+                      turn.grounded ? "border-edge bg-elevated/50" : "border-hot/30 bg-hot/5"
                     )}
                   >
-                    {turn.outcome ? (
-                      <>
-                        <p
-                          className={cx(
-                            "whitespace-pre-wrap text-sm leading-relaxed",
-                            turn.outcome.grounded ? "text-ink" : "text-muted"
-                          )}
-                        >
-                          {renderAnswer(turn.outcome.answer, turn.outcome.citations, (marker) =>
-                            setOpenCite(
-                              openCite?.turn === n && openCite.marker === marker
-                                ? null
-                                : { turn: n, marker }
-                            )
-                          )}
-                        </p>
-                        {!turn.outcome.grounded && (
-                          <p className="mt-2 border-t border-hot/20 pt-2 font-mono text-2xs text-hot">
-                            not supported by the collection — nothing below was cited
-                          </p>
-                        )}
-                      </>
-                    ) : (
-                      <p className="font-mono text-2xs text-subtle">
-                        {turn.raw.ok
-                          ? "Passages only — Search does not write prose. The response is below."
-                          : `Request failed with ${turn.raw.status}.`}
+                    <p
+                      className={cx(
+                        "whitespace-pre-wrap text-sm leading-relaxed",
+                        turn.grounded ? "text-ink" : "text-muted"
+                      )}
+                    >
+                      {renderAnswer(turn.answer, turn.citations, (c) =>
+                        setOpenCite(
+                          openCite?.turn === n && openCite.marker === c.marker
+                            ? null
+                            : { turn: n, marker: c.marker }
+                        )
+                      )}
+                    </p>
+                    {!turn.grounded && (
+                      <p className="mt-2 border-t border-hot/20 pt-2 font-mono text-2xs text-hot">
+                        not supported by the collection — nothing below was cited
                       </p>
                     )}
-
-                    {turn.outcome && (
-                      <Evidence
-                        citations={turn.outcome.citations}
-                        open={openCite?.turn === n ? openCite.marker : null}
-                        onToggle={(marker) =>
-                          setOpenCite(
-                            openCite?.turn === n && openCite.marker === marker
-                              ? null
-                              : { turn: n, marker }
-                          )
-                        }
-                      />
+                    {turn.degraded && (
+                      <p className="mt-2 font-mono text-2xs text-hot">{turn.degraded}</p>
                     )}
+
+                    <Evidence
+                      citations={turn.citations}
+                      open={openCite?.turn === n ? openCite.marker : null}
+                      onToggle={(marker) =>
+                        setOpenCite(
+                          openCite?.turn === n && openCite.marker === marker
+                            ? null
+                            : { turn: n, marker }
+                        )
+                      }
+                    />
 
                     <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-edge pt-2.5">
                       <Chip>{turn.mode}</Chip>
-                      {turn.vision && <Chip>vision</Chip>}
-                      {turn.behaviourId !== "default" && <Chip>{turn.behaviourId}</Chip>}
-                      {turn.docs > 0 && <Chip>{turn.docs} docs</Chip>}
-                      <Mono className="text-2xs text-subtle">{ms(turn.raw.ms)}</Mono>
+                      {turn.settings?.vision && <Chip>vision</Chip>}
+                      {turn.settings?.behaviour ? <Chip>styled</Chip> : null}
+                      {(turn.settings?.docs ?? 0) > 0 && <Chip>{turn.settings?.docs} docs</Chip>}
+                      <Mono className="text-2xs text-subtle">{ms(turn.tookMs)}</Mono>
                       <Chip
                         onClick={() => setOpenJson(openJson === n ? null : n)}
                         active={openJson === n}
@@ -583,8 +448,8 @@ export function Playground({ active }: { active: string | null }) {
                     {openJson === n && (
                       <div className="mt-3">
                         <Code
-                          code={JSON.stringify(turn.raw.body, null, 2)}
-                          filename={`${turn.raw.status} · response.json`}
+                          code={JSON.stringify(turn.raw, null, 2)}
+                          filename="response.json"
                           lang="json"
                         />
                       </div>
@@ -592,9 +457,20 @@ export function Playground({ active }: { active: string | null }) {
                   </div>
                 </div>
               ))}
-              {busy && (
-                <p className="font-mono text-2xs text-subtle">{progress || "searching…"}</p>
+
+              {searchRun && (
+                <div>
+                  <p className="mb-2 text-right text-sm text-muted">{searchRun.q}</p>
+                  <Code
+                    code={JSON.stringify(searchRun.raw.body, null, 2)}
+                    filename={`${searchRun.raw.status} · response.json`}
+                    lang="json"
+                  />
+                </div>
               )}
+
+              {pending && <p className="mb-2 text-right text-sm text-muted">{pending}</p>}
+              {live && <LiveTrail live={live} />}
               <div ref={foot} />
             </div>
           )}
