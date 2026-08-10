@@ -566,14 +566,47 @@ function toAnswerOutcome(payload: RawAnswer, fallbackMode: AskMode): AnswerOutco
   };
 }
 
+/** Everything about an ask that is not the question itself.
+ *
+ *  Optional throughout and omitted from the URL when unset, so the request the
+ *  console sends stays the request it always sent unless something was actually
+ *  changed — a default that travels as an explicit parameter is a default
+ *  nobody can change later without breaking callers. */
+export type AskOptions = {
+  /** Restrict the answer to these documents. Empty = the store decides. */
+  docs?: string[];
+  /** Let the agent read a page as a picture. Off, a figure stops being
+   *  readable and the most expensive step in a walk is gone. */
+  vision?: boolean;
+  /** How the answer should be written. Style only — it cannot change what may
+   *  be said, which the server enforces rather than trusting. */
+  behaviour?: string;
+};
+
+/** The query string for an ask, shared by `ask` and the curl the console shows,
+ *  so what gets copied is what was actually sent. */
+export function askParams(
+  question: string,
+  limit: number,
+  mode: AskMode,
+  options: AskOptions = {}
+): string {
+  const params = new URLSearchParams({ q: question, limit: String(limit), mode });
+  for (const id of options.docs ?? []) params.append("doc", id);
+  if (options.vision === false) params.set("vision", "false");
+  if (options.behaviour?.trim()) params.set("behaviour", options.behaviour.trim());
+  return params.toString();
+}
+
 export async function ask(
   collectionId: string | undefined,
   question: string,
   limit = 8,
-  mode: AskMode = "agentic"
+  mode: AskMode = "agentic",
+  options: AskOptions = {}
 ): Promise<AnswerOutcome> {
   const payload = await call<RawAnswer>(
-    `/api/answer?q=${encodeURIComponent(question)}&limit=${limit}&mode=${mode}`,
+    `/api/answer?${askParams(question, limit, mode, options)}`,
     { collection: collectionId }
   );
   return toAnswerOutcome(payload, mode);

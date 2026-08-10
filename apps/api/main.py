@@ -53,6 +53,7 @@ from packages.core.db import Session
 from packages.core.graph import chunk_lineage as graph_lineage
 from packages.core.graph import chunk_neighbours as graph_neighbours
 from packages.core.keys import create_key, list_keys, revoke_key
+from packages.core.navigator import MAX_BEHAVIOUR_CHARS
 from packages.core.neighbours import collection_graph
 from packages.core.normalise import can_parse, supported
 from packages.core.pipeline import redis_settings
@@ -406,6 +407,24 @@ async def answer_question(
             "question is about."
         ),
     ),
+    vision: bool = Query(
+        True,
+        description=(
+            "Let the agent read a page as a picture when the text layer cannot "
+            "answer. Off, a figure stops being readable and a page-picture "
+            "question fails honestly rather than being answered from a caption "
+            "— but the single most expensive step in a walk is gone."
+        ),
+    ),
+    behaviour: str = Query(
+        "",
+        max_length=MAX_BEHAVIOUR_CHARS,
+        description=(
+            "How the answer should be WRITTEN — tone, length, formatting. It "
+            "cannot change what may be said: citing only what was read, and "
+            "saying so when the documents do not answer, are not negotiable."
+        ),
+    ),
     scope: Scope = Depends(workspace_scope),
     principal: dict[str, Any] = Depends(resolve_caller),
     session: AsyncSession = Depends(db),
@@ -442,7 +461,16 @@ async def answer_question(
     cfg = RetrievalConfig(limit=limit, sources=tuple(sources or ()))
     try:
         result, trace = await asyncio.wait_for(
-            answer(session, scope, q, cfg, mode=mode, item_ids=tuple(doc or ())),
+            answer(
+                session,
+                scope,
+                q,
+                cfg,
+                mode=mode,
+                item_ids=tuple(doc or ()),
+                vision=vision,
+                behaviour=behaviour,
+            ),
             timeout=ANSWER_DEADLINE_SECONDS,
         )
     except TimeoutError:

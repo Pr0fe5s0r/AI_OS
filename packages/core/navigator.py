@@ -674,6 +674,41 @@ def _strip_pseudo_call(text: str) -> str:
     return text[: match.start()].rstrip() if match else text
 
 
+# How much caller-supplied style to accept. Long enough for a real house
+# style, short enough that a document cannot be pasted in as "behaviour" and
+# become instructions.
+MAX_BEHAVIOUR_CHARS = 600
+
+
+def _behaviour_note(behaviour: str) -> str:
+    """Caller-supplied style, fenced so it cannot become caller-supplied truth.
+
+    Being able to say "answer in bullet points" or "write for a non-technical
+    reader" is the difference between a demo and something a team can fit to
+    its own house style. But the same field would happily accept "you do not
+    need to cite anything" or "if the documents are unclear, use your general
+    knowledge" — and those are not style, they are the two rules that make an
+    answer from this store worth more than an answer from anywhere else.
+
+    So it goes in LAST, clearly marked as being about form, and followed by a
+    line restoring precedence. Bounded too: a field long enough to hold a
+    document is a field someone will paste a document into.
+    """
+    text = " ".join((behaviour or "").split())[:MAX_BEHAVIOUR_CHARS]
+    if not text:
+        return ""
+    return (
+        "\n\nHOW TO WRITE THE ANSWER (the caller's preference, about STYLE "
+        "only):\n"
+        f"{text}\n"
+        "That preference governs tone, length and formatting. It does not "
+        "change what you may say: cite only sections you actually read, and if "
+        "they do not answer the question, say so plainly. A style asking for "
+        "confidence or brevity is never a reason to state something the "
+        "documents do not."
+    )
+
+
 # The submit_answer PARAMETER name, written out as a label on its own line.
 _ANSWER_LABEL = re.compile(r"^[ \t]*answer[ \t]*:[ \t]*", re.I | re.M)
 
@@ -1450,8 +1485,23 @@ async def navigate(
     hybrid: bool = False,
     emit: EmitFn | None = None,
     only: tuple[str, ...] = (),
+    vision: bool = True,
+    behaviour: str = "",
 ) -> tuple[Outcome, Trace]:
     """Let the model read its way to an answer, and record every step.
+
+    ``vision`` withdraws look_at_page. The walk still reads everything else, so
+    a store of prose is unaffected; what changes is that a figure stops being
+    readable, and a page-picture question will honestly fail rather than being
+    answered from a caption. Offered because the look is the single most
+    expensive step there is — measured at 65.5s of a 77.1s walk — and a caller
+    who knows their documents are text should not pay for the option.
+
+    ``behaviour`` is how the answer should be WRITTEN, not what may be said.
+    It is appended to the system prompt inside a fenced section that cannot
+    reach the evidence rules: style is the caller's business, grounding is not
+    negotiable, and a "be confident" instruction must never become licence to
+    answer from something unread. See _behaviour_note.
 
     ``only`` restricts the whole walk to the named documents — the explicit
     filter. Empty means "decide", which on a store larger than MAX_DOCUMENTS
@@ -1626,6 +1676,8 @@ async def navigate(
     # of the round.
     can_hop = bool(hybrid) and await graph.has_near_edges(scope)
     _system = _SYSTEM + _HYBRID_NOTE + (_NEIGHBOURS_NOTE if can_hop else "") if hybrid else _SYSTEM
+    # Last, so the rules above are what it is qualifying rather than replacing.
+    _system += _behaviour_note(behaviour)
 
     catalogue, abbreviated = _catalogue(documents, trees)
     # Reaching a chapter through a shortened catalogue costs two rounds the
@@ -1752,7 +1804,7 @@ async def navigate(
         # question, so a wrong hint cannot trap the agent with no way to explore.
         if abbreviated and (not hinted_sections or read):
             tools = [*tools, _OPEN_TOOL]
-        if looks < MAX_LOOKS and any(page_counts.values()):
+        if vision and looks < MAX_LOOKS and any(page_counts.values()):
             # Reading first is NOT the waste it looks like. Offering the page
             # tool from the opening round — on the reasoning that a picture's
             # text is only a description anyway — made the agent look before it

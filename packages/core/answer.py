@@ -453,6 +453,8 @@ async def answer(
     mode: str = "agentic",
     emit: EmitFn | None = None,
     item_ids: tuple[str, ...] = (),
+    vision: bool = True,
+    behaviour: str = "",
 ) -> tuple[Answer, Trace]:
     """Retrieve, then write an answer from what was retrieved.
 
@@ -504,7 +506,14 @@ async def answer(
         from packages.core.navigator import navigate
 
         walk, trace = await navigate(
-            session, scope, question, hybrid=(mode == "agentic"), emit=emit, only=item_ids
+            session,
+            scope,
+            question,
+            hybrid=(mode == "agentic"),
+            emit=emit,
+            only=item_ids,
+            vision=vision,
+            behaviour=behaviour,
         )
         result = Answer(
             question=question,
