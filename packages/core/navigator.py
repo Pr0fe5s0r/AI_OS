@@ -674,6 +674,48 @@ def _strip_pseudo_call(text: str) -> str:
     return text[: match.start()].rstrip() if match else text
 
 
+# The submit_answer PARAMETER name, written out as a label on its own line.
+_ANSWER_LABEL = re.compile(r"^[ \t]*answer[ \t]*:[ \t]*", re.I | re.M)
+
+# How much text may follow that label before it stops looking like a summary of
+# what was already said. Measured leak: 900 characters of finished answer, then
+# "answer: The two surfaces of the user experience are the Agent page and the
+# Feed page." — 88 characters restating it.
+RESTATEMENT_CHARS = 400
+
+
+def _strip_answer_label(text: str) -> str:
+    """Cut the ``answer:`` label a model writes when it means to call the tool.
+
+    A sibling of _strip_pseudo_call and not covered by it: that one needs an
+    opening bracket to fire, and this leak has none. The model finishes a good
+    answer in prose and then appends the submit_answer parameter name with a
+    one-line restatement after it, which reaches the reader verbatim under a
+    heading saying this is what the store found.
+
+    Cutting text is riskier than leaving it, so the two shapes are treated
+    differently and neither can lose an answer:
+
+      label first   The whole reply is ``answer: <the answer>``. Only the label
+                    goes; every word after it is the answer itself.
+
+      label last    Something complete was already said. What follows is a
+                    restatement, so it goes — but only when it is short enough
+                    to BE one. A document quoting "Answer:" in an FAQ, or a
+                    model genuinely continuing, runs long and is left alone;
+                    truncating a real answer is a correctness failure, while
+                    leaving a duplicate line is untidy.
+    """
+    match = _ANSWER_LABEL.search(text)
+    if not match:
+        return text
+    before = text[: match.start()].rstrip()
+    if not before:
+        return text[match.end() :].lstrip()
+    after = text[match.end() :].strip()
+    return before if len(after) <= RESTATEMENT_CHARS else text
+
+
 _REGION = re.compile(
     r"^\s*REGION\s+x=(-?[\d.]+)\s+y=(-?[\d.]+)\s+w=(-?[\d.]+)\s+h=(-?[\d.]+)\s*\|?\s*(.*)$",
     re.IGNORECASE | re.MULTILINE,
@@ -1832,7 +1874,9 @@ async def navigate(
             # produced would turn a formatting slip into an empty result, which
             # is the failure this whole module exists to remove.
             if reply.get("content"):
-                drafted = _strip_pseudo_call(reply["content"].strip())
+                drafted = _strip_answer_label(
+                    _strip_pseudo_call(reply["content"].strip())
+                )
                 if _should_search_first(
                     absent=_reads_as_absent(drafted),
                     hybrid=hybrid,

@@ -871,3 +871,52 @@ def test_the_best_ranked_document_is_the_one_that_is_read():
     source = inspect.getsource(navigator.navigate)
     assert "by_rank = {doc: n for n, doc in enumerate(routing.order)}" in source
     assert "min(distinct, key=lambda d: by_rank.get(d, len(by_rank)))" in source
+
+
+def test_the_answer_label_does_not_reach_the_reader():
+    """A model that means to call submit_answer sometimes just writes its
+    parameter name. _strip_pseudo_call needs an opening bracket to fire, so
+    this shape walked straight through it and onto the screen, under a heading
+    saying this is what the store found."""
+    from packages.core.navigator import _strip_answer_label
+
+    leaked = (
+        "The two surfaces are the Agent page and the Feed page, described in "
+        "the MarkOS document across two sections [1][2].\n\n"
+        "answer: The two surfaces of the user experience are the Agent page "
+        "and the Feed page. [1][2]"
+    )
+    cleaned = _strip_answer_label(leaked)
+    assert "answer:" not in cleaned
+    assert cleaned.startswith("The two surfaces are the Agent page")
+
+
+def test_a_label_that_introduces_the_answer_keeps_the_answer():
+    """When the label is all there is before the text, the text IS the answer.
+    Cutting from there would return nothing at all -- turning a formatting slip
+    into an empty result, which is the failure this module exists to remove."""
+    from packages.core.navigator import _strip_answer_label
+
+    assert _strip_answer_label("answer: Hedwig") == "Hedwig"
+    assert _strip_answer_label("Answer:   The owl is called Hedwig.") == (
+        "The owl is called Hedwig."
+    )
+
+
+def test_long_material_after_the_label_is_left_alone():
+    """Truncating a real answer is a correctness failure; leaving a duplicate
+    line is untidy. So the cut only fires on something short enough to BE a
+    restatement -- a document quoting "Answer:" in an FAQ, or a model that
+    genuinely kept going, runs long and is untouched."""
+    from packages.core.navigator import RESTATEMENT_CHARS, _strip_answer_label
+
+    genuine = "Background follows.\n\nAnswer: " + ("substantive detail. " * 40)
+    assert len(genuine.split("Answer:")[1]) > RESTATEMENT_CHARS
+    assert _strip_answer_label(genuine) == genuine
+
+
+def test_text_with_no_label_is_returned_unchanged():
+    from packages.core.navigator import _strip_answer_label
+
+    plain = "The owl is called Hedwig, and she appears throughout the books."
+    assert _strip_answer_label(plain) == plain
