@@ -64,6 +64,45 @@ _SYSTEM = (
 _NOT_FOUND = "NOT_IN_CONTEXT"
 _CITATION = re.compile(r"\[(\d+)\]")
 
+# The model saying, in prose, that this did not come from the documents.
+#
+# Deliberately narrow. These are admissions, not hedges: "the sections do not
+# contain", "this is well known". A merely cautious answer ("the documents do
+# not say when this takes effect, but they do state…") is a good answer and
+# must stay grounded, so the phrases here are the ones that disclaim the
+# EVIDENCE rather than qualify the finding.
+_FROM_OUTSIDE = re.compile(
+    r"do(?:es)? not (?:explicitly )?contain the (?:name|answer|information)"
+    r"|not (?:directly )?(?:stated|mentioned|contained|present) in the (?:provided |given )?"
+    r"(?:sections?|passages?|documents?|text)"
+    r"|(?:this is|it is) (?:a )?well[- ]known"
+    r"|from (?:my|general) knowledge"
+    r"|outside the (?:provided )?(?:documents?|sections?|passages?)",
+    re.I,
+)
+
+
+def _answered_from_outside(text: str) -> bool:
+    """Did the answer admit it came from somewhere other than the passages?
+
+    Measured in the console, asked for the name of Harry Potter's owl: "The
+    provided sections do not contain the name directly, but the full text of
+    the document confirms this fact. Since the question is about a well-known
+    detail from the Harry Potter series..." — cited to a table of contents,
+    which names no owl, and reported as grounded.
+
+    The name was right, which is precisely what makes this the worst failure
+    this system can produce. A reader cannot tell that answer apart from one
+    the store actually found, and the difference between those two is the
+    entire product. Rare — eight of nine runs answered from a real passage —
+    and rare is not the same as acceptable when the claim is that every answer
+    is checkable.
+
+    It cannot stop a model knowing things. It stops the store presenting what
+    the model knows as something it read.
+    """
+    return bool(_FROM_OUTSIDE.search(text or ""))
+
 
 @dataclass(slots=True)
 class Citation:
@@ -571,7 +610,9 @@ async def answer(
                 )
                 for index, (passage, hit) in enumerate(passages, start=1)
             ]
-        result.grounded = bool(result.citations) and walk.found
+        result.grounded = (
+            bool(result.citations) and walk.found and not _answered_from_outside(result.text)
+        )
         # Sections the page index cut already know their page; a section the
         # chunker cut does not. Both end up here, so both are filled in.
         await _attach_pages(session, scope, result.citations)

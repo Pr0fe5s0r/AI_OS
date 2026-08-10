@@ -597,3 +597,41 @@ def test_a_figure_is_still_distinctive():
 
     passages = _passages("The team grew to 96 people.", "No numbers here at all.")
     assert _distinctive(_words("96"), "96", passages) is True
+
+
+def test_an_answer_that_admits_it_came_from_outside_is_not_grounded():
+    """The worst failure this system can produce is a RIGHT answer that did not
+    come from the documents, presented as though it did.
+
+    Measured in the console, asked the name of Harry Potter's owl: "The
+    provided sections do not contain the name directly, but the full text of
+    the document confirms this fact. Since the question is about a well-known
+    detail from the Harry Potter series..." -- cited to a table of contents,
+    which names no owl, and reported as grounded. The name was correct, which
+    is exactly what makes it dangerous: a reader cannot tell it apart from an
+    answer the store actually found.
+    """
+    from packages.core.answer import _answered_from_outside
+
+    assert _answered_from_outside(
+        "The provided sections do not contain the name directly, but the full "
+        "text confirms this. Since this is a well-known detail..."
+    )
+    assert _answered_from_outside("The name is not stated in the provided passages.")
+    assert _answered_from_outside("From general knowledge, the answer is Hedwig.")
+
+
+def test_a_merely_cautious_answer_stays_grounded():
+    """An answer that qualifies its FINDING is a good answer. Only one that
+    disclaims its EVIDENCE is the failure -- confusing the two would stamp the
+    most careful answers in the store as unsupported, and a warning that fires
+    on good work is a warning nobody reads."""
+    from packages.core.answer import _answered_from_outside
+
+    assert not _answered_from_outside(
+        "The documents do not say when this takes effect, but they do state "
+        "that receipts must be filed within thirty days [1]."
+    )
+    assert not _answered_from_outside("Harry's owl is Hedwig [1].")
+    assert not _answered_from_outside("The sources disagree: [1] says 30 days, [2] says 60.")
+    assert not _answered_from_outside("")
