@@ -516,6 +516,8 @@ async def answer_stream(
             "question is about."
         ),
     ),
+    vision: bool = Query(True, description="See /api/answer."),
+    behaviour: str = Query("", max_length=MAX_BEHAVIOUR_CHARS, description="See /api/answer."),
     scope: Scope = Depends(workspace_scope),
     principal: dict[str, Any] = Depends(resolve_caller),
     session: AsyncSession = Depends(db),
@@ -545,6 +547,7 @@ async def answer_stream(
                 result, trace = await answer(
                     session, scope, q, cfg, mode=mode, emit=emit,
                     item_ids=tuple(doc or ()),
+                    vision=vision, behaviour=behaviour,
                 )
                 await record(
                     session,

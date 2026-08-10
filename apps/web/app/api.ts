@@ -646,9 +646,10 @@ export async function askStream(
   question: string,
   limit: number,
   mode: AskMode,
-  onEvent: (event: StreamEvent) => void
+  onEvent: (event: StreamEvent) => void,
+  options: AskOptions = {}
 ): Promise<AnswerOutcome> {
-  const params = new URLSearchParams({ q: question, limit: String(limit), mode });
+  const params = askParams(question, limit, mode, options);
   const res = await fetch(`${API}/api/answer/stream?${params}`, {
     credentials: "include",
     headers: collectionId ? { "X-Collection": collectionId } : {},

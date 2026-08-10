@@ -1,111 +1,159 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import * as api from "../api";
 import { cx, ms } from "../data";
 import type { Document } from "../data";
-import { Button, Card, Chip, Code, Label, Mono } from "../ui/kit";
+import { Chip, Code, Label, Mono } from "../ui/kit";
 
 type Endpoint = "search" | "answer";
 
-const ENDPOINTS: { id: Endpoint; label: string; path: string; blurb: string }[] = [
-  {
-    id: "search",
-    label: "Search",
-    path: "/api/search",
-    blurb: "Ranked passages only — the contract other software builds on. No generated prose.",
-  },
-  {
-    id: "answer",
-    label: "Answer",
-    path: "/api/answer",
-    blurb: "Retrieval plus a written answer built only from what was retrieved, with citations.",
-  },
-];
-
 /** Only the two modes the server wants sent.
  *
- *  `vectorless` is still accepted for backward compatibility and still arrives
- *  on historical traces, but it is not a choice any more — offering it here
- *  would be offering a worse agentic. */
+ *  `vectorless` is still accepted and still arrives on historical traces, but
+ *  as a choice it is only a worse agentic, so it is not offered. */
 const MODES: { id: api.AskMode; label: string; blurb: string }[] = [
   {
     id: "agentic",
     label: "Agentic",
     blurb:
-      "An agent reads its way to the answer: tables of contents, then hybrid search for a figure no heading advertises, then the passages it lands on. Slower, and it can reach things ranking alone cannot.",
+      "An agent reads its way there: tables of contents, then search for a figure no heading advertises, then the passages it lands on.",
   },
   {
     id: "hybrid",
     label: "Hybrid",
     blurb:
-      "Passage embeddings and keyword matching fused into one ranked pass. Fast and deterministic — the same question gives the same passages every time.",
+      "Embeddings and keyword matching fused into one ranked pass. Fast, and the same question returns the same passages every time.",
   },
 ];
 
-/** Behaviour presets.
- *
- *  These are STYLE, and the server enforces that: it fences whatever arrives
- *  here into a section that governs tone, length and formatting, then restores
- *  the evidence rules underneath. So a preset cannot be written that stops the
- *  answer citing what it read — which is why offering a free-text box next to
- *  them is safe. */
-const BEHAVIOURS: { id: string; label: string; text: string; blurb: string }[] = [
-  { id: "default", label: "Default", text: "", blurb: "The store's own voice — direct, cited, no preamble." },
+/** Behaviour presets — STYLE only, which the server enforces rather than
+ *  trusts: whatever arrives is fenced into a section governing tone, length
+ *  and formatting, with the evidence rules restored underneath it. That is why
+ *  a free-text box can sit next to these safely. */
+const BEHAVIOURS: { id: string; label: string; text: string }[] = [
+  { id: "default", label: "Default", text: "" },
   {
     id: "brief",
     label: "Brief",
     text: "Answer in at most two sentences. No preamble, no restating the question. Lead with the fact.",
-    blurb: "One or two sentences, fact first.",
   },
   {
     id: "bullets",
-    label: "Bullet points",
+    label: "Bullets",
     text: "Answer as a short bulleted list. One fact per bullet, each with its citation. No introductory sentence.",
-    blurb: "A list, one fact per line.",
   },
   {
     id: "analyst",
     label: "Analyst",
     text: "Write for a reader who will act on this. Lead with the answer, then the supporting detail, then anything that qualifies it. Note explicitly where the documents disagree or leave a gap.",
-    blurb: "Answer first, then detail, then caveats.",
   },
   {
     id: "plain",
     label: "Plain language",
     text: "Write for a reader who is new to this subject. Avoid jargon, and when a technical term is unavoidable explain it in the same sentence. Keep sentences short.",
-    blurb: "No jargon; explain the terms.",
   },
   {
     id: "extract",
     label: "Strict extract",
     text: "Quote the document verbatim wherever possible rather than paraphrasing. Keep the original wording, numbers and units exactly as written.",
-    blurb: "Verbatim wording, numbers unchanged.",
   },
 ];
 
-/** Starting points, not examples — each is a shape of question the store
- *  answers differently, so trying them teaches something about the retrieval
- *  rather than just filling the box. */
-const QUERY_TEMPLATES: { label: string; q: string; why: string }[] = [
-  { label: "Specific fact", q: "What is the ", why: "A named thing. Keyword and semantic agree, and it is fastest." },
-  { label: "Terse keywords", q: "", why: "No sentence, no shared words with the answer — the hard case." },
-  { label: "Across documents", q: "Compare what the sources say about ", why: "Routing has to reach more than one document." },
-  { label: "From a figure", q: "What does the diagram show about ", why: "The text layer will not have it; vision reads the page." },
-  { label: "Absence", q: "Does anything here cover ", why: "Should say no plainly rather than reaching for something close." },
+type Preset = {
+  id: string;
+  glyph: string;
+  tone: string;
+  label: string;
+  blurb: string;
+  mode: api.AskMode;
+  vision: boolean;
+  behaviour: string;
+  starter: string;
+};
+
+/** Whole configurations, not example questions.
+ *
+ *  Each one is a shape of work the store is actually good at, with the settings
+ *  that suit it already applied — so picking one and pressing Run shows what
+ *  that combination does, which is the thing this page exists to let somebody
+ *  judge. The starter question is a beginning, not a demo script. */
+const PRESETS: Preset[] = [
+  {
+    id: "support",
+    glyph: "S",
+    tone: "text-accent bg-accent/15",
+    label: "Support answers",
+    blurb: "Short, quotable replies for someone with a customer waiting. Fast retrieval, two sentences, cited.",
+    mode: "hybrid",
+    vision: false,
+    behaviour: BEHAVIOURS.find((b) => b.id === "brief")!.text,
+    starter: "How do I ",
+  },
+  {
+    id: "analyst",
+    glyph: "A",
+    tone: "text-heat-2 bg-heat-2/15",
+    label: "Analyst brief",
+    blurb: "The answer, then what supports it, then what qualifies it — and where the documents disagree.",
+    mode: "agentic",
+    vision: true,
+    behaviour: BEHAVIOURS.find((b) => b.id === "analyst")!.text,
+    starter: "What do the documents say about ",
+  },
+  {
+    id: "figures",
+    glyph: "F",
+    tone: "text-success bg-success/15",
+    label: "Figure reader",
+    blurb: "For charts, tables and diagrams. The agent may open a page as a picture when the text layer cannot answer.",
+    mode: "agentic",
+    vision: true,
+    behaviour: BEHAVIOURS.find((b) => b.id === "bullets")!.text,
+    starter: "What does the diagram show about ",
+  },
+  {
+    id: "extract",
+    glyph: "E",
+    tone: "text-hot bg-hot/15",
+    label: "Strict extract",
+    blurb: "Verbatim wording, numbers and units unchanged. For quoting a policy or a spec rather than summarising it.",
+    mode: "agentic",
+    vision: false,
+    behaviour: BEHAVIOURS.find((b) => b.id === "extract")!.text,
+    starter: "Quote exactly what it says about ",
+  },
+  {
+    id: "onboarding",
+    glyph: "P",
+    tone: "text-accentSoft bg-accentSoft/15",
+    label: "Plain language",
+    blurb: "For a reader new to the subject. No jargon, and any unavoidable term explained in the same sentence.",
+    mode: "agentic",
+    vision: true,
+    behaviour: BEHAVIOURS.find((b) => b.id === "plain")!.text,
+    starter: "Explain ",
+  },
+  {
+    id: "audit",
+    glyph: "C",
+    tone: "text-muted bg-elevated",
+    label: "Coverage check",
+    blurb: "Does the collection cover this at all? Should say no plainly rather than reaching for something close.",
+    mode: "agentic",
+    vision: false,
+    behaviour: BEHAVIOURS.find((b) => b.id === "brief")!.text,
+    starter: "Does anything here cover ",
+  },
 ];
 
 function Toggle({
   on,
   onChange,
-  label,
-  hint,
   disabled,
 }: {
   on: boolean;
   onChange: (v: boolean) => void;
-  label: string;
-  hint: string;
   disabled?: boolean;
 }) {
   return (
@@ -113,49 +161,53 @@ function Toggle({
       type="button"
       onClick={() => !disabled && onChange(!on)}
       disabled={disabled}
-      title={hint}
+      aria-pressed={on}
       className={cx(
-        "flex items-center gap-2.5 rounded-lg border px-3 py-2 text-left transition",
-        disabled
-          ? "cursor-not-allowed border-edge bg-elevated/30 opacity-50"
-          : on
-            ? "border-accent/50 bg-accent/10"
-            : "border-edge bg-elevated hover:border-edgeStrong"
+        "relative h-5 w-9 shrink-0 rounded-full transition",
+        disabled ? "cursor-not-allowed bg-edgeStrong opacity-40" : on ? "bg-accent" : "bg-edgeStrong"
       )}
     >
       <span
         className={cx(
-          "relative h-4 w-7 shrink-0 rounded-full transition",
-          on ? "bg-accent/70" : "bg-edgeStrong"
+          "absolute top-0.5 h-4 w-4 rounded-full bg-canvas transition-all",
+          on ? "left-[1.125rem]" : "left-0.5"
         )}
-      >
-        <span
-          className={cx(
-            "absolute top-0.5 h-3 w-3 rounded-full bg-canvas transition-all",
-            on ? "left-3.5" : "left-0.5"
-          )}
-        />
-      </span>
-      <span>
-        <span className="block font-mono text-2xs text-ink">{label}</span>
-        <span className="block text-2xs text-subtle">{hint}</span>
-      </span>
+      />
     </button>
   );
 }
 
-/** Playground — the API, run by hand, with every knob the API actually has.
+function Row({
+  label,
+  hint,
+  children,
+}: {
+  label: string;
+  hint?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="flex items-start justify-between gap-3 py-2.5">
+      <div className="min-w-0">
+        <p className="text-xs text-ink">{label}</p>
+        {hint && <p className="mt-0.5 text-2xs leading-relaxed text-subtle">{hint}</p>}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+/** Playground — the whole store, adjustable, with the effect on screen.
  *
- *  Still the developer's console rather than a second chat window: it sends the
- *  exact request the SDK would and shows what came back verbatim. What changed
- *  is that the request is now configurable the way the endpoint is — retrieval
- *  mode, vision, document filter, and how the answer should be written — and
- *  the answer is rendered as well as dumped, so the settings can be judged by
- *  their effect and not only by their JSON.
+ *  Laid out as a console rather than a form: the conversation holds the middle,
+ *  every setting lives in one rail on the right, and the composer stays at the
+ *  bottom where it can be reached without scrolling. Change a setting, ask
+ *  again, and the two answers sit next to each other with the settings that
+ *  produced each stamped on them — which is the only way to judge a setting.
  *
- *  Every control here maps to a real parameter. There is deliberately no knob
- *  that the server would ignore: a setting that does nothing is worse than a
- *  missing one, because it is indistinguishable from a broken one. */
+ *  Every control maps to a real parameter. There is deliberately no knob the
+ *  server would ignore: a setting that does nothing is worse than a missing
+ *  one, because it is indistinguishable from a broken one. */
 export function Playground({ active }: { active: string | null }) {
   const [endpoint, setEndpoint] = useState<Endpoint>("answer");
   const [mode, setMode] = useState<api.AskMode>("agentic");
@@ -164,16 +216,28 @@ export function Playground({ active }: { active: string | null }) {
   const [behaviour, setBehaviour] = useState("");
   const [docs, setDocs] = useState<string[]>([]);
   const [library, setLibrary] = useState<Document[]>([]);
-  const [q, setQ] = useState("");
   const [limit, setLimit] = useState(8);
+  const [q, setQ] = useState("");
   const [busy, setBusy] = useState(false);
-  const [turns, setTurns] = useState<
-    { q: string; outcome: api.AnswerOutcome; mode: api.AskMode; vision: boolean }[]
-  >([]);
-  const [raw, setRaw] = useState<api.RawRun | null>(null);
+  // What the walk is doing right now. A progress line that never moves is
+  // indistinguishable from a hang, and an agentic answer is a long half minute.
+  const [progress, setProgress] = useState("");
+  const [showCode, setShowCode] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [turns, setTurns] = useState<
+    {
+      q: string;
+      outcome: api.AnswerOutcome | null;
+      raw: api.RawRun;
+      mode: api.AskMode;
+      vision: boolean;
+      behaviourId: string;
+      docs: number;
+    }[]
+  >([]);
+  const [openJson, setOpenJson] = useState<number | null>(null);
+  const foot = useRef<HTMLDivElement | null>(null);
 
-  const chosen = ENDPOINTS.find((e) => e.id === endpoint)!;
   const answering = endpoint === "answer";
   // Vision is the agent's tool. Hybrid ranks and hands over — it never opens a
   // page — so the control is disabled rather than quietly ignored.
@@ -185,14 +249,18 @@ export function Playground({ active }: { active: string | null }) {
       .documents(active ?? undefined, 100)
       .then((d) => live && setLibrary(d))
       .catch(() => live && setLibrary([]));
-    // The filter names documents by id, and those ids belong to the collection
-    // that was selected. Kept rather than remapped when it changes: a filter
-    // pointing at another collection's documents would silently return nothing.
+    // The filter names document ids, and those belong to the collection that
+    // was selected. Cleared rather than remapped: a filter pointing at another
+    // collection's documents would silently return nothing.
     setDocs([]);
     return () => {
       live = false;
     };
   }, [active]);
+
+  useEffect(() => {
+    foot.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [turns.length, busy]);
 
   const path = useMemo(() => {
     if (!answering) {
@@ -215,325 +283,397 @@ export function Playground({ active }: { active: string | null }) {
     .filter(Boolean)
     .join("\n");
 
+  function applyPreset(p: Preset) {
+    setEndpoint("answer");
+    setMode(p.mode);
+    setVision(p.vision);
+    setBehaviour(p.behaviour);
+    setBehaviourId(BEHAVIOURS.find((b) => b.text === p.behaviour)?.id ?? "custom");
+    setQ(p.starter);
+  }
+
   async function go() {
     if (!q.trim() || busy) return;
     setBusy(true);
     setError(null);
     const asked = q.trim();
+    const settings = { mode, vision: visionApplies && vision, behaviourId, docs: docs.length };
+    const options = { docs, vision: visionApplies ? vision : undefined, behaviour };
+    const started = performance.now();
+    setProgress("");
     try {
-      // The raw run is what this page is for, and it goes out for both
-      // endpoints. The rendered answer is an extra read of the same request,
-      // not a different one — so what the console shows and what the JSON says
-      // can never disagree.
-      const run = await api.run(path, active ?? undefined);
-      setRaw(run);
-      if (answering && run.ok) {
-        const outcome = await api.ask(active ?? undefined, asked, limit, mode, {
-          docs,
-          vision: visionApplies ? vision : undefined,
-          behaviour,
-        });
-        setTurns((t) => [...t, { q: asked, outcome, mode, vision: visionApplies && vision }]);
-        setQ("");
+      if (!answering) {
+        // Search returns in well under a second and its JSON is the point, so
+        // it goes out as a plain request.
+        const raw = await api.run(path, active ?? undefined);
+        setTurns((t) => [...t, { q: asked, outcome: null, raw, ...settings }]);
+      } else {
+        // Answering STREAMS, and not for the animation.
+        //
+        // The blocking route dies at this proxy: Next gives up on a rewrite at
+        // ~30s and returns a bare 500 with nothing in the API log — the same
+        // failure already recorded in next.config.js for uploads. Agentic
+        // answers measured 20-35s on a six-document store, which is exactly
+        // astride that ceiling, and the first real run here hit it at 30.05s.
+        // A stream is bytes from the first step onward, so no idle timeout ever
+        // fires — which is why the rest of this app already streams.
+        // Kept from the terminal `done` event, which carries exactly the
+        // payload /api/answer returns — so the JSON shown below is still the
+        // API's own response and not something this page composed.
+        let body: unknown = null;
+        const outcome = await api.askStream(
+          active ?? undefined,
+          asked,
+          limit,
+          mode,
+          (event) => {
+            if (event.type === "start") setProgress("navigating…");
+            else if (event.type === "retrieved")
+              setProgress(`${event.documents} documents, ${event.passages} passages`);
+            else if (event.type === "tool_call") setProgress(`${event.tool}…`);
+            else if (event.type === "token") setProgress("writing…");
+            else if (event.type === "done") body = event.answer;
+          },
+          options
+        );
+        const raw: api.RawRun = {
+          status: 200,
+          ms: performance.now() - started,
+          ok: true,
+          body,
+        };
+        setTurns((t) => [...t, { q: asked, outcome, raw, ...settings }]);
       }
+      setQ("");
     } catch (e) {
       setError((e as Error).message);
-      setRaw(null);
     } finally {
+      setProgress("");
       setBusy(false);
     }
   }
 
-  function pickBehaviour(id: string) {
-    setBehaviourId(id);
-    setBehaviour(BEHAVIOURS.find((b) => b.id === id)?.text ?? "");
-  }
-
   return (
-    <div className="px-6 py-6">
-      <div className="mb-5">
-        <h1 className="text-base font-semibold text-ink">Playground</h1>
-        <p className="mt-1 max-w-2xl text-xs leading-relaxed text-subtle">
-          Run the read API by hand with every setting it accepts, and see both the answer
-          and the response that produced it. Requests go to{" "}
-          {active ? (
-            <>
-              <Mono className="text-accentSoft">{active}</Mono>
-            </>
-          ) : (
-            "the whole workspace"
-          )}
-          . Every control here maps to a real parameter — nothing on this page is
-          decorative.
-        </p>
-      </div>
-
-      <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_20rem]">
-        {/* ------------------------------- ask ------------------------------ */}
-        <div className="min-w-0">
-          <div className="mb-3 flex flex-wrap items-center gap-2">
-            <div className="flex gap-1 rounded-lg border border-edge bg-elevated p-0.5">
-              {ENDPOINTS.map((e) => (
-                <button
-                  key={e.id}
-                  onClick={() => setEndpoint(e.id)}
-                  className={cx(
-                    "rounded-md px-3 py-1 font-mono text-2xs transition",
-                    endpoint === e.id ? "bg-accent/15 text-ink" : "text-subtle hover:text-muted"
-                  )}
-                >
-                  {e.label}
-                </button>
-              ))}
-            </div>
-            <Chip tone="text-heat-2 border-heat-2/30 bg-heat-2/10">GET {chosen.path}</Chip>
-            {answering && <Chip>{mode}</Chip>}
-            {visionApplies && !vision && <Chip>vision off</Chip>}
-            {docs.length > 0 && <Chip>{docs.length} document filter</Chip>}
+    <div className="flex h-full min-h-0">
+      {/* ------------------------------ console ------------------------------ */}
+      <div className="flex min-w-0 flex-1 flex-col">
+        <div className="flex items-center justify-between gap-3 px-6 pb-3 pt-5">
+          <div className="flex items-center gap-2">
+            <h1 className="text-base font-semibold text-ink">Playground</h1>
+            <Chip>{active ?? "workspace-wide"}</Chip>
           </div>
-          <p className="mb-4 max-w-xl text-2xs leading-relaxed text-subtle">{chosen.blurb}</p>
-
-          {/* templates */}
-          <div className="mb-3 flex flex-wrap items-center gap-1.5">
-            <Label className="mr-1">try</Label>
-            {QUERY_TEMPLATES.map((t) => (
-              <Chip key={t.label} onClick={() => setQ(t.q)} title={t.why}>
-                {t.label}
+          <div className="flex items-center gap-2">
+            <Chip active={showCode} onClick={() => setShowCode((s) => !s)} title="The request as curl">
+              &lt;&gt; Get code
+            </Chip>
+            {turns.length > 0 && (
+              <Chip onClick={() => setTurns([])} title="Clear this session">
+                clear
               </Chip>
-            ))}
+            )}
           </div>
+        </div>
 
-          <Card className="mb-4 p-4">
+        <div className="min-h-0 flex-1 overflow-y-auto px-6">
+          {showCode && (
+            <div className="mb-4">
+              <Code code={curl} filename="curl" />
+            </div>
+          )}
+
+          {turns.length === 0 && !busy ? (
+            <div className="mx-auto max-w-3xl py-6">
+              <h2 className="text-2xl font-semibold text-ink">Ask your collection</h2>
+              <p className="mt-1.5 max-w-xl text-xs leading-relaxed text-subtle">
+                Start from a configuration, or set your own in the rail on the right. Every
+                control there is a real parameter — change one, ask the same question again,
+                and the two answers sit side by side with the settings that produced them.
+              </p>
+              <div className="mt-6 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+                {PRESETS.map((p) => (
+                  <button
+                    key={p.id}
+                    onClick={() => applyPreset(p)}
+                    className="group rounded-xl border border-edge bg-elevated/40 p-4 text-left transition hover:border-edgeStrong hover:bg-elevated"
+                  >
+                    <span
+                      className={cx(
+                        "flex h-7 w-7 items-center justify-center rounded-lg font-mono text-2xs",
+                        p.tone
+                      )}
+                    >
+                      {p.glyph}
+                    </span>
+                    <p className="mt-3 text-sm text-ink">{p.label}</p>
+                    <p className="mt-1 text-2xs leading-relaxed text-subtle">{p.blurb}</p>
+                    <p className="mt-2.5 font-mono text-2xs text-subtle opacity-0 transition group-hover:opacity-100">
+                      {p.mode}
+                      {p.vision ? " · vision" : ""}
+                    </p>
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <div className="mx-auto max-w-3xl space-y-4 py-2">
+              {turns.map((turn, n) => (
+                <div key={n}>
+                  <p className="mb-2 text-right text-sm text-muted">{turn.q}</p>
+                  <div
+                    className={cx(
+                      "rounded-xl border p-4",
+                      turn.outcome && !turn.outcome.grounded
+                        ? "border-hot/30 bg-hot/5"
+                        : "border-edge bg-elevated/50"
+                    )}
+                  >
+                    {turn.outcome ? (
+                      <>
+                        <p
+                          className={cx(
+                            "whitespace-pre-wrap text-sm leading-relaxed",
+                            turn.outcome.grounded ? "text-ink" : "text-muted"
+                          )}
+                        >
+                          {turn.outcome.answer}
+                        </p>
+                        {!turn.outcome.grounded && (
+                          <p className="mt-2 border-t border-hot/20 pt-2 font-mono text-2xs text-hot">
+                            not supported by the collection — nothing below was cited
+                          </p>
+                        )}
+                      </>
+                    ) : (
+                      <p className="font-mono text-2xs text-subtle">
+                        {turn.raw.ok
+                          ? "Passages only — Search does not write prose. The response is below."
+                          : `Request failed with ${turn.raw.status}.`}
+                      </p>
+                    )}
+
+                    <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-edge pt-2.5">
+                      <Chip>{turn.mode}</Chip>
+                      {turn.vision && <Chip>vision</Chip>}
+                      {turn.behaviourId !== "default" && <Chip>{turn.behaviourId}</Chip>}
+                      {turn.docs > 0 && <Chip>{turn.docs} docs</Chip>}
+                      <Mono className="text-2xs text-subtle">{ms(turn.raw.ms)}</Mono>
+                      {turn.outcome?.citations.map((c) => (
+                        <Chip key={c.marker} title={c.text.slice(0, 300)}>
+                          [{c.marker}] {c.title}
+                        </Chip>
+                      ))}
+                      <Chip
+                        onClick={() => setOpenJson(openJson === n ? null : n)}
+                        active={openJson === n}
+                      >
+                        json
+                      </Chip>
+                    </div>
+                    {openJson === n && (
+                      <div className="mt-3">
+                        <Code
+                          code={JSON.stringify(turn.raw.body, null, 2)}
+                          filename={`${turn.raw.status} · response.json`}
+                          lang="json"
+                        />
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+              {busy && (
+                <p className="font-mono text-2xs text-subtle">{progress || "searching…"}</p>
+              )}
+              <div ref={foot} />
+            </div>
+          )}
+        </div>
+
+        {/* composer */}
+        <div className="border-t border-edge px-6 py-4">
+          <div className="mx-auto max-w-3xl">
+            {error && (
+              <p className="mb-2 rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 font-mono text-2xs text-danger">
+                {error}
+              </p>
+            )}
             <form
               onSubmit={(e) => {
                 e.preventDefault();
                 go();
               }}
-              className="flex flex-wrap items-end gap-3"
+              className="rounded-2xl border border-edge bg-elevated/60 p-2.5 focus-within:border-accent/50"
             >
-              <label className="min-w-[16rem] flex-1">
-                <Label className="mb-1.5 block">q</Label>
-                <input
-                  autoFocus
-                  value={q}
-                  onChange={(e) => setQ(e.target.value)}
-                  placeholder="refund policy"
-                  className="w-full rounded-lg border border-edge bg-canvas px-3 py-2 text-sm text-ink outline-none focus:border-accent/60"
-                />
-              </label>
-              <label className="w-20">
-                <Label className="mb-1.5 block">limit</Label>
-                <input
-                  type="number"
-                  min={1}
-                  max={answering ? 20 : 100}
-                  value={limit}
-                  onChange={(e) => setLimit(Math.max(1, Number(e.target.value) || 1))}
-                  className="w-full rounded-lg border border-edge bg-canvas px-3 py-2 font-mono text-xs text-ink outline-none focus:border-accent/60"
-                />
-              </label>
-              <Button variant="primary" onClick={go} disabled={busy || !q.trim()}>
-                {busy ? "Running…" : "Run"}
-              </Button>
-            </form>
-          </Card>
-
-          {error && (
-            <p className="mb-4 rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 font-mono text-2xs text-danger">
-              {error}
-            </p>
-          )}
-
-          {/* the conversation, when answering */}
-          {turns.length > 0 && (
-            <div className="mb-4 space-y-3">
-              <div className="flex items-center gap-2">
-                <Label>answers</Label>
-                <Chip onClick={() => setTurns([])} title="Clear the answers on this page">
-                  clear
+              <input
+                value={q}
+                onChange={(e) => setQ(e.target.value)}
+                placeholder="Ask anything about this collection…"
+                className="w-full bg-transparent px-2 py-1.5 text-sm text-ink outline-none placeholder:text-subtle"
+              />
+              <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                <Chip active={answering} onClick={() => setEndpoint("answer")}>
+                  Answer
                 </Chip>
-              </div>
-              {turns.map((turn, n) => (
-                <Card key={n} className="p-4">
-                  <p className="mb-2 font-mono text-2xs text-subtle">{turn.q}</p>
-                  <p
-                    className={cx(
-                      "whitespace-pre-wrap text-sm leading-relaxed",
-                      turn.outcome.grounded ? "text-ink" : "text-muted"
-                    )}
-                  >
-                    {turn.outcome.answer}
-                  </p>
-                  {!turn.outcome.grounded && (
-                    <p className="mt-2 border-t border-hot/20 pt-2 font-mono text-2xs text-hot">
-                      not supported by the collection — nothing below was cited
-                    </p>
+                <Chip active={!answering} onClick={() => setEndpoint("search")}>
+                  Search
+                </Chip>
+                <span className="mx-1 h-4 w-px bg-edge" />
+                {answering && <Chip>{mode}</Chip>}
+                {visionApplies && <Chip>{vision ? "vision on" : "vision off"}</Chip>}
+                {answering && behaviourId !== "default" && <Chip>{behaviourId}</Chip>}
+                {docs.length > 0 && <Chip>{docs.length} documents</Chip>}
+                <button
+                  type="submit"
+                  disabled={busy || !q.trim()}
+                  className={cx(
+                    "ml-auto rounded-lg px-4 py-1.5 font-mono text-2xs transition",
+                    busy || !q.trim()
+                      ? "cursor-not-allowed bg-elevated text-subtle"
+                      : "bg-accent/20 text-ink hover:bg-accent/30"
                   )}
-                  <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-edge pt-2.5">
-                    <Chip>{turn.mode}</Chip>
-                    {turn.vision && <Chip>vision</Chip>}
-                    <Mono className="text-2xs text-subtle">{ms(turn.outcome.tookMs)}</Mono>
-                    {turn.outcome.citations.map((c) => (
-                      <Chip key={c.marker} title={c.text.slice(0, 300)}>
-                        [{c.marker}] {c.title}
-                      </Chip>
-                    ))}
-                  </div>
-                </Card>
-              ))}
-            </div>
-          )}
-
-          <div className="mb-4">
-            <Label className="mb-2 block">reproduce</Label>
-            <Code code={curl} filename="curl" />
-          </div>
-
-          {raw && (
-            <div>
-              <div className="mb-2 flex items-center gap-2">
-                <Label>response</Label>
-                <Chip
-                  tone={
-                    raw.ok
-                      ? "text-success border-success/30 bg-success/10"
-                      : "text-danger border-danger/30 bg-danger/10"
-                  }
                 >
-                  {raw.status}
-                </Chip>
-                <Mono className="text-2xs text-subtle">{ms(raw.ms)}</Mono>
+                  {busy ? "Running…" : "Run ↵"}
+                </button>
               </div>
-              <Code code={JSON.stringify(raw.body, null, 2)} filename="response.json" lang="json" />
-            </div>
-          )}
+            </form>
+          </div>
+        </div>
+      </div>
+
+      {/* ---------------------------- run settings ---------------------------- */}
+      <aside className="w-80 shrink-0 overflow-y-auto border-l border-edge bg-elevated/20 px-4 py-5">
+        <p className="mb-3 text-xs font-semibold text-ink">Run settings</p>
+
+        <div className="rounded-xl border border-edge bg-elevated/50 p-3">
+          <p className="text-xs text-ink">{answering ? "Answer" : "Search"}</p>
+          <p className="mt-1 text-2xs leading-relaxed text-subtle">
+            {answering
+              ? "Retrieval plus a written answer built only from what was retrieved, with citations."
+              : "Ranked passages only — the contract other software builds on. No generated prose, so nothing below applies except the document filter and limit."}
+          </p>
         </div>
 
-        {/* ----------------------------- settings --------------------------- */}
-        <aside className="space-y-4">
-          <div>
-            <Label className="mb-2 block">retrieval</Label>
-            <div className="space-y-1.5">
-              {MODES.map((m) => (
+        <div className="mt-4 border-t border-edge pt-1">
+          <Label className="mb-2 mt-2 block">retrieval</Label>
+          <div className="space-y-1.5">
+            {MODES.map((m) => (
+              <button
+                key={m.id}
+                type="button"
+                disabled={!answering}
+                onClick={() => setMode(m.id)}
+                className={cx(
+                  "block w-full rounded-lg border px-3 py-2 text-left transition",
+                  !answering
+                    ? "cursor-not-allowed border-edge opacity-40"
+                    : mode === m.id
+                      ? "border-accent/50 bg-accent/10"
+                      : "border-edge bg-elevated/50 hover:border-edgeStrong"
+                )}
+              >
+                <span className="block text-xs text-ink">{m.label}</span>
+                <span className="mt-0.5 block text-2xs leading-relaxed text-subtle">{m.blurb}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="mt-3 border-t border-edge">
+          <Row
+            label="Vision"
+            hint={
+              visionApplies
+                ? "Read a page as a picture when the text layer cannot answer. The most expensive step in a walk."
+                : "Only the agent opens pages. Hybrid ranks and hands over."
+            }
+          >
+            <Toggle on={vision} onChange={setVision} disabled={!visionApplies} />
+          </Row>
+        </div>
+
+        <div className="border-t border-edge py-3">
+          <Label className="mb-2 block">agent behaviour</Label>
+          <div className="mb-2 flex flex-wrap gap-1.5">
+            {BEHAVIOURS.map((b) => (
+              <Chip
+                key={b.id}
+                active={behaviourId === b.id}
+                onClick={() => {
+                  if (!answering) return;
+                  setBehaviourId(b.id);
+                  setBehaviour(b.text);
+                }}
+              >
+                {b.label}
+              </Chip>
+            ))}
+          </div>
+          <textarea
+            value={behaviour}
+            disabled={!answering}
+            onChange={(e) => {
+              setBehaviour(e.target.value);
+              setBehaviourId("custom");
+            }}
+            rows={5}
+            maxLength={600}
+            placeholder="How should it write? Tone, length, formatting."
+            className="w-full resize-none rounded-lg border border-edge bg-canvas px-3 py-2 text-xs leading-relaxed text-ink outline-none focus:border-accent/60 disabled:opacity-40"
+          />
+          <p className="mt-1.5 text-2xs leading-relaxed text-subtle">
+            Style only. It cannot change what may be said — citing only what was read, and
+            saying so when the documents do not answer, hold underneath whatever goes here.
+          </p>
+        </div>
+
+        <div className="border-t border-edge py-3">
+          <Row label="Passages" hint="How much evidence reaches the answer.">
+            <input
+              type="number"
+              min={1}
+              max={answering ? 20 : 100}
+              value={limit}
+              onChange={(e) => setLimit(Math.max(1, Number(e.target.value) || 1))}
+              className="w-16 rounded-lg border border-edge bg-canvas px-2 py-1 text-right font-mono text-xs text-ink outline-none focus:border-accent/60"
+            />
+          </Row>
+        </div>
+
+        <div className="border-t border-edge py-3">
+          <div className="mb-1.5 flex items-center justify-between">
+            <Label>documents</Label>
+            {docs.length > 0 && <Chip onClick={() => setDocs([])}>clear</Chip>}
+          </div>
+          <p className="mb-2 text-2xs leading-relaxed text-subtle">
+            {docs.length === 0
+              ? "None selected — the store decides which documents the question is about."
+              : `${docs.length} of ${library.length}. A filter is an instruction, not a hint.`}
+          </p>
+          <div className="max-h-56 space-y-0.5 overflow-y-auto rounded-lg border border-edge bg-canvas/60 p-1.5">
+            {library.length === 0 && (
+              <p className="px-2 py-3 text-2xs text-subtle">No documents in this collection.</p>
+            )}
+            {library.map((d) => {
+              const on = docs.includes(d.id);
+              return (
                 <button
-                  key={m.id}
+                  key={d.id}
                   type="button"
-                  disabled={!answering}
-                  onClick={() => setMode(m.id)}
+                  onClick={() => setDocs((c) => (on ? c.filter((x) => x !== d.id) : [...c, d.id]))}
+                  title={d.locator}
                   className={cx(
-                    "block w-full rounded-lg border px-3 py-2 text-left transition",
-                    !answering
-                      ? "cursor-not-allowed border-edge bg-elevated/30 opacity-50"
-                      : mode === m.id
-                        ? "border-accent/50 bg-accent/10"
-                        : "border-edge bg-elevated hover:border-edgeStrong"
+                    "block w-full truncate rounded-md px-2 py-1.5 text-left font-mono text-2xs transition",
+                    on ? "bg-accent/15 text-ink" : "text-subtle hover:bg-elevated hover:text-muted"
                   )}
                 >
-                  <span className="block font-mono text-2xs text-ink">{m.label}</span>
-                  <span className="mt-0.5 block text-2xs leading-relaxed text-subtle">
-                    {m.blurb}
-                  </span>
+                  {on ? "▸ " : "  "}
+                  {d.title || d.locator}
                 </button>
-              ))}
-            </div>
-            {!answering && (
-              <p className="mt-1.5 text-2xs text-subtle">
-                Search returns passages and never writes prose, so retrieval mode and
-                behaviour do not apply to it.
-              </p>
-            )}
+              );
+            })}
           </div>
-
-          <div>
-            <Label className="mb-2 block">vision</Label>
-            <Toggle
-              on={vision}
-              onChange={setVision}
-              disabled={!visionApplies}
-              label={vision ? "read pages as pictures" : "text only"}
-              hint={
-                visionApplies
-                  ? "Off, a figure stops being readable — and the most expensive step in a walk is gone."
-                  : "Only the agent opens pages. Hybrid ranks and hands over."
-              }
-            />
-          </div>
-
-          <div>
-            <Label className="mb-2 block">how it should answer</Label>
-            <div className="mb-2 flex flex-wrap gap-1.5">
-              {BEHAVIOURS.map((b) => (
-                <Chip
-                  key={b.id}
-                  title={b.blurb}
-                  active={behaviourId === b.id}
-                  onClick={() => answering && pickBehaviour(b.id)}
-                >
-                  {b.label}
-                </Chip>
-              ))}
-            </div>
-            <textarea
-              value={behaviour}
-              disabled={!answering}
-              onChange={(e) => {
-                setBehaviour(e.target.value);
-                setBehaviourId("custom");
-              }}
-              rows={4}
-              maxLength={600}
-              placeholder="Write for a support engineer. Lead with the fix."
-              className="w-full resize-none rounded-lg border border-edge bg-canvas px-3 py-2 text-xs leading-relaxed text-ink outline-none focus:border-accent/60 disabled:opacity-50"
-            />
-            <p className="mt-1.5 text-2xs leading-relaxed text-subtle">
-              Style only — tone, length, formatting. It cannot change what may be said:
-              citing only what was read, and saying so when the documents do not answer,
-              are enforced by the server underneath whatever goes here.
-            </p>
-          </div>
-
-          <div>
-            <div className="mb-2 flex items-center gap-2">
-              <Label>documents</Label>
-              {docs.length > 0 && (
-                <Chip onClick={() => setDocs([])} title="Let the store decide again">
-                  clear
-                </Chip>
-              )}
-            </div>
-            <p className="mb-2 text-2xs leading-relaxed text-subtle">
-              {docs.length === 0
-                ? "None selected — the store decides which documents the question is about."
-                : `Answering from ${docs.length} of ${library.length}. A filter is an instruction, not a hint.`}
-            </p>
-            <div className="max-h-64 space-y-1 overflow-y-auto rounded-lg border border-edge bg-elevated/40 p-1.5">
-              {library.length === 0 && (
-                <p className="px-2 py-3 text-2xs text-subtle">No documents in this collection.</p>
-              )}
-              {library.map((d) => {
-                const on = docs.includes(d.id);
-                return (
-                  <button
-                    key={d.id}
-                    type="button"
-                    onClick={() =>
-                      setDocs((c) => (on ? c.filter((x) => x !== d.id) : [...c, d.id]))
-                    }
-                    className={cx(
-                      "block w-full truncate rounded-md px-2 py-1.5 text-left font-mono text-2xs transition",
-                      on ? "bg-accent/15 text-ink" : "text-subtle hover:bg-elevated hover:text-muted"
-                    )}
-                    title={d.locator}
-                  >
-                    {on ? "▸ " : "  "}
-                    {d.title || d.locator}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-        </aside>
-      </div>
+        </div>
+      </aside>
     </div>
   );
 }
