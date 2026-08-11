@@ -1487,6 +1487,7 @@ async def navigate(
     only: tuple[str, ...] = (),
     vision: bool = True,
     behaviour: str = "",
+    allow_open: bool = True,
 ) -> tuple[Outcome, Trace]:
     """Let the model read its way to an answer, and record every step.
 
@@ -1496,6 +1497,13 @@ async def navigate(
     answered from a caption. Offered because the look is the single most
     expensive step there is — measured at 65.5s of a 77.1s walk — and a caller
     who knows their documents are text should not pay for the option.
+
+    ``allow_open`` keeps open_document out of the toolbox. It exists because a
+    shortened catalogue can leave the agent without the section ids it needs,
+    and withdrawing it removes that escape hatch — so it is a choice, not a
+    default. Off, the walk navigates from the catalogue and the hint alone,
+    which is what most questions do anyway: measured across three questions on
+    a seven-document store, the tool was called exactly zero times.
 
     ``behaviour`` is how the answer should be WRITTEN, not what may be said.
     It is appended to the system prompt inside a fenced section that cannot
@@ -1802,7 +1810,7 @@ async def navigate(
         #
         # It comes BACK once reading has happened and has not settled the
         # question, so a wrong hint cannot trap the agent with no way to explore.
-        if abbreviated and (not hinted_sections or read):
+        if allow_open and abbreviated and (not hinted_sections or read):
             tools = [*tools, _OPEN_TOOL]
         if vision and looks < MAX_LOOKS and any(page_counts.values()):
             # Reading first is NOT the waste it looks like. Offering the page

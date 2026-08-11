@@ -981,3 +981,30 @@ def test_the_defaults_leave_the_walk_unchanged():
     signature = inspect.signature(navigator.navigate)
     assert signature.parameters["vision"].default is True
     assert signature.parameters["behaviour"].default == ""
+
+
+def test_open_document_can_be_withheld():
+    """The tool is offered when the catalogue was shortened, and a caller may
+    decline it. Withheld, the walk navigates from the catalogue and the section
+    hint alone.
+
+    Measured on a seven-document store, medians of two, agentic:
+
+      question                   offered   withheld
+      Harry Potter's owl          10.8s     18.1s
+      STT and TTS engines         10.5s      5.6s
+      components marked missing    8.2s     10.1s
+
+    So it is NOT a latency fix, whatever a single sample suggested (one pair
+    read 14.8s against 3.6s, which was provider variance and nothing else).
+    What it does buy is the same citations either way -- 1, 2 and 2 in both
+    columns -- so a caller who does not want the tool loses nothing by saying
+    so, which is the honest reason to expose it rather than a speed claim.
+    """
+    import inspect
+
+    from packages.core import navigator
+
+    source = inspect.getsource(navigator.navigate)
+    assert "if allow_open and abbreviated and (not hinted_sections or read):" in source
+    assert inspect.signature(navigator.navigate).parameters["allow_open"].default is True

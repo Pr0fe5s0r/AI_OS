@@ -494,6 +494,7 @@ async def answer(
     item_ids: tuple[str, ...] = (),
     vision: bool = True,
     behaviour: str = "",
+    allow_open: bool = True,
 ) -> tuple[Answer, Trace]:
     """Retrieve, then write an answer from what was retrieved.
 
@@ -553,6 +554,7 @@ async def answer(
             only=item_ids,
             vision=vision,
             behaviour=behaviour,
+            allow_open=allow_open,
         )
         result = Answer(
             question=question,

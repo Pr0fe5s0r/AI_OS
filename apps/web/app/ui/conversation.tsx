@@ -334,29 +334,80 @@ export function Evidence({
   );
 }
 
-/** The live trail, while a turn is in flight.
+/** The turn in flight: what it is doing, what it is thinking, what it has
+ *  written so far.
  *
- *  A progress line that never moves is indistinguishable from a hang, and an
- *  agentic answer is a long half minute. */
-export function LiveTrail({ live }: { live: Live }) {
+ *  Lifted verbatim out of query.tsx rather than reinvented. The Playground had
+ *  a flat list of grey lines and no streamed draft at all, so an agentic walk
+ *  showed the question and then a blank pane for half a minute — while the very
+ *  same events were already being folded into a live trail two files away.
+ *
+ *  Every part of it is the point: the spinner says it is alive, the ordered
+ *  list says WHERE it is, the reasoning says what it is weighing, and the draft
+ *  is the answer arriving word by word rather than all at once at the end. */
+export function Thinking({
+  live,
+  mode,
+  pending,
+}: {
+  live: Live | null;
+  mode: api.AskMode;
+  pending?: string | null;
+}) {
   return (
-    <div className="space-y-1">
-      {live.activity.map((a, n) => (
-        <p
-          key={n}
-          className={cx(
-            "font-mono text-2xs",
-            a.kind === "tool" ? "text-subtle" : "text-muted",
-            a.ok === false && "text-hot"
-          )}
-        >
-          {a.kind === "tool" ? "› " : ""}
-          {a.text}
-        </p>
-      ))}
-      {live.draft && (
-        <p className="whitespace-pre-wrap pt-1 text-sm leading-relaxed text-muted">{live.draft}</p>
+    <div className="animate-rise">
+      {pending && (
+        <div className="mb-3 flex items-start gap-2.5">
+          <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md bg-accent/20 font-mono text-2xs text-accentSoft">
+            ?
+          </span>
+          <p className="text-sm text-ink">{pending}</p>
+        </div>
       )}
+      <div className="pl-8">
+        <div className="rounded-xl border border-edge bg-elevated/40 p-3.5">
+          <div className="mb-2 flex items-center gap-2 font-mono text-2xs text-subtle">
+            <span className="h-3 w-3 animate-spin rounded-full border-2 border-edgeStrong border-t-accent" />
+            {mode === "agentic"
+              ? "navigating structure and searching…"
+              : "embedding and searching…"}
+          </div>
+
+          {live && live.activity.length > 0 && (
+            <ol className="space-y-1 border-l border-edge pl-3">
+              {live.activity.map((step, i) => (
+                <li
+                  key={i}
+                  className={cx(
+                    "font-mono text-2xs leading-relaxed",
+                    step.kind === "status"
+                      ? "text-subtle"
+                      : step.ok === false
+                        ? "text-warn"
+                        : "text-accentSoft"
+                  )}
+                >
+                  {step.kind === "tool" ? "› " : ""}
+                  {step.text}
+                </li>
+              ))}
+            </ol>
+          )}
+
+          {live?.reasoning && (
+            <p className="mt-2 line-clamp-3 whitespace-pre-wrap text-2xs italic leading-relaxed text-subtle">
+              {live.reasoning}
+            </p>
+          )}
+
+          {live?.draft && (
+            <p className="mt-2.5 whitespace-pre-wrap border-t border-edge pt-2.5 text-sm leading-relaxed text-ink">
+              {live.draft}
+              <span className="ml-0.5 inline-block h-3.5 w-1.5 animate-pulse bg-accent/60 align-middle" />
+            </p>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
@@ -405,6 +456,16 @@ export type AskSettings = {
   limit?: number;
   mode?: api.AskMode;
   options?: api.AskOptions;
+  /** Show the work as it happens. Off, nothing appears until the answer is
+   *  whole — the difference between watching it think and being handed a
+   *  finished reply.
+   *
+   *  Both go over the same SSE transport, deliberately. The blocking route
+   *  exists and is correct, but Next abandons a proxied rewrite at ~30s and
+   *  returns a bare 500 with nothing in the API log, and agentic answers run
+   *  well past that. So "completion" here means the events are consumed and
+   *  not shown, rather than a request that would sometimes simply fail. */
+  stream?: boolean;
 };
 
 /** One conversation against one collection.
@@ -424,7 +485,7 @@ export function useConversation(collectionId: string | undefined, storageKey?: s
     async (question: string, settings: AskSettings = {}) => {
       const q = question.trim();
       if (!q) return;
-      const { limit = 8, mode = "agentic", options = {} } = settings;
+      const { limit = 8, mode = "agentic", options = {}, stream = true } = settings;
       setBusy(true);
       setError(null);
       setPending(q);
@@ -442,7 +503,7 @@ export function useConversation(collectionId: string | undefined, storageKey?: s
           mode,
           (event) => {
             if (event.type === "done") raw = event.answer;
-            setLive((cur) => reduceLive(cur ?? EMPTY_LIVE, event));
+            if (stream) setLive((cur) => reduceLive(cur ?? EMPTY_LIVE, event));
           },
           options
         );

@@ -7,7 +7,7 @@ import type { Document } from "../data";
 import {
   CitationChips,
   FocusPanel,
-  LiveTrail,
+  Thinking,
   renderAnswer,
   useConversation,
   useRetrievalMode,
@@ -222,6 +222,12 @@ export function Playground({ active }: { active: string | null }) {
   // not silently change how the store answers.
   const [mode, setMode] = useRetrievalMode();
   const [vision, setVision] = useState(true);
+  // Show the work as it happens, or hand over a finished answer.
+  const [stream, setStream] = useState(true);
+  // Off by default. It is the one tool that can spend a round on navigation
+  // rather than on reading, and measured across three questions on this store
+  // the agent did not reach for it once.
+  const [openDoc, setOpenDoc] = useState(false);
   const [behaviourId, setBehaviourId] = useState("default");
   const [behaviour, setBehaviour] = useState("");
   const [docs, setDocs] = useState<string[]>([]);
@@ -285,8 +291,9 @@ export function Playground({ active }: { active: string | null }) {
       docs,
       vision: visionApplies ? vision : undefined,
       behaviour,
+      openDocument: openDoc,
     })}`;
-  }, [answering, q, limit, docs, mode, vision, visionApplies, behaviour]);
+  }, [answering, q, limit, docs, mode, vision, visionApplies, behaviour, openDoc]);
 
   const curl = [
     `curl -H "Authorization: Bearer $KB_API_KEY" \\`,
@@ -325,7 +332,13 @@ export function Playground({ active }: { active: string | null }) {
     await ask(asked, {
       limit,
       mode,
-      options: { docs, vision: visionApplies ? vision : undefined, behaviour },
+      stream,
+      options: {
+        docs,
+        vision: visionApplies ? vision : undefined,
+        behaviour,
+        openDocument: openDoc,
+      },
     });
   }
 
@@ -393,34 +406,40 @@ export function Playground({ active }: { active: string | null }) {
           ) : (
             <div className="mx-auto max-w-3xl space-y-4 py-2">
               {turns.map((turn, n) => (
-                <div key={n}>
-                  <p className="mb-2 text-right text-sm text-muted">{turn.question}</p>
-                  <div
-                    className={cx(
-                      "rounded-xl border p-4",
-                      turn.grounded ? "border-edge bg-elevated/50" : "border-hot/30 bg-hot/5"
-                    )}
-                  >
-                    <p
+                <div key={n} className="animate-rise">
+                  <div className="mb-3 flex items-start gap-2.5">
+                    <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md bg-accent/20 font-mono text-2xs text-accentSoft">
+                      ?
+                    </span>
+                    <p className="text-sm text-ink">{turn.question}</p>
+                  </div>
+
+                  <div className="pl-8">
+                    <div
                       className={cx(
-                        "whitespace-pre-wrap text-sm leading-relaxed",
-                        turn.grounded ? "text-ink" : "text-muted"
+                        "rounded-xl border p-4",
+                        turn.grounded ? "border-edge bg-elevated/50" : "border-hot/30 bg-hot/5"
                       )}
                     >
-                      {renderAnswer(turn.answer, turn.citations, setFocus)}
-                    </p>
-                    {!turn.grounded && (
-                      <p className="mt-2 border-t border-hot/20 pt-2 font-mono text-2xs text-hot">
-                        not supported by the collection — nothing below was cited
+                      <p className="whitespace-pre-wrap text-sm leading-relaxed text-ink">
+                        {renderAnswer(turn.answer, turn.citations, setFocus)}
                       </p>
-                    )}
-                    {turn.degraded && (
-                      <p className="mt-2 font-mono text-2xs text-hot">{turn.degraded}</p>
-                    )}
 
-                    <CitationChips citations={turn.citations} onOpen={setFocus} />
+                      {!turn.grounded && (
+                        <p className="mt-2.5 border-t border-hot/20 pt-2 font-mono text-2xs text-hot">
+                          not supported by the collection — nothing below was cited
+                        </p>
+                      )}
+                      {turn.degraded && (
+                        <p className="mt-2 font-mono text-2xs text-hot">{turn.degraded}</p>
+                      )}
 
-                    <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-edge pt-2.5">
+                      <CitationChips citations={turn.citations} onOpen={setFocus} />
+                    </div>
+
+                    {/* What the Playground adds, and only this: the settings
+                        that produced the answer, so two runs can be compared. */}
+                    <div className="mt-2 flex flex-wrap items-center gap-1.5">
                       <Chip>{turn.mode}</Chip>
                       {turn.settings?.vision && <Chip>vision</Chip>}
                       {turn.settings?.behaviour ? <Chip>styled</Chip> : null}
@@ -434,7 +453,7 @@ export function Playground({ active }: { active: string | null }) {
                       </Chip>
                     </div>
                     {openJson === n && (
-                      <div className="mt-3">
+                      <div className="mt-2">
                         <Code
                           code={JSON.stringify(turn.raw, null, 2)}
                           filename="response.json"
@@ -457,8 +476,7 @@ export function Playground({ active }: { active: string | null }) {
                 </div>
               )}
 
-              {pending && <p className="mb-2 text-right text-sm text-muted">{pending}</p>}
-              {live && <LiveTrail live={live} />}
+              {busy && <Thinking live={live} mode={mode} pending={pending} />}
               <div ref={foot} />
             </div>
           )}
@@ -497,6 +515,8 @@ export function Playground({ active }: { active: string | null }) {
                 <span className="mx-1 h-4 w-px bg-edge" />
                 {answering && <Chip>{mode}</Chip>}
                 {visionApplies && <Chip>{vision ? "vision on" : "vision off"}</Chip>}
+                {answering && !stream && <Chip>completion</Chip>}
+                {visionApplies && openDoc && <Chip>open_document</Chip>}
                 {answering && behaviourId !== "default" && <Chip>{behaviourId}</Chip>}
                 {docs.length > 0 && <Chip>{docs.length} documents</Chip>}
                 <button
@@ -569,6 +589,32 @@ export function Playground({ active }: { active: string | null }) {
             }
           >
             <Toggle on={vision} onChange={setVision} disabled={!visionApplies} />
+          </Row>
+        </div>
+
+        <div className="border-t border-edge">
+          <Row
+            label="Stream"
+            hint={
+              stream
+                ? "Show the steps, the thinking and the answer as they arrive."
+                : "Nothing appears until the answer is whole."
+            }
+          >
+            <Toggle on={stream} onChange={setStream} disabled={!answering} />
+          </Row>
+        </div>
+
+        <div className="border-t border-edge">
+          <Row
+            label="Open document"
+            hint={
+              visionApplies
+                ? "Let the agent open a whole outline when the catalogue is shortened. Off, it navigates from the catalogue and the hint."
+                : "Only the agent navigates. Hybrid ranks and hands over."
+            }
+          >
+            <Toggle on={openDoc} onChange={setOpenDoc} disabled={!visionApplies} />
           </Row>
         </div>
 

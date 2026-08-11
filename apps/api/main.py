@@ -425,6 +425,14 @@ async def answer_question(
             "saying so when the documents do not answer, are not negotiable."
         ),
     ),
+    open_document: bool = Query(
+        True,
+        description=(
+            "Let the agent open a whole document's outline when the catalogue "
+            "was shortened. Off, it navigates from the catalogue and the "
+            "section hint alone."
+        ),
+    ),
     scope: Scope = Depends(workspace_scope),
     principal: dict[str, Any] = Depends(resolve_caller),
     session: AsyncSession = Depends(db),
@@ -470,6 +478,7 @@ async def answer_question(
                 item_ids=tuple(doc or ()),
                 vision=vision,
                 behaviour=behaviour,
+                allow_open=open_document,
             ),
             timeout=ANSWER_DEADLINE_SECONDS,
         )
@@ -518,6 +527,7 @@ async def answer_stream(
     ),
     vision: bool = Query(True, description="See /api/answer."),
     behaviour: str = Query("", max_length=MAX_BEHAVIOUR_CHARS, description="See /api/answer."),
+    open_document: bool = Query(True, description="See /api/answer."),
     scope: Scope = Depends(workspace_scope),
     principal: dict[str, Any] = Depends(resolve_caller),
     session: AsyncSession = Depends(db),
@@ -548,6 +558,7 @@ async def answer_stream(
                     session, scope, q, cfg, mode=mode, emit=emit,
                     item_ids=tuple(doc or ()),
                     vision=vision, behaviour=behaviour,
+                    allow_open=open_document,
                 )
                 await record(
                     session,

@@ -6,6 +6,7 @@ import { Point, cx, ms } from "../data";
 import {
   CitationChips,
   FocusPanel,
+  Thinking,
   renderAnswer,
   useConversation,
   useRetrievalMode,
@@ -269,62 +270,7 @@ export function Query({ active }: { active: string | null }) {
               </div>
             ))}
 
-            {busy && (
-              <div className="animate-rise">
-                {pending && (
-                  <div className="mb-3 flex items-start gap-2.5">
-                    <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md bg-accent/20 font-mono text-2xs text-accentSoft">
-                      ?
-                    </span>
-                    <p className="text-sm text-ink">{pending}</p>
-                  </div>
-                )}
-                <div className="pl-8">
-                  <div className="rounded-xl border border-edge bg-elevated/40 p-3.5">
-                    <div className="mb-2 flex items-center gap-2 font-mono text-2xs text-subtle">
-                      <span className="h-3 w-3 animate-spin rounded-full border-2 border-edgeStrong border-t-accent" />
-                      {mode === "agentic"
-                        ? "navigating structure and searching…"
-                        : "embedding and searching…"}
-                    </div>
-
-                    {live && live.activity.length > 0 && (
-                      <ol className="space-y-1 border-l border-edge pl-3">
-                        {live.activity.map((step, i) => (
-                          <li
-                            key={i}
-                            className={cx(
-                              "font-mono text-2xs leading-relaxed",
-                              step.kind === "status"
-                                ? "text-subtle"
-                                : step.ok === false
-                                  ? "text-warn"
-                                  : "text-accentSoft"
-                            )}
-                          >
-                            {step.kind === "tool" ? "› " : ""}
-                            {step.text}
-                          </li>
-                        ))}
-                      </ol>
-                    )}
-
-                    {live?.reasoning && (
-                      <p className="mt-2 line-clamp-3 whitespace-pre-wrap text-2xs italic leading-relaxed text-subtle">
-                        {live.reasoning}
-                      </p>
-                    )}
-
-                    {live?.draft && (
-                      <p className="mt-2.5 whitespace-pre-wrap border-t border-edge pt-2.5 text-sm leading-relaxed text-ink">
-                        {live.draft}
-                        <span className="ml-0.5 inline-block h-3.5 w-1.5 animate-pulse bg-accent/60 align-middle" />
-                      </p>
-                    )}
-                  </div>
-                </div>
-              </div>
-            )}
+            {busy && <Thinking live={live} mode={mode} pending={pending} />}
             {error && (
               <p className="rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 font-mono text-2xs text-danger">
                 {error}

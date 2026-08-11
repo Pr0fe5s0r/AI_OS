@@ -581,6 +581,9 @@ export type AskOptions = {
   /** How the answer should be written. Style only — it cannot change what may
    *  be said, which the server enforces rather than trusting. */
   behaviour?: string;
+  /** Let the agent open a whole document's outline when the catalogue was
+   *  shortened. Off, it navigates from the catalogue and the hint alone. */
+  openDocument?: boolean;
 };
 
 /** The query string for an ask, shared by `ask` and the curl the console shows,
@@ -595,6 +598,7 @@ export function askParams(
   for (const id of options.docs ?? []) params.append("doc", id);
   if (options.vision === false) params.set("vision", "false");
   if (options.behaviour?.trim()) params.set("behaviour", options.behaviour.trim());
+  if (options.openDocument === false) params.set("open_document", "false");
   return params.toString();
 }
 
