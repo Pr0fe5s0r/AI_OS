@@ -10,6 +10,7 @@ import {
   LiveTrail,
   renderAnswer,
   useConversation,
+  useRetrievalMode,
 } from "../ui/conversation";
 import { Chip, Code, Label, Mono } from "../ui/kit";
 
@@ -217,7 +218,9 @@ function Row({
  *  one, because it is indistinguishable from a broken one. */
 export function Playground({ active }: { active: string | null }) {
   const [endpoint, setEndpoint] = useState<Endpoint>("answer");
-  const [mode, setMode] = useState<api.AskMode>("agentic");
+  // The SAME preference Query & chat uses. Opening a different page must
+  // not silently change how the store answers.
+  const [mode, setMode] = useRetrievalMode();
   const [vision, setVision] = useState(true);
   const [behaviourId, setBehaviourId] = useState("default");
   const [behaviour, setBehaviour] = useState("");

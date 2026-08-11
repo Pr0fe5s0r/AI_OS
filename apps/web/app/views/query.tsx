@@ -8,6 +8,7 @@ import {
   FocusPanel,
   renderAnswer,
   useConversation,
+  useRetrievalMode,
 } from "../ui/conversation";
 import { Card, Chip, HeatLegend, Label, Mono, ScoreBar, VectorField } from "../ui/kit";
 
@@ -38,23 +39,8 @@ export function Query({ active }: { active: string | null }) {
   // implementations of it is how the Playground ended up with a worse
   // rendering of citations than this page had all along.
   const { turns, live, pending, busy, error, ask: run } = useConversation(collectionId, "query");
-  // Remembered rather than reset every visit: a retrieval preference is a
-  // standing choice about how you want the store to work, not a per-question
-  // one. Agentic is the default — it reaches the whole collection.
-  const [mode, setMode] = useState<api.AskMode>("agentic");
-
-  useEffect(() => {
-    const saved = localStorage.getItem("retrieval-mode");
-    if (saved === "hybrid" || saved === "agentic") setMode(saved);
-    // vectorless was retired as a choice; carry an old preference over to
-    // agentic, which does the same catalogue reasoning and also reaches the rest.
-    else if (saved === "vectorless") setMode("agentic");
-  }, []);
-
-  function choose(next: api.AskMode) {
-    setMode(next);
-    localStorage.setItem("retrieval-mode", next);
-  }
+  // Shared with the Playground: one standing choice, not one per page.
+  const [mode, choose] = useRetrievalMode();
   // The most recent turn, for the retrieval-space aside on the right.
   const latest = turns[turns.length - 1];
   const endRef = useRef<HTMLDivElement>(null);

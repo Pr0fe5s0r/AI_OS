@@ -367,6 +367,40 @@ export function LiveTrail({ live }: { live: Live }) {
 // bounded because every turn carries its passages and the quota is small.
 const HISTORY_LIMIT = 40;
 
+/** The retrieval preference, remembered and shared by every page that asks.
+ *
+ *  It is ONE preference. A standing choice about how you want the store to
+ *  work does not become a different choice because you opened a different
+ *  page — and when the two pages disagreed, the disagreement was invisible and
+ *  looked like a bug in the slower one. Query remembered your choice while the
+ *  Playground always started on agentic, so a store set to hybrid answered in
+ *  about a second on one page and took the better part of a minute on the
+ *  other, for the same question and the same code underneath. That reads as
+ *  the Playground running something older. It was running what it was told.
+ */
+export function useRetrievalMode(): [api.AskMode, (next: api.AskMode) => void] {
+  const [mode, setMode] = useState<api.AskMode>("agentic");
+
+  useEffect(() => {
+    const saved = window.localStorage.getItem("retrieval-mode");
+    if (saved === "hybrid" || saved === "agentic") setMode(saved);
+    // vectorless was retired as a choice; an old preference carries over to
+    // agentic, which does the same catalogue reasoning and reaches the rest.
+    else if (saved === "vectorless") setMode("agentic");
+  }, []);
+
+  const choose = useCallback((next: api.AskMode) => {
+    setMode(next);
+    try {
+      window.localStorage.setItem("retrieval-mode", next);
+    } catch {
+      /* private mode — the choice still holds for this session */
+    }
+  }, []);
+
+  return [mode, choose];
+}
+
 export type AskSettings = {
   limit?: number;
   mode?: api.AskMode;
