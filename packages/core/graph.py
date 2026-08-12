@@ -499,33 +499,96 @@ async def replace_near_edges(scope: Scope, edges: list[dict]) -> int:
 
 
 async def chunk_neighbours(scope: Scope, chunk_id: str, limit: int = 10) -> list[dict]:
-    """The passages nearest this one — the store's own graph links, either way.
+    """The passages related to this one — the store's own graph links, either way.
 
     This is the traversal primitive. Given a passage, it returns what sits next
-    to it in meaning, so an agent — ours, or a caller's own LLM through the SDK —
-    can walk from one passage to related material a fresh search might not reach,
-    a hop at a time. NEAR edges are matched in both directions because they are
-    stored once per pair but mean an undirected relationship. Archived
-    neighbours are excluded: a hop must never land on content the store has
-    already retired.
+    to it, so an agent — ours, or a caller's own LLM through the SDK — can walk
+    from one passage to related material a fresh search might not reach, a hop at
+    a time.
+
+    Two kinds of edge, and an AUTHORED one always beats a merely-similar one:
+      :RELATED  a typed judgement (elaborates/defines/supports/contradicts/
+                precedes) written by the labelling pass — a reason two passages
+                belong together, which cosine cannot reconstruct.
+      :NEAR     cosine similarity, computed by consolidation.
+    Both are matched in both directions (stored once per pair). A neighbour
+    reachable by both is returned once, as its typed relation. `relation` is the
+    edge kind ("near" when only similarity links them); results are ordered
+    authored-first, then by weight. Archived neighbours are excluded.
     """
     clause, params = _scope_clause("c", scope)
     return await _run(
         f"""
         MATCH (c:Chunk {{chunk_id: $chunk_id}}) WHERE {clause}
-        MATCH (c)-[r:NEAR]-(n:Chunk)
+        MATCH (c)-[r:NEAR|RELATED]-(n:Chunk)
         WHERE n.status = $active
+          AND NOT (type(r) = 'RELATED' AND coalesce(r.relation, 'none') = 'none')
+        WITH n, collect(r) AS rels
+        WITH n,
+             head([x IN rels WHERE type(x) = 'RELATED']) AS typed,
+             head([x IN rels WHERE type(x) = 'NEAR']) AS near
+        WITH n, typed,
+             CASE WHEN typed IS NOT NULL THEN typed.relation ELSE 'near' END AS relation,
+             CASE WHEN typed IS NOT NULL THEN coalesce(typed.confidence, 0.6)
+                  ELSE coalesce(near.similarity, 0.0) END AS weight
         RETURN n.chunk_id AS chunk_id, n.item_id AS item_id,
                n.heading AS heading, n.title AS title,
                coalesce(properties(n)['node_type'], 'fact') AS node_type,
-               r.similarity AS similarity
-        ORDER BY r.similarity DESC
+               relation AS relation, weight AS similarity,
+               (typed IS NOT NULL) AS typed
+        ORDER BY typed DESC, weight DESC
         LIMIT $limit
         """,
         chunk_id=chunk_id,
         active=str(Lifecycle.ACTIVE),
         limit=limit,
         **params,
+    )
+
+
+async def unlabeled_near_pairs(scope: Scope, limit: int = 20) -> list[dict]:
+    """NEAR pairs that have not been typed yet — the edge-labeller's worklist.
+
+    One row per unordered pair (a.chunk_id < b.chunk_id), and only pairs with no
+    :RELATED edge in either direction — so a pair is processed once, whatever the
+    labeller decided (a real relation, or 'none').
+    """
+    clause, params = _scope_clause("a", scope)
+    return await _run(
+        f"""
+        MATCH (a:Chunk)-[:NEAR]-(b:Chunk)
+        WHERE {clause} AND a.chunk_id < b.chunk_id
+          AND coalesce(a.node_type, 'fact') = 'fact'
+          AND coalesce(b.node_type, 'fact') = 'fact'
+          AND NOT (a)-[:RELATED]-(b)
+        RETURN DISTINCT a.chunk_id AS src, b.chunk_id AS dst
+        LIMIT $limit
+        """,
+        limit=limit,
+        **params,
+    )
+
+
+async def link_chunk(
+    scope: Scope, src: str, dst: str, relation: str, confidence: float
+) -> None:
+    """Write one authored typed edge between two passages (directional src→dst).
+
+    A 'none' relation is still recorded — it marks the pair as processed so the
+    labeller does not keep paying to re-decide a pair it already judged
+    unrelated. The traversal filters 'none' out.
+    """
+    await _run(
+        """
+        MATCH (a:Chunk {chunk_id: $src})
+        MATCH (b:Chunk {chunk_id: $dst})
+        MERGE (a)-[r:RELATED]->(b)
+        SET r.relation = $relation, r.confidence = $confidence
+        """,
+        src=src,
+        dst=dst,
+        relation=relation,
+        confidence=confidence,
     )
 
 

@@ -183,7 +183,10 @@ export interface Neighbor {
   heading: string;
   title: string;
   nodeType: string;
+  /** The edge kind: an authored judgement ("elaborates", "defines", "supports",
+   *  "contradicts", "precedes") when `typed` is true, else "near" (cosine). */
   relation: string;
+  typed: boolean;
   similarity: number;
 }
 
@@ -195,6 +198,7 @@ export function toNeighbor(d: Raw): Neighbor {
     title: d.title ?? "",
     nodeType: d.node_type ?? "fact",
     relation: d.relation ?? "near",
+    typed: Boolean(d.typed),
     similarity: Number(d.similarity ?? 0) || 0,
   };
 }

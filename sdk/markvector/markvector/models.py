@@ -291,7 +291,11 @@ class Neighbor:
     heading: str
     title: str
     node_type: str = "fact"
+    # The edge kind. An authored judgement — "elaborates", "defines",
+    # "supports", "contradicts", "precedes" — when the labeller wrote one
+    # (`typed` is then True), else "near" for a plain cosine link.
     relation: str = "near"
+    typed: bool = False
     similarity: float = 0.0
 
     @classmethod
@@ -303,6 +307,7 @@ class Neighbor:
             title=d.get("title", "") or "",
             node_type=d.get("node_type", "fact") or "fact",
             relation=d.get("relation", "near") or "near",
+            typed=bool(d.get("typed")),
             similarity=float(d.get("similarity", 0) or 0),
         )
 
