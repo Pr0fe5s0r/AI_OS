@@ -19,12 +19,13 @@ from markvector import AgentAnswer, Markvector, Thinking, ToolCall, ToolResult
 def main() -> None:
     question = " ".join(sys.argv[1:]) or "what is the bank details?"
 
-    mv = Markvector(api_key="kb_live_4yVotNdXLTGxADrMsNVqgq8zjByGSbAs0oMn4ZIHPTk")  # MARKVECTOR_API_KEY / MARKVECTOR_URL
-    agent = mv.collection("checking-collection").agent(
-        api_key="v1.CmMKHHN0YXRpY2tleS1lMDBreGJhdnBxNTJwOTd6enQSIXNlcnZpY2VhY2NvdW50LWUwMHljeWt5bjhyendhNDRlcTILCP6wrswGEMDPzzM6DAj9s8aXBxCA_OuOAkACWgNlMDA.AAAAAAAAAAFX3TPuGB5p10KSS8cwpiVYwqtWfUPdUXSFnnTy4z17Vqzn8Hr2V_C-7B4BJkBtTwDviyGwibudnPbztpworoYE",
-        base_url="https://api.studio.nebius.com/v1",
-        model="zai-org/GLM-5.2",
-
+    # Reads MARKVECTOR_API_KEY / MARKVECTOR_URL from the environment. Keys do not
+    # belong in a file that gets committed.
+    mv = Markvector()
+    agent = mv.collection(os.environ.get("MARKVECTOR_COLLECTION", "cookbook")).agent(
+        api_key=os.environ["OPENAI_API_KEY"],
+        base_url=os.environ.get("OPENAI_BASE_URL"),  # any compatible endpoint
+        model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
     )
 
     for event in agent.stream(question):

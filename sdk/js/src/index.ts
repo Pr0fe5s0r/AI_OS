@@ -23,6 +23,7 @@ export type {
   MintedKey,
   Neighbor,
   Original,
+  Region,
   Results,
   Section,
   Source,

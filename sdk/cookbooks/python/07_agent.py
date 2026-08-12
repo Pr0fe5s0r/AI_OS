@@ -1,11 +1,21 @@
 """07 · Agent — reason + tools, streamed, with your own LLM.
 
 The agent runs entirely client-side: it reasons, calls read-only markvector
-tools (search / list / structure / read_document) to look things up, and keeps
-going until it can answer. Bring any OpenAI-compatible endpoint.
+tools (overview / search / list_files / structure / read_document / neighbors)
+to look things up, and keeps going until it can answer. Bring any
+OpenAI-compatible endpoint.
+
+A `neighbors` hop returns `relation` and `typed`. Where `typed` is true the
+relation is an authored judgement — elaborates, defines, supports, contradicts,
+precedes — and the built-in prompt acts on it: it follows `elaborates` to fill a
+thin answer, and on `contradicts` it reports that the collection disagrees with
+itself and cites both sides instead of quietly picking a winner. Where `typed`
+is false the relation is only "near", a cosine resemblance nobody vouched for.
+This recipe prints the relation on every hop so you can watch that happen.
 
     pip install 'markvector[agent]'
-    export OPENAI_API_KEY=sk-…
+    export MARKVECTOR_API_KEY=kb_live_…      # the collection
+    export OPENAI_API_KEY=sk-…               # the model
     python python/07_agent.py "how are refunds handled?"
 """
 from __future__ import annotations
@@ -24,14 +34,16 @@ from markvector import (
 
 
 def main(question: str) -> None:
-    with Markvector(api_key="kb_live_SzftqASz9j89vL7eNQp__kWjtvuOyXwSMRB0iONmYEs", base_url="http://localhost:8000") as mv:
-        
-        docs = mv.collection("tn-organization-brain")
+    # Reads MARKVECTOR_API_KEY and MARKVECTOR_URL from the environment when the
+    # constructor arguments are omitted. Keys do not belong in a file that gets
+    # committed — a recipe is the easiest place in a repository to leak one.
+    with Markvector() as mv:
+        docs = mv.collection(os.environ.get("MARKVECTOR_COLLECTION", "cookbook"))
 
         agent = docs.agent(
-            api_key="v1.CmMKHHN0YXRpY2tleS1lMDBreGJhdnBxNTJwOTd6enQSIXNlcnZpY2VhY2NvdW50LWUwMHljeWt5bjhyendhNDRlcTILCP6wrswGEMDPzzM6DAj9s8aXBxCA_OuOAkACWgNlMDA.AAAAAAAAAAFX3TPuGB5p10KSS8cwpiVYwqtWfUPdUXSFnnTy4z17Vqzn8Hr2V_C-7B4BJkBtTwDviyGwibudnPbztpworoYE",   # your LLM key
-            model="moonshotai/Kimi-K2.6",
-            base_url="https://api.studio.nebius.com/v1",  # any compatible endpoint
+            api_key=os.environ["OPENAI_API_KEY"],
+            model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+            base_url=os.environ.get("OPENAI_BASE_URL"),  # any compatible endpoint
             instructions="Answer in three sentences or fewer. Cite the filename.",
         )
 
@@ -43,6 +55,10 @@ def main(question: str) -> None:
             elif isinstance(event, ToolCall):
                 print(f"\n  → {event.name}({event.arguments})")
             elif isinstance(event, ToolResult):
+                # For a `neighbors` hop the summary names the authored relations
+                # that came back — "6 results (4× elaborates, 1× contradicts)" —
+                # so a disagreement is visible in the transcript as it happens,
+                # rather than only implied by the wording of the final answer.
                 print(f"  ← {event.summary}")
             elif isinstance(event, AgentAnswer):
                 print(f"\n\nANSWER:\n{event.text}")

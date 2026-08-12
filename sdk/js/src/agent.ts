@@ -18,7 +18,16 @@ Work like this:
 3. Search ONLY when the overview does not make the source obvious: a specific figure, name or identifier no card would mention, or when you genuinely cannot tell which document to open.
 4. When a passage a search or read returned is close but not complete, call neighbors on its chunk_id to reach the passages nearest it in the store's graph — often the rest of the answer sits one hop away.
 
-Ground every claim in what the tools returned — do not use outside knowledge. The overview is a MAP, not evidence: never cite it; cite the real document (item_id / filename) a claim came from. If the knowledge base does not contain the answer, say so plainly rather than guessing.`;
+Read the relation on every neighbour before you use it. Where typed is true, someone judged how those two passages stand to each other, and the judgements mean different things to you:
+- contradicts — the two sources disagree. Never quietly pick one. Say that the knowledge base disagrees with itself and cite BOTH, so the reader decides.
+- elaborates / defines — the detail or the definition behind a passage you already have. Follow these when the answer is thin or a term needs pinning down.
+- supports — a second, independent source for the same claim. Worth citing alongside the first; it is corroboration, not repetition.
+- precedes — the earlier state of something. Check for a later passage before presenting it as current, or you will report superseded facts as today's.
+Where typed is false the relation is only "near": a cosine resemblance nobody vouched for. Treat it as a lead to check, never as evidence of a relationship.
+
+Ground every claim in what the tools returned — do not use outside knowledge. The overview is a MAP, not evidence: never cite it; cite the real document (item_id / filename) a claim came from.
+
+Say plainly what you could not establish. If the knowledge base does not contain the answer, say so rather than guessing; if it answers only part, give that part and name the gap; if the sources conflict, report the conflict as the finding. A hedged paragraph that hides which of these happened is worse than a short answer that names it.`;
 
 type JsonObject = Record<string, unknown>;
 type Message = Record<string, unknown>;
@@ -180,7 +189,7 @@ const TOOLS = [
     function: {
       name: "neighbors",
       description:
-        "Given a passage's chunk_id (from a search result, or an earlier neighbors hop), list the passages nearest it in meaning — the store's own similarity graph. Related material often sits one hop from the first hit, where a fresh search would miss it. Returns each neighbour's chunk_id (hop again from it), the document it belongs to, and how close it is.",
+        "Given a passage's chunk_id (from a search result, or an earlier neighbors hop), list the passages nearest it in meaning — the store's own similarity graph. Related material often sits one hop from the first hit, where a fresh search would miss it. Returns each neighbour's chunk_id (hop again from it), the document it belongs to, how close it is, and `relation`: when `typed` is true this is an authored judgement about how the two passages stand to each other — elaborates, defines, supports, contradicts, precedes — and when false it is merely \"near\", a cosine resemblance nobody vouched for.",
       parameters: {
         type: "object",
         properties: {
@@ -434,6 +443,11 @@ export class Agent {
             item_id: n.itemId,
             heading: n.heading,
             title: n.title,
+            // The edge, not just the distance. "contradicts" and "elaborates"
+            // are opposite instructions to a reader, and collapsing both into a
+            // similarity score threw away the one thing that told them apart.
+            relation: n.relation,
+            typed: n.typed,
             similarity: Math.round(n.similarity * 10000) / 10000,
           }));
       }
@@ -462,7 +476,26 @@ function finiteNumber(value: unknown, fallback: number): number {
 }
 
 function summarise(result: unknown): string {
-  if (Array.isArray(result)) return `${result.length} result${result.length === 1 ? "" : "s"}`;
+  if (Array.isArray(result)) {
+    const gist = `${result.length} result${result.length === 1 ? "" : "s"}`;
+    // Name the authored relations a hop found. "10 results" hides the one thing
+    // worth watching for — that a `contradicts` edge came back and the answer is
+    // about to have to report a disagreement rather than a fact.
+    const kinds = new Map<string, number>();
+    for (const row of result) {
+      if (row === null || typeof row !== "object") continue;
+      const value = row as JsonObject;
+      if (!value.typed) continue;
+      const kind = String(value.relation);
+      kinds.set(kind, (kinds.get(kind) ?? 0) + 1);
+    }
+    if (kinds.size === 0) return gist;
+    const named = [...kinds.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([kind, n]) => `${n}× ${kind}`)
+      .join(", ");
+    return `${gist} (${named})`;
+  }
   if (result !== null && typeof result === "object") {
     const value = result as JsonObject;
     if ("error" in value) return `error: ${String(value.error)}`;
