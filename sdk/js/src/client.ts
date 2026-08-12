@@ -24,10 +24,10 @@ import {
   toResults,
   toStructure,
 } from "./models.js";
+import { SDK_CLIENT } from "./version.js";
 
 const DEFAULT_URL = "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me";
 const RETRYABLE = new Set([429, 500, 502, 503, 504]);
-const SDK_CLIENT = "javascript/0.2.0";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
