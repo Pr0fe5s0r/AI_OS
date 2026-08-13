@@ -6,6 +6,7 @@ import { cx, ms } from "../data";
 import type { Document } from "../data";
 import {
   CitationChips,
+  Figures,
   FocusPanel,
   Thinking,
   renderAnswer,
@@ -435,6 +436,7 @@ export function Playground({ active }: { active: string | null }) {
                       )}
 
                       <CitationChips citations={turn.citations} onOpen={setFocus} />
+                      <Figures citations={turn.citations} question={turn.question} />
                     </div>
 
                     {/* What the Playground adds, and only this: the settings

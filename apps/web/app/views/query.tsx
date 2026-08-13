@@ -5,6 +5,7 @@ import * as api from "../api";
 import { Point, cx, ms } from "../data";
 import {
   CitationChips,
+  Figures,
   FocusPanel,
   Thinking,
   renderAnswer,
@@ -157,6 +158,7 @@ export function Query({ active }: { active: string | null }) {
                       )}
 
                       <CitationChips citations={t.citations} onOpen={setFocus} />
+                      <Figures citations={t.citations} question={t.question} />
                     </div>
                   </div>
                 )}

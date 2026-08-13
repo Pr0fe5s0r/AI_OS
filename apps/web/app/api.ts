@@ -507,6 +507,33 @@ export function pageImageUrl(itemId: string, page: number): string {
   return `${API}/api/items/${encodeURIComponent(itemId)}/pages/${page}`;
 }
 
+/** A picture INSIDE a page — a diagram, a flowchart, a chart, a photograph —
+ *  as a box to crop out of that page's picture. Percentages from the top-left,
+ *  the same units the vision regions use, so one component draws both. */
+export type Figure = {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  /** "image" for something placed as a picture, "drawing" for vector artwork. */
+  kind: string;
+  /** The caption printed under it in the document, when it has one. Read off
+   *  the page, never written about it. */
+  caption: string;
+};
+
+/** Where the pictures are on one page.
+ *
+ *  Fetched AFTER an answer has arrived, against the pages it cited. Never part
+ *  of the answer request: a reader who asked a question about text should not
+ *  wait a millisecond on pictures they will not scroll to. */
+export async function pageFigures(itemId: string, page: number): Promise<Figure[]> {
+  const out = await call<{ figures: Figure[] }>(
+    `/api/items/${encodeURIComponent(itemId)}/pages/${page}/figures`
+  );
+  return out.figures || [];
+}
+
 /** One thing the agent did on the way to the answer.
  *
  *  `action` is "read" (opened a section, which became a citation), "missed"

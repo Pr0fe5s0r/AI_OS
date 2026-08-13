@@ -26,7 +26,7 @@ from apps.common.consolidation import enabled as consolidation_enabled
 from apps.common.consolidation import interval_seconds as consolidation_interval
 from apps.common.summaries import coverage as summary_coverage_for
 from apps.common.summaries import missing_cards
-from packages.core import audit, blobs, graph, pages, tree
+from packages.core import audit, blobs, figures, graph, pages, tree
 from packages.core.answer import answer
 from packages.core.chunks import by_ids as chunks_by_ids
 from packages.core.chunks import for_item as chunks_for_item
@@ -1107,6 +1107,35 @@ async def item_page(
         # it is worth caching hard. Private because it is workspace data.
         headers={"Cache-Control": "private, max-age=86400"},
     )
+
+
+@app.get("/api/items/{item_id}/pages/{page}/figures")
+async def item_page_figures(
+    item_id: str,
+    page: int,
+    scope: Scope = Depends(workspace_scope),
+    session: AsyncSession = Depends(db),
+) -> dict[str, Any]:
+    """Where the pictures are on this page, as boxes to crop out of it.
+
+    Asked for by the reader AFTER an answer has arrived, against the pages that
+    answer cited — never during it. That is the whole reason this is a route of
+    its own rather than a field on the answer: an answer must not wait on
+    anything a reader might not scroll to, and a store with no diagrams in it
+    stays exactly as fast as it was.
+
+    Empty is a perfectly good reply, and the common one. Most pages of most
+    documents are words.
+    """
+    if await get_item(session, scope, item_id) is None:
+        raise HTTPException(404, "No such item.")
+    if page < 1:
+        raise HTTPException(422, "Pages are numbered from 1.")
+    return {
+        "figures": await figures.for_page(scope.workspace_id, item_id, page),
+        # Cached like the picture it crops: same file, same rules, same boxes.
+        "page": page,
+    }
 
 
 # ---------------------------------- brands ----------------------------------

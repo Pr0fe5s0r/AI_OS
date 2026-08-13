@@ -285,6 +285,262 @@ export function FocusPanel({
   );
 }
 
+// --------------------------------- figures ---------------------------------
+//
+// A page picture answers "where did this come from?". It does not answer "show
+// me the architecture diagram" — the diagram arrives three centimetres tall in
+// the corner of a sheet of paper, with the rest of the page around it.
+//
+// So the pictures INSIDE the cited pages are cropped out and shown under the
+// answer. Two sources, one presentation, because to a reader they are the same
+// thing:
+//
+//   * what the store found on the page (deterministic, from the PDF's own
+//     object tree — no model, no tokens, no time on the answer path), and
+//   * where a vision read said it was looking, when the walk used one.
+//
+// Nothing here is on the answer path. The strip mounts with the finished turn
+// and fetches per cited page; a store with no diagrams in it is exactly as fast
+// as it was before any of this existed.
+
+export type Shown = api.Figure & {
+  item_id: string;
+  page: number;
+  title: string;
+  /** "page" — found in the document. "read" — where a vision read looked. */
+  source: "page" | "read";
+};
+
+/** Whether a question is ASKING about pictures.
+ *
+ *  Used only to decide how prominent the strip starts, never whether figures
+ *  are fetched or shown. Getting this wrong therefore costs a click, not a
+ *  diagram — which is the only reason a word list is allowed to make the call.
+ */
+const _ABOUT_PICTURES =
+  /\b(diagram|diagrams|flow ?charts?|flow ?diagrams?|architectur\w*|chart|charts|graph|graphs|figure|figures|image|images|picture|pictures|photo\w*|screenshots?|drawing|drawings|illustrat\w*|visuali[sz]\w*|schematic|layout|wireframe|infographic|plot|map)\b/i;
+
+export function asksAboutPictures(question: string): boolean {
+  return _ABOUT_PICTURES.test(question);
+}
+
+/** Every picture on every page this answer cited, in citation order.
+ *
+ *  Fetched once per distinct page, not once per citation — three citations off
+ *  page 6 is one request. Failures are silent by design: a page whose figures
+ *  cannot be worked out still has its text, and an error banner over a picture
+ *  nobody asked for would be the tail wagging the dog. */
+export function useFigures(citations: api.Citation[]): Shown[] {
+  const [found, setFound] = useState<Shown[]>([]);
+
+  // The identity of the request, not the array: citations arrive as a new array
+  // on every render, and depending on the array itself would refetch forever.
+  const wanted = citations
+    .filter((c) => c.page != null)
+    .map((c) => `${c.item_id}:${c.page}`)
+    .filter((key, index, all) => all.indexOf(key) === index)
+    .join("|");
+
+  useEffect(() => {
+    let live = true;
+    if (!wanted) {
+      setFound([]);
+      return;
+    }
+    const titles = new Map(citations.map((c) => [`${c.item_id}:${c.page}`, c.title]));
+
+    (async () => {
+      const pages = wanted.split("|");
+      const results = await Promise.all(
+        pages.map(async (key) => {
+          const [itemId, page] = [key.slice(0, key.lastIndexOf(":")), Number(key.split(":").pop())];
+          try {
+            const figures = await api.pageFigures(itemId, page);
+            return figures.map((f) => ({
+              ...f,
+              item_id: itemId,
+              page,
+              title: titles.get(key) || "",
+              source: "page" as const,
+            }));
+          } catch {
+            return [];
+          }
+        })
+      );
+      if (live) setFound(results.flat());
+    })();
+
+    return () => {
+      live = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wanted]);
+
+  // What a vision read pointed at, kept alongside. A region is already a box on
+  // a page in the same units, so it crops identically — and when the walk
+  // looked at a page, its own idea of where it was looking is better evidence
+  // than anything inferred from the file.
+  const regions: Shown[] = citations.flatMap((c) =>
+    c.page == null
+      ? []
+      : (c.regions || []).map((r) => ({
+          ...r,
+          kind: "read",
+          caption: r.label || "",
+          item_id: c.item_id,
+          page: c.page as number,
+          title: c.title,
+          source: "read" as const,
+        }))
+  );
+
+  // A read region sitting on top of a found figure is the same picture twice.
+  const kept = found.filter(
+    (f) =>
+      !regions.some(
+        (r) =>
+          r.item_id === f.item_id &&
+          r.page === f.page &&
+          Math.abs(r.x - f.x) < 12 &&
+          Math.abs(r.y - f.y) < 12
+      )
+  );
+  return [...regions, ...kept];
+}
+
+/** One figure, cropped out of its page picture with CSS.
+ *
+ *  Cropped rather than cut: the page PNG is one request the browser already has
+ *  cached from the citation panel, and every figure on it is a transform of
+ *  that same image. Producing crops server-side would mean a new blob, a new
+ *  route and a new cache for something the browser can do for nothing.
+ *
+ *  The page's own proportions are measured rather than assumed — letter, A4 and
+ *  a landscape slide are all different, and a guess would show every diagram
+ *  subtly stretched. */
+export function FigureCrop({ figure, className }: { figure: Shown; className?: string }) {
+  const [ratio, setRatio] = useState<number | null>(null);
+  const src = api.pageImageUrl(figure.item_id, figure.page);
+
+  useEffect(() => {
+    let live = true;
+    const probe = new Image();
+    probe.crossOrigin = "use-credentials";
+    probe.onload = () => {
+      if (live && probe.naturalHeight) setRatio(probe.naturalWidth / probe.naturalHeight);
+    };
+    probe.src = src;
+    return () => {
+      live = false;
+    };
+  }, [src]);
+
+  // Until the page has been measured, letter paper — close enough that nothing
+  // visibly jumps when the real number arrives.
+  const pageRatio = ratio ?? 8.5 / 11;
+  const aspect = (figure.w * pageRatio) / figure.h;
+
+  return (
+    <div
+      className={cx("relative overflow-hidden bg-white", className)}
+      style={{ aspectRatio: `${aspect}` }}
+    >
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        src={src}
+        alt={figure.caption || `Figure on page ${figure.page} of ${figure.title}`}
+        // Cross-origin API, cookie session: without this the browser sends no
+        // credentials and every figure comes back 401.
+        crossOrigin="use-credentials"
+        className="absolute max-w-none"
+        style={{
+          width: `${(100 / figure.w) * 100}%`,
+          left: `${-(figure.x / figure.w) * 100}%`,
+          top: `${-(figure.y / figure.h) * 100}%`,
+          height: `${(100 / figure.h) * 100}%`,
+        }}
+      />
+    </div>
+  );
+}
+
+/** The pictures behind an answer, as a row of crops under it.
+ *
+ *  Opens onto the figure at full size with the page it was cut from beside it,
+ *  because a crop is a claim about where something is and the page is what
+ *  makes that checkable — the same argument the citation panel makes about
+ *  transcribed text. */
+export function Figures({ citations, question }: { citations: api.Citation[]; question: string }) {
+  const figures = useFigures(citations);
+  const [open, setOpen] = useState<number | null>(null);
+
+  // Asked about pictures? Then the first one is already open. Otherwise the
+  // strip sits quietly under the answer and waits to be clicked.
+  const asked = asksAboutPictures(question);
+  useEffect(() => {
+    setOpen(asked && figures.length > 0 ? 0 : null);
+  }, [asked, figures.length]);
+
+  if (figures.length === 0) return null;
+  const showing = open != null ? figures[open] : null;
+
+  return (
+    <div className="mt-3 border-t border-edge pt-3">
+      <Label>
+        {figures.length === 1 ? "figure" : "figures"} · {figures.length}
+      </Label>
+
+      <div className="mt-2 flex flex-wrap gap-2">
+        {figures.map((figure, index) => (
+          <button
+            key={`${figure.item_id}-${figure.page}-${figure.x}-${figure.y}-${index}`}
+            onClick={() => setOpen(open === index ? null : index)}
+            title={figure.caption || `page ${figure.page} · ${figure.title}`}
+            className={cx(
+              "group w-28 shrink-0 overflow-hidden rounded-md border text-left transition",
+              open === index
+                ? "border-accent"
+                : "border-edge hover:border-accent/50"
+            )}
+          >
+            <FigureCrop figure={figure} className="w-full" />
+            <span className="block truncate border-t border-edge bg-canvas/60 px-1.5 py-1 font-mono text-[0.6rem] text-subtle">
+              {figure.source === "read" ? "read" : `p${figure.page}`}
+              {figure.caption ? ` · ${figure.caption}` : ""}
+            </span>
+          </button>
+        ))}
+      </div>
+
+      {showing && (
+        <figure className="mt-2.5 rounded-lg border border-edge bg-canvas/60 p-2.5">
+          <FigureCrop figure={showing} className="mx-auto max-h-[26rem] w-full rounded" />
+          <figcaption className="mt-2 flex items-baseline justify-between gap-3 text-2xs">
+            <span className="min-w-0 flex-1 text-muted">
+              {showing.caption || (
+                <span className="text-subtle">
+                  {showing.source === "read"
+                    ? "where this answer was read from"
+                    : `${showing.kind === "image" ? "picture" : "drawing"} on this page`}
+                </span>
+              )}
+            </span>
+            <a
+              href={api.pageImageUrl(showing.item_id, showing.page)}
+              target="_blank"
+              rel="noreferrer"
+              className="shrink-0 font-mono text-2xs text-accentSoft hover:underline"
+            >
+              page {showing.page} ↗
+            </a>
+          </figcaption>
+        </figure>
+      )}
+    </div>
+  );
+}
+
 /** The evidence, in full, under the answer it produced.
  *
  *  Chips with the passage in a tooltip were not showing a citation, they were
