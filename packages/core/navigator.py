@@ -834,6 +834,48 @@ def _strip_medium_apology(text: str) -> str:
     return trimmed or text
 
 
+# How many page numbers to name. A list of thirty is not a hint, it is the
+# document again.
+MAX_NAMED_PICTURE_PAGES = 8
+
+
+async def _where_the_pictures_are(scope: Any, doc_id: str, question: str) -> str:
+    """Name the pages that actually hold a picture, when the question wants one.
+
+    A document is navigated by its TEXT, and a diagram is invisible to that. The
+    casino platform's architecture diagrams sit on pages 6, 7 and 9 with no
+    caption to give them away, so a walk asked for "the architecture diagram"
+    read the pages whose WORDS said architecture, looked at pages 4-6, and
+    answered that the document contains no such diagram. The store knew where
+    they were and had no way to say so.
+
+    Only for questions about pictures, and only ever a hint. It aims a look; it
+    never asserts what the picture shows — the model still has to look, and what
+    it reads there is the evidence. Silent on any failure, because a hint that
+    cannot be produced is a hint not worth an error.
+    """
+    if not _about_a_picture(question):
+        return ""
+    try:
+        from packages.core import figures
+
+        pages_with = await figures.scan(scope.workspace_id, doc_id)
+    except Exception:
+        return ""
+    if not pages_with:
+        return ""
+
+    named = pages_with[:MAX_NAMED_PICTURE_PAGES]
+    listed = ", ".join(str(n) for n in named)
+    more = "" if len(pages_with) <= len(named) else f" (and {len(pages_with) - len(named)} more)"
+    plural = "" if len(named) == 1 else "s"
+    return (
+        f" Page{plural} {listed}{more} hold a picture — a diagram, chart or "
+        "photograph — which the text layer does not carry. If the question is "
+        "about one of those, look there."
+    )
+
+
 def _tidy_answer(text: str) -> str:
     """Every leak that reaches a reader as machinery, removed in one place.
 
@@ -2942,8 +2984,8 @@ async def navigate(
                         f"\n\n(This document has {page_counts[doc_id]} pages. If the "
                         "text above is there but unusable — a table whose columns "
                         "have collapsed, a form, a chart — look_at_page will read "
-                        "the page picture instead.)"
-                    )
+                        "the page picture instead.{where})"
+                    ).format(where=await _where_the_pictures_are(scope, doc_id, question))
 
             if overflow > 0:
                 # One line, not one per dropped section.

@@ -209,6 +209,105 @@ def test_an_unreadable_render_keeps_the_figure():
 # --------------------------------- caching ---------------------------------
 
 
+# ---------------------------- aiming a look ----------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_picture_question_is_told_which_pages_hold_pictures():
+    """The link between knowing where the figures are and using it.
+
+    A document is navigated by its TEXT, and a diagram is invisible to that. The
+    casino platform's architecture diagrams sit on pages 6, 7 and 9 with no
+    caption to give them away, so a walk asked for "the architecture diagram"
+    read the pages whose WORDS said architecture, looked at pages 4-6, and
+    answered that the document has no such diagram.
+    """
+    from packages.core.navigator import _where_the_pictures_are
+
+    class FakeScope:
+        workspace_id = "ws"
+
+    async def fake_scan(_workspace, _item, *_a, **_k):
+        return [6, 7, 9]
+
+    figures.scan = fake_scan  # type: ignore[assignment]
+    try:
+        hint = await _where_the_pictures_are(FakeScope(), "doc", "show me the architecture diagram")
+        assert "6, 7, 9" in hint
+        # A hint, never an assertion about what the picture shows.
+        assert "look there" in hint
+
+        # A question about words gets nothing: the scan is not free, and a page
+        # list is noise to someone asking about a delivery date.
+        assert await _where_the_pictures_are(FakeScope(), "doc", "what is the timeline") == ""
+    finally:
+        del figures.scan
+
+
+@pytest.mark.asyncio
+async def test_a_document_with_no_pictures_offers_nothing():
+    """An offer of something that is not there is worse than no offer."""
+    from packages.core.navigator import _where_the_pictures_are
+
+    class FakeScope:
+        workspace_id = "ws"
+
+    async def empty(_workspace, _item, *_a, **_k):
+        return []
+
+    figures.scan = empty  # type: ignore[assignment]
+    try:
+        assert await _where_the_pictures_are(FakeScope(), "doc", "show me the diagram") == ""
+    finally:
+        del figures.scan
+
+
+@pytest.mark.asyncio
+async def test_a_failing_scan_is_silent():
+    # A hint that cannot be produced is a hint not worth an error. Losing it
+    # costs a worse-aimed look; raising costs the whole answer.
+    from packages.core.navigator import _where_the_pictures_are
+
+    class FakeScope:
+        workspace_id = "ws"
+
+    async def boom(_workspace, _item, *_a, **_k):
+        raise RuntimeError("object store is down")
+
+    figures.scan = boom  # type: ignore[assignment]
+    try:
+        assert await _where_the_pictures_are(FakeScope(), "doc", "show me the diagram") == ""
+    finally:
+        del figures.scan
+
+
+@pytest.mark.asyncio
+async def test_a_long_list_of_pages_is_not_a_hint():
+    """Thirty page numbers is not a hint, it is the document again."""
+    from packages.core.navigator import MAX_NAMED_PICTURE_PAGES, _where_the_pictures_are
+
+    class FakeScope:
+        workspace_id = "ws"
+
+    async def many(_workspace, _item, *_a, **_k):
+        return list(range(1, 31))
+
+    figures.scan = many  # type: ignore[assignment]
+    try:
+        hint = await _where_the_pictures_are(FakeScope(), "doc", "show me the charts")
+        assert str(MAX_NAMED_PICTURE_PAGES) in hint or "more" in hint
+        assert "30 more" not in hint
+        assert hint.count(",") < 30
+    finally:
+        del figures.scan
+
+
+def test_the_scan_is_bounded():
+    """Unbounded, a 700-page book would spend seconds of a live answer proving
+    that most of it is prose. The scan aims ONE look."""
+    assert figures.SCAN_PAGES <= 60
+
+
 def test_the_cache_key_carries_the_format():
     """Thresholds move as documents that break them turn up.
 

@@ -244,7 +244,22 @@ def _is_drawn(obj: Any) -> bool:
 
 
 def _detect_sync(data: bytes, page: int) -> list[Figure]:
-    """Every picture on one page of a PDF. Page numbers are 1-based, as printed.
+    """Every picture on one page of a PDF. Page numbers are 1-based, as printed."""
+    import pypdfium2 as pdfium
+
+    pdf = pdfium.PdfDocument(io.BytesIO(data))
+    try:
+        return _page_figures(pdf, page)
+    finally:
+        pdf.close()
+
+
+def _page_figures(pdf: Any, page: int) -> list[Figure]:
+    """One page of an ALREADY OPEN document.
+
+    Split from _detect_sync so a scan can open the file once and walk it: on a
+    17MB PDF the open dominates everything else, and paying it per page turns a
+    cheap scan into an expensive one.
 
     An image object is a figure on its own — something was placed there as a
     picture, and that is not a judgement call. Vector strokes are only a figure
@@ -252,80 +267,76 @@ def _detect_sync(data: bytes, page: int) -> list[Figure]:
     lines, so a handful of strokes near each other is furniture, and dozens is a
     drawing.
     """
-    import pypdfium2 as pdfium
     import pypdfium2.raw as raw
 
-    pdf = pdfium.PdfDocument(io.BytesIO(data))
-    try:
-        if not 1 <= page <= len(pdf):
-            return []
-        target = pdf[page - 1]
-        width, height = target.get_size()
-        if not width or not height:
-            return []
+    if not 1 <= page <= len(pdf):
+        return []
+    target = pdf[page - 1]
+    width, height = target.get_size()
+    if not width or not height:
+        return []
 
-        def to_box(obj: Any, kind: str) -> Figure | None:
-            try:
-                left, bottom, right, top = obj.get_pos()
-            except Exception:
-                # An object with no position — a clipped form, a degenerate
-                # path. Skipped rather than raised: one bad object must not
-                # cost the page its other figures.
-                return None
-            return _clamp(
-                Figure(
-                    x=left / width * 100,
-                    y=(height - top) / height * 100,
-                    w=(right - left) / width * 100,
-                    h=(top - bottom) / height * 100,
-                    kind=kind,
-                )
+
+    def to_box(obj: Any, kind: str) -> Figure | None:
+        try:
+            left, bottom, right, top = obj.get_pos()
+        except Exception:
+            # An object with no position — a clipped form, a degenerate
+            # path. Skipped rather than raised: one bad object must not
+            # cost the page its other figures.
+            return None
+        return _clamp(
+            Figure(
+                x=left / width * 100,
+                y=(height - top) / height * 100,
+                w=(right - left) / width * 100,
+                h=(top - bottom) / height * 100,
+                kind=kind,
             )
+        )
 
-        rasters: list[tuple[Figure, int, int]] = []
-        strokes: list[tuple[Figure, int, int]] = []
-        placed: list[Figure] = []
-        seen = 0
-        # max_depth so a diagram placed inside a form XObject — which is how
-        # most vector figures are actually embedded — is descended into rather
-        # than reported as one opaque box the size of the page.
-        for obj in target.get_objects(max_depth=4):
-            seen += 1
-            if seen > MAX_OBJECTS:
-                break
-            if obj.type == raw.FPDF_PAGEOBJ_IMAGE:
-                box = to_box(obj, "image")
-                if box:
-                    rasters.append((box, 1, 1))
-            elif obj.type in (raw.FPDF_PAGEOBJ_PATH, raw.FPDF_PAGEOBJ_SHADING):
-                box = to_box(obj, "drawing")
-                if box:
-                    strokes.append((box, 1, 1 if _is_drawn(obj) else 0))
-            elif obj.type == raw.FPDF_PAGEOBJ_FORM:
-                box = to_box(obj, "drawing")
-                if box and _worth_showing(box):
-                    placed.append(box)
+    rasters: list[tuple[Figure, int, int]] = []
+    strokes: list[tuple[Figure, int, int]] = []
+    placed: list[Figure] = []
+    seen = 0
+    # max_depth so a diagram placed inside a form XObject — which is how
+    # most vector figures are actually embedded — is descended into rather
+    # than reported as one opaque box the size of the page.
+    for obj in target.get_objects(max_depth=4):
+        seen += 1
+        if seen > MAX_OBJECTS:
+            break
+        if obj.type == raw.FPDF_PAGEOBJ_IMAGE:
+            box = to_box(obj, "image")
+            if box:
+                rasters.append((box, 1, 1))
+        elif obj.type in (raw.FPDF_PAGEOBJ_PATH, raw.FPDF_PAGEOBJ_SHADING):
+            box = to_box(obj, "drawing")
+            if box:
+                strokes.append((box, 1, 1 if _is_drawn(obj) else 0))
+        elif obj.type == raw.FPDF_PAGEOBJ_FORM:
+            box = to_box(obj, "drawing")
+            if box and _worth_showing(box):
+                placed.append(box)
 
-        found: list[Figure] = [
-            group for group, _, _ in _merge(rasters, gap=0.0) if _worth_showing(group)
-        ]
-        if len(placed) <= MAX_TRUSTED_FORMS:
-            found.extend(placed)
-        for group, count, drawn in _merge(strokes, gap=CLUSTER_GAP_PCT):
-            if count < MIN_STROKES or drawn < MIN_DRAWN_STROKES:
-                continue
-            if _worth_showing(group) and not any(_overlap(group, kept) for kept in found):
-                # A drawing that sits on top of a picture is the picture's
-                # annotation, not a second figure.
-                found.append(group)
+    found: list[Figure] = [
+        group for group, _, _ in _merge(rasters, gap=0.0) if _worth_showing(group)
+    ]
+    if len(placed) <= MAX_TRUSTED_FORMS:
+        found.extend(placed)
+    for group, count, drawn in _merge(strokes, gap=CLUSTER_GAP_PCT):
+        if count < MIN_STROKES or drawn < MIN_DRAWN_STROKES:
+            continue
+        if _worth_showing(group) and not any(_overlap(group, kept) for kept in found):
+            # A drawing that sits on top of a picture is the picture's
+            # annotation, not a second figure.
+            found.append(group)
 
-        found.sort(key=lambda f: (f.y, f.x))
-        found = found[:MAX_FIGURES]
-        if found:
-            _caption_sync(target, found, width, height)
-        return found
-    finally:
-        pdf.close()
+    found.sort(key=lambda f: (f.y, f.x))
+    found = found[:MAX_FIGURES]
+    if found:
+        _caption_sync(target, found, width, height)
+    return found
 
 
 def _trim_caption(raw_text: str) -> str:
@@ -493,6 +504,84 @@ async def for_page(workspace_id: str, item_id: str, page: int) -> list[dict[str,
         await blobs.put(key, json.dumps(found).encode("utf-8"), "application/json")
     except Exception:
         # Serving them uncached is better than serving nothing.
+        pass
+    return found
+
+
+# How far into a document a "which pages have pictures" scan will look. The
+# scan exists to aim ONE look_at_page call, and a reader asking about a diagram
+# is asking about one in the part of the document that matters. Unbounded, a
+# 700-page book would spend seconds of a live answer proving that most of it is
+# prose.
+SCAN_PAGES = 40
+
+
+def _scan_sync(data: bytes, upto: int) -> list[int]:
+    """Which of the first ``upto`` pages hold a picture.
+
+    Opens the file ONCE and walks it, rather than calling _detect_sync per page:
+    on a 17MB PDF the open dominates everything else, and paying it forty times
+    turns a cheap scan into an expensive one.
+
+    Deliberately skips the render-and-confirm step that for_page() does. This
+    result AIMS a look; it is not shown to anybody. A page that turns out to
+    hold an invisible box costs one look at a real page, which the vision model
+    then reads correctly — whereas rendering forty pages to be sure would cost
+    more than the answer.
+    """
+    import pypdfium2 as pdfium
+
+    found: list[int] = []
+    pdf = pdfium.PdfDocument(io.BytesIO(data))
+    try:
+        for number in range(1, min(len(pdf), upto) + 1):
+            try:
+                if _page_figures(pdf, number):
+                    found.append(number)
+            except Exception:
+                continue
+    finally:
+        pdf.close()
+    return found
+
+
+async def scan(workspace_id: str, item_id: str, upto: int = SCAN_PAGES) -> list[int]:
+    """The pages of a document that hold a picture. Cached, like everything here.
+
+    The point of it: a document is navigated by its TEXT, and a diagram is
+    invisible to that. Asked for the casino platform's architecture diagram, the
+    walk read the pages whose words said "architecture", looked at pages 4-6,
+    and answered that the document contains no such diagram — while the diagrams
+    sat on pages 6, 7 and 9 with no caption to give them away. The store knew
+    where they were the whole time and had no way to say so.
+    """
+    if not blobs.enabled():
+        return []
+    key = f"{workspace_id}/{item_id}/figures/v{FORMAT}/scan-{upto}.json"
+    if await blobs.exists(key):
+        try:
+            data, _ = await blobs.get(key)
+            return [int(n) for n in json.loads(data)]
+        except Exception:
+            pass
+
+    try:
+        original, content_type = await blobs.get(blobs.key_for(workspace_id, item_id))
+    except Exception:
+        return []
+    if not pages.renderable(content_type, "") or pages.is_image(content_type, ""):
+        # An image document is one page and it IS the picture; there is nothing
+        # to aim at, and the navigator already knows to look at it.
+        return []
+
+    try:
+        found = await asyncio.to_thread(_scan_sync, original, upto)
+    except Exception:
+        return []
+
+    try:
+        await blobs.put(key, json.dumps(found).encode("utf-8"), "application/json")
+    except Exception:
         pass
     return found
 
