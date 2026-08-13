@@ -967,9 +967,16 @@ def _strip_medium_apology(text: str) -> str:
 # How many page numbers to name. A list of thirty is not a hint, it is the
 # document again.
 MAX_NAMED_PICTURE_PAGES = 8
+# How far from the sections just read a picture page may be and still be worth
+# mentioning. A figure belongs to the passage that refers to it, and in a
+# printed book the two are a few pages apart at most — the offset between a
+# book's printed page numbers and its PDF's is itself about a dozen.
+PICTURE_PAGE_WINDOW = 40
 
 
-async def _where_the_pictures_are(scope: Any, doc_id: str, question: str) -> str:
+async def _where_the_pictures_are(
+    scope: Any, doc_id: str, question: str, near: list[int] | None = None
+) -> str:
     """Name the pages that actually hold a picture, when the question wants one.
 
     A document is navigated by its TEXT, and a diagram is invisible to that. The
@@ -995,12 +1002,26 @@ async def _where_the_pictures_are(scope: Any, doc_id: str, question: str) -> str
     if not pages_with:
         return ""
 
-    named = pages_with[:MAX_NAMED_PICTURE_PAGES]
+    # Named RELATIVE to what was just read. A 962-page book has 274 pages with
+    # a picture on them, and eight arbitrary ones out of 274 is not a hint —
+    # it is a wrong answer waiting to be followed. The sections in hand say
+    # which part of the book this question is being answered from, so the
+    # pictures worth mentioning are the ones near them.
+    if near:
+        pages_with = [
+            page
+            for page in pages_with
+            if min(abs(page - read) for read in near) <= PICTURE_PAGE_WINDOW
+        ]
+        if not pages_with:
+            return ""
+        pages_with.sort(key=lambda page: min(abs(page - read) for read in near))
+
+    named = sorted(pages_with[:MAX_NAMED_PICTURE_PAGES])
     listed = ", ".join(str(n) for n in named)
-    more = "" if len(pages_with) <= len(named) else f" (and {len(pages_with) - len(named)} more)"
     plural = "" if len(named) == 1 else "s"
     return (
-        f" Page{plural} {listed}{more} hold a picture — a diagram, chart or "
+        f" Page{plural} {listed} hold a picture — a diagram, chart or "
         "photograph — which the text layer does not carry. If the question is "
         "about one of those, look there."
     )
@@ -2991,6 +3012,10 @@ async def navigate(
             # or it will cite a number it was never given.
             parts: list[str] = []
             read_any = False
+            # Which pages the sections just read sit on. Used to keep the
+            # picture hint relevant: a book has hundreds of picture pages, and
+            # only the ones near what is being read are worth naming.
+            read_pages: list[int] = []
             for node_id in node_ids:
                 nodes = tree.find(root, [node_id]) if root else []
                 if not nodes:
@@ -3070,6 +3095,9 @@ async def navigate(
                         doc_id,
                     )
                 )
+                on_page = tree.page_of(by_id[doc_id]["body"] or "", node)
+                if on_page:
+                    read_pages.append(on_page)
                 read_any = True
                 record(Step(round_number, "read", f"{node.title[:60]} → [{marker}]"))
                 if emit is not None:
@@ -3130,7 +3158,11 @@ async def navigate(
                         "text above is there but unusable — a table whose columns "
                         "have collapsed, a form, a chart — look_at_page will read "
                         "the page picture instead.{where})"
-                    ).format(where=await _where_the_pictures_are(scope, doc_id, question))
+                    ).format(
+                        where=await _where_the_pictures_are(
+                            scope, doc_id, question, read_pages
+                        )
+                    )
 
             if overflow > 0:
                 # One line, not one per dropped section.

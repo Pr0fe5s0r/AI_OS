@@ -21,6 +21,7 @@ from packages.core.normalise import (
     title_from,
 )
 
+
 def _prose(subject: str) -> str:
     # Long enough that each section becomes its own passage. The chunker packs
     # to about a kilobyte, so a fixture of one-line sections collapses into a

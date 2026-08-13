@@ -508,12 +508,18 @@ async def for_page(workspace_id: str, item_id: str, page: int) -> list[dict[str,
     return found
 
 
-# How far into a document a "which pages have pictures" scan will look. The
-# scan exists to aim ONE look_at_page call, and a reader asking about a diagram
-# is asking about one in the part of the document that matters. Unbounded, a
-# 700-page book would spend seconds of a live answer proving that most of it is
-# prose.
-SCAN_PAGES = 40
+# How far into a document a "which pages have pictures" scan will look.
+#
+# This was 40, and 40 was actively harmful. On a 962-page textbook it found the
+# only three picture pages in the front matter, the hint named 28, 29 and 31,
+# and the walk went and looked at them for a diagram that lives on page 300 —
+# then reported the diagram was not in the document. A hint that names the
+# wrong pages is worse than no hint, because it gets followed.
+#
+# The whole book scans in 3.3 seconds, once, and is then cached forever: the
+# bound exists to stop something pathological, not to ration a cost that turns
+# out to be small.
+SCAN_PAGES = 1500
 
 
 def _scan_sync(data: bytes, upto: int) -> list[int]:

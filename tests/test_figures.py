@@ -416,10 +416,56 @@ async def test_a_lone_figure_is_cropped_with_a_margin_for_its_caption():
         del figures.for_page
 
 
-def test_the_scan_is_bounded():
-    """Unbounded, a 700-page book would spend seconds of a live answer proving
-    that most of it is prose. The scan aims ONE look."""
-    assert figures.SCAN_PAGES <= 60
+@pytest.mark.asyncio
+async def test_the_hint_names_pictures_near_what_was_read():
+    """Eight arbitrary pages out of 274 is not a hint.
+
+    This is the bug the first version shipped with. The scan stopped at page 40,
+    so on a 962-page textbook it found the only three picture pages in the front
+    matter, the hint named 28, 29 and 31, and the walk went and looked at them
+    for a diagram that lives on page 300 — then reported the diagram was not in
+    the document. A hint that names the wrong pages is worse than no hint,
+    because it gets followed.
+    """
+    from packages.core.navigator import _where_the_pictures_are
+
+    class FakeScope:
+        workspace_id = "ws"
+
+    async def spread(_workspace, _item, *_a, **_k):
+        return [28, 29, 31, 273, 274, 287, 288, 292, 293, 294, 296, 600]
+
+    figures.scan = spread  # type: ignore[assignment]
+    try:
+        hint = await _where_the_pictures_are(FakeScope(), "doc", "show me the diagram", [286])
+        assert "287" in hint and "288" in hint
+        assert "28," not in hint and "600" not in hint
+    finally:
+        del figures.scan
+
+
+@pytest.mark.asyncio
+async def test_pictures_nowhere_near_the_reading_are_not_mentioned():
+    from packages.core.navigator import _where_the_pictures_are
+
+    class FakeScope:
+        workspace_id = "ws"
+
+    async def far_away(_workspace, _item, *_a, **_k):
+        return [900, 901, 902]
+
+    figures.scan = far_away  # type: ignore[assignment]
+    try:
+        assert await _where_the_pictures_are(FakeScope(), "doc", "show the chart", [50]) == ""
+    finally:
+        del figures.scan
+
+
+def test_the_scan_reaches_a_whole_book():
+    """The bound exists to stop something pathological, not to ration a cost
+    that turns out to be small: a 962-page book scans in 3.3 seconds, once, and
+    is cached from then on."""
+    assert figures.SCAN_PAGES >= 1000
 
 
 def test_the_cache_key_carries_the_format():
