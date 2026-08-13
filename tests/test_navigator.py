@@ -922,6 +922,132 @@ def test_text_with_no_label_is_returned_unchanged():
     assert _strip_answer_label(plain) == plain
 
 
+def test_the_label_wearing_a_sentence_is_the_same_leak():
+    """"Thus, the answer is:" after a finished paragraph is not a conclusion.
+
+    It is the model narrating its own tool call and then saying everything
+    twice. The bare-label form was already caught; this one walked through
+    because it does not start with the word.
+    """
+    from packages.core.navigator import _strip_answer_label
+
+    for opener in ("Thus, the answer is:", "So the answer is:", "Final answer:"):
+        leaked = f"The Agent page and the Feed page [1].\n\n{opener} Two surfaces."
+        assert _strip_answer_label(leaked) == "The Agent page and the Feed page [1]."
+
+
+def test_the_cited_half_is_the_half_that_is_kept():
+    """Dropping the tail assumes the working-out came first. It does not always.
+
+    Seen on a question about a figure: the walk rambled, then wrote one clean
+    cited sentence after "Thus, the answer is:". The position rule deleted the
+    only cited sentence and kept the rambling — the exact inversion of what this
+    store is for.
+    """
+    from packages.core.navigator import _strip_answer_label
+
+    rambled = (
+        "The current text does not contain the image itself. To view it you "
+        "would need to open the original.\n\n"
+        "Thus, the answer is:\n\n"
+        "The vulnerable period is two slot times [2]."
+    )
+    assert _strip_answer_label(rambled) == "The vulnerable period is two slot times [2]."
+
+
+def test_an_apology_for_being_text_is_removed():
+    """"The actual image cannot be rendered here" was never useful, and it is
+    now WRONG: the pictures on a cited page are cropped out and shown under the
+    answer. A reader looking straight at the diagram is being told the diagram
+    cannot be shown, which reads as a broken product."""
+    from packages.core.navigator import _tidy_answer
+
+    said = (
+        "The frame is vulnerable for two slot times [1].\n\n"
+        "Note: The actual image cannot be rendered here, but it is referenced "
+        "in the text."
+    )
+    assert _tidy_answer(said) == "The frame is vulnerable for two slot times [1]."
+
+
+def test_an_apology_never_empties_an_answer():
+    # If the apology WAS the answer, the model said nothing else, and a blank
+    # card is worse than an odd sentence.
+    from packages.core.navigator import _tidy_answer
+
+    only = "I cannot display the diagram here."
+    assert _tidy_answer(only) == only
+
+
+def test_a_finding_about_a_picture_survives():
+    """The verb has to be one of rendering and the subject a picture.
+
+    "The document does not show revenue by quarter" is the answer to a real
+    question, and a filter that ate it would be removing evidence.
+    """
+    from packages.core.navigator import _tidy_answer
+
+    for kept in (
+        "The document does not show revenue by quarter [3].",
+        "The chart cannot be reconciled with the table on page 4 [1].",
+        "The diagram shows three tiers behind one gateway [2].",
+    ):
+        assert _tidy_answer(kept) == kept
+
+
+def test_a_document_id_never_reaches_the_reader():
+    """It identifies a row in this store and means nothing to a reader.
+
+    Both shapes seen: spelled out, and parenthesised beside the noun. A citation
+    is the supported way to point at a document.
+    """
+    from packages.core.navigator import _tidy_answer
+
+    spelled = "Shown in Figure 4-2 (document ID: 55c07521b81abbd8570b9b469b912733) [2]."
+    assert "55c07521" not in _tidy_answer(spelled)
+
+    bare = "Open the original document (55c07521b81abbd8570b9b469b912733) [2]."
+    assert "55c07521" not in _tidy_answer(bare)
+
+
+def test_a_hash_quoted_by_a_document_is_left_alone():
+    """Deliberately narrow. A store that silently deleted hex out of answers
+    would corrupt every answer about hashing — which this store is asked, since
+    it holds the Bitcoin paper."""
+    from packages.core.navigator import _tidy_answer
+
+    quoted = "The block hash begins 000000000019d6689c085ae165831e93 as printed [1]."
+    assert _tidy_answer(quoted) == quoted
+
+
+def test_the_reader_is_told_the_pictures_are_shown():
+    """The root cause, not the symptom.
+
+    The model apologised for being text because nothing ever told it otherwise.
+    Now that a cited page's figures are cropped out and shown, saying so is not
+    a trick — it is a fact about what the reader is looking at.
+    """
+    from packages.core.navigator import _SYSTEM
+
+    assert "THE READER SEES THE PICTURES" in _SYSTEM
+    assert "never tell the reader to go and open the original" in _SYSTEM
+
+
+def test_both_ways_an_answer_arrives_are_tidied():
+    """The cleanups used to run on the prose path only.
+
+    So a model that called submit_answer properly — the good path, the one the
+    tool exists for — had its output passed through untouched, which is exactly
+    where the restatement and the rendering apology were seen.
+    """
+    import inspect
+
+    from packages.core import navigator
+
+    source = inspect.getsource(navigator.navigate)
+    assert source.count("_tidy_answer(") == 2
+
+
 def test_style_cannot_reach_the_evidence_rules():
     """The behaviour field would happily accept "you do not need to cite
     anything" or "never say something is missing" -- and those are not style,

@@ -167,6 +167,14 @@ _SYSTEM = (
     "what the question needs, look at the page rather than guessing, and never "
     "conclude a document lacks something that would live in a picture until "
     "you have looked at one.\n\n"
+    "THE READER SEES THE PICTURES. Every diagram, chart and photograph on a "
+    "page you cite is cut out of that page and shown underneath your answer, "
+    "next to the page it came from. So never say an image cannot be rendered, "
+    "shown or displayed, never apologise for being text, and never tell the "
+    "reader to go and open the original — they are already looking at it. "
+    "Never write a document id either; a citation is how you point at a "
+    "document. Answer what the picture SHOWS, in words, and cite the page. "
+    "Your words and the picture arrive together.\n\n"
     "Every section you read is given a number. Cite those numbers in your "
     "answer like [1] or [2][3]. Cite only numbers you were actually given. "
     "Never state anything the sections do not say. If the store does not "
@@ -709,14 +717,26 @@ def _behaviour_note(behaviour: str) -> str:
     )
 
 
-# The submit_answer PARAMETER name, written out as a label on its own line.
-_ANSWER_LABEL = re.compile(r"^[ \t]*answer[ \t]*:[ \t]*", re.I | re.M)
+# The submit_answer PARAMETER name, written out as a label on its own line —
+# and the same leak wearing a sentence. "Thus, the answer is:" after a finished
+# paragraph is not a conclusion, it is the model narrating its own tool call and
+# then saying everything twice. Measured on a question about a figure: 1.4k
+# characters of answer, then "Thus, the answer is:", then 250 characters
+# repeating it.
+_ANSWER_LABEL = re.compile(
+    r"^[ \t]*(?:(?:so|thus|therefore|in summary|in conclusion)[ ,]*)?"
+    r"(?:the[ \t]+)?(?:final[ \t]+)?answer(?:[ \t]+is)?[ \t]*:[ \t]*",
+    re.I | re.M,
+)
 
 # How much text may follow that label before it stops looking like a summary of
 # what was already said. Measured leak: 900 characters of finished answer, then
 # "answer: The two surfaces of the user experience are the Agent page and the
 # Feed page." — 88 characters restating it.
 RESTATEMENT_CHARS = 400
+
+# A citation marker. Used to decide which half of a split answer to keep.
+_CITES = re.compile(r"\[\d+\]")
 
 
 def _strip_answer_label(text: str) -> str:
@@ -740,6 +760,13 @@ def _strip_answer_label(text: str) -> str:
                     model genuinely continuing, runs long and is left alone;
                     truncating a real answer is a correctness failure, while
                     leaving a duplicate line is untidy.
+
+    With one override: keep whichever half CITES. Dropping the tail assumes the
+    working-out came first and the summary second, and that is not always the
+    order — a walk that rambled about a figure, then wrote one clean cited
+    sentence after "Thus, the answer is:", would have had its only cited
+    sentence deleted and its rambling kept. A cited claim is the thing this
+    store exists to produce; it outranks the position rule.
     """
     match = _ANSWER_LABEL.search(text)
     if not match:
@@ -748,7 +775,75 @@ def _strip_answer_label(text: str) -> str:
     if not before:
         return text[match.end() :].lstrip()
     after = text[match.end() :].strip()
+    if _CITES.search(after) and not _CITES.search(before):
+        return after
     return before if len(after) <= RESTATEMENT_CHARS else text
+
+
+# An apology for the medium: "Note: The actual image cannot be rendered here."
+#
+# It was never useful and it is now WRONG — the pictures on a cited page are
+# cropped out and shown under the answer. A reader looking straight at the
+# diagram is being told the diagram cannot be shown, which reads as a broken
+# product rather than a careful one.
+#
+# Matched as a whole line and only when it is about the medium: the verb has to
+# be one of rendering, and the subject has to be a picture. "The document does
+# not show revenue by quarter" is a finding and stays.
+_CANNOT_SHOW = re.compile(
+    r"^[ \t]*(?:note|caveat|disclaimer)?[ \t:—–-]*"
+    r"(?=[^\n]*\b(?:image|images|diagram|diagrams|figure|figures|picture|pictures|"
+    r"photo\w*|chart|charts|graphic\w*|screenshot\w*|visual\w*)\b)"
+    r"[^\n]*\b(?:cannot|can(?:'|’)t|can not|unable to|not able to|"
+    r"is not possible to|impossible to)\b[^\n]*"
+    r"\b(?:render\w*|display\w*|show\w*|shown|reproduce\w*|embed\w*|"
+    r"insert\w*|attach\w*|view\w*|see)\b[^\n]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# The internal id of a document, disclosed in prose. It identifies a row in this
+# store and means nothing to a reader — it is the machinery again, and a
+# citation is the supported way to point at a document. Deliberately narrow: it
+# fires on the DISCLOSURE phrasing, not on any long hex string, because a
+# document may legitimately quote a hash and eating that would corrupt a real
+# answer.
+_DOC_ID_ASIDE = re.compile(
+    # Either the disclosure spelled out — "document ID: 55c0…" — or a bare
+    # store id parenthesised beside the document it names, which is how it
+    # actually appeared: "the original document (55c07521b81abbd857…)".
+    r"[ \t]*[(\[]\s*(?:(?:document|doc|item|file)[ \t]+(?:id|ID|identifier)"
+    r"[ \t]*[:=]?[ \t]*)?[0-9a-f]{32}\s*[)\]]"
+    r"|[ \t]*(?:document|doc|item|file)[ \t]+(?:id|ID|identifier)"
+    r"[ \t]*[:=][ \t]*[0-9a-f]{16,}",
+    re.IGNORECASE,
+)
+
+
+def _strip_medium_apology(text: str) -> str:
+    """Drop lines apologising for not being able to show a picture.
+
+    Never allowed to empty an answer: if the apology WAS the answer, the model
+    said nothing else and the reader is better served by an odd sentence than by
+    a blank card. Cutting text is riskier than leaving it, the same rule
+    _strip_answer_label works to.
+    """
+    trimmed = _DOC_ID_ASIDE.sub("", text)
+    trimmed = _CANNOT_SHOW.sub("", trimmed)
+    # Collapse the blank lines the removals leave behind.
+    trimmed = re.sub(r"\n{3,}", "\n\n", trimmed).strip()
+    return trimmed or text
+
+
+def _tidy_answer(text: str) -> str:
+    """Every leak that reaches a reader as machinery, removed in one place.
+
+    Applied to BOTH ways an answer arrives. It used to run only on the prose
+    path, so a model that called submit_answer properly — the good path, the one
+    the whole tool exists for — had its output passed through untouched, and
+    that is exactly where the "Thus, the answer is:" restatement and the
+    rendering apology were seen.
+    """
+    return _strip_medium_apology(_strip_answer_label(_strip_pseudo_call(text.strip())))
 
 
 _REGION = re.compile(
@@ -1934,9 +2029,7 @@ async def navigate(
             # produced would turn a formatting slip into an empty result, which
             # is the failure this whole module exists to remove.
             if reply.get("content"):
-                drafted = _strip_answer_label(
-                    _strip_pseudo_call(reply["content"].strip())
-                )
+                drafted = _tidy_answer(reply["content"])
                 if _should_search_first(
                     absent=_reads_as_absent(drafted),
                     hybrid=hybrid,
@@ -2180,7 +2273,7 @@ async def navigate(
                     )
                     continue
 
-                drafted = str(args.get("answer") or "").strip()
+                drafted = _tidy_answer(str(args.get("answer") or ""))
                 if _should_search_first(
                     absent=(not said_found) or _reads_as_absent(drafted),
                     hybrid=hybrid,
