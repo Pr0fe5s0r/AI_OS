@@ -234,7 +234,17 @@ if not answer.grounded:
 else:
     print(answer.text)
     for citation in answer.citations:
-        print(f"[{citation.marker}] {citation.title} — {citation.heading}")`}
+        print(f"[{citation.marker}] {citation.title} — {citation.heading}")
+        # Present when the passage was read off a picture of the page.
+        # Regions are percentages: scale them to however you render it.
+        if citation.page is not None:
+            print(f"    page {citation.page}")
+            for r in citation.regions:
+                print(f"    box {r.x},{r.y} {r.w}x{r.h} — {r.label}")
+
+    # The route it took. Show this when asked why the answer is trustworthy.
+    for step in answer.steps:
+        print(step)`}
               javascript={`const answer = await docs.answer("Summarise Q2 paid performance", {
   mode: "agentic",
 });
@@ -245,13 +255,32 @@ if (!answer.grounded) {
   console.log(answer.text);
   for (const citation of answer.citations) {
     console.log("[" + citation.marker + "] " + citation.title);
+    // Present when the passage was read off a picture of the page.
+    // Regions are percentages: scale them to however you render it.
+    if (citation.page !== null) {
+      console.log("    page " + citation.page);
+      for (const r of citation.regions) {
+        console.log("    box", r.x, r.y, r.w, r.h, r.label);
+      }
+    }
   }
+
+  // The route it took. Show this when asked why the answer is trustworthy.
+  for (const step of answer.steps) console.log(step);
 }`}
             />
             <Note>
               <Mono>agentic</Mono> (default) reasons over heading trees, searches passages, and
               hops the similarity graph to reach the whole collection. Use <Mono>hybrid</Mono>{" "}
               for a fast, deterministic embeddings-plus-keyword ranking.
+            </Note>
+            <Note>
+              <Mono>page</Mono> and <Mono>regions</Mono> are filled in only when a passage was
+              read off a <em>picture</em> of the page rather than out of its text — that is what
+              lets a reader check a transcribed table against the page instead of taking it on
+              trust. For text passages <Mono>page</Mono> is empty, which is not an error.{" "}
+              <Mono>steps</Mono> is the route the answer took, and is empty for{" "}
+              <Mono>hybrid</Mono>, which ranks and hands over without one.
             </Note>
           </TopicPanel>
         )}
@@ -353,12 +382,24 @@ for await (const event of agent.stream("How does the spec handle voice input?", 
               </p>
             </div>
             <Note>
-              The agent has five tools: <Mono>overview</Mono> (read the index first),
-              <Mono>search</Mono>, <Mono>structure</Mono>, <Mono>read_document</Mono>, and
-              <Mono>neighbors</Mono> (hop the graph). A selected-file run is a hard boundary —
-              every tool is restricted to those files. Omit <Mono>files</Mono> to use the whole
-              collection. Use <Mono>instructions</Mono> for additive prompting;{" "}
-              <Mono>system</Mono> replaces the complete built-in prompt.
+              The agent has six tools: <Mono>overview</Mono> (read the index first),{" "}
+              <Mono>search</Mono>, <Mono>list_files</Mono>, <Mono>structure</Mono>,{" "}
+              <Mono>read_document</Mono>, and <Mono>neighbors</Mono> (hop the graph). A
+              selected-file run is a hard boundary — every tool is restricted to those files.
+              Omit <Mono>files</Mono> to use the whole collection. Use <Mono>instructions</Mono>{" "}
+              for additive prompting; <Mono>system</Mono> replaces the complete built-in prompt.
+            </Note>
+            <Note>
+              Every <Mono>neighbors</Mono> hop carries a <Mono>relation</Mono>. Where{" "}
+              <Mono>typed</Mono> is true someone judged how the two passages stand to each other
+              — <Mono>elaborates</Mono>, <Mono>defines</Mono>, <Mono>supports</Mono>,{" "}
+              <Mono>contradicts</Mono>, <Mono>precedes</Mono> — and the built-in prompt reads
+              them: it follows <Mono>elaborates</Mono> to fill a thin answer, and on{" "}
+              <Mono>contradicts</Mono> it reports that the collection disagrees with itself and
+              cites both sides rather than quietly picking a winner. Where <Mono>typed</Mono> is
+              false the relation is only <Mono>near</Mono> — cosine resemblance nobody vouched
+              for. Replacing <Mono>system</Mono> drops this handling; prefer{" "}
+              <Mono>instructions</Mono>.
             </Note>
           </TopicPanel>
         )}
@@ -526,6 +567,9 @@ function aiDoc(lang: Lang, collection: string, base: string): string {
     "- Reusing a locator updates the existing document instead of creating a duplicate.",
     "- Search combines semantic and keyword retrieval and returns a trace ID.",
     "- Always check `grounded` before presenting an answer.",
+    "- A citation carries `page` and `regions` when the passage was read off a picture of the page rather than out of its text. `regions` are boxes in PERCENT of the page (`x`, `y`, `w`, `h`, `label`) — multiply by your rendered page size to draw them. `page` is null and `regions` empty for text passages; that is normal, not an error.",
+    "- An answer carries `steps`: the route taken to reach it — sections opened, ids reached for and missed, where it stopped. Empty for `hybrid`, which ranks and hands over without a route. Show it when a reader asks why they should believe the answer.",
+    "- A neighbour carries `relation` and `typed`. When `typed` is true the relation is an authored judgement — `elaborates`, `defines`, `supports`, `contradicts`, `precedes`. When false it is `near`: cosine resemblance nobody vouched for. Never present a `near` hop as a stated relationship, and never resolve a `contradicts` pair silently — cite both.",
     "- Agent tools are read-only.",
     "- Agent questions accept an optional file selection. Omit it to use all files; when provided it is enforced across every agent tool.",
     "- Agent `instructions` are appended to the protected grounding prompt. `system` replaces that prompt completely.",
@@ -553,7 +597,7 @@ function aiDoc(lang: Lang, collection: string, base: string): string {
       "- `docs.search(query, limit=10, files=[...])` returns iterable results with `trace_id`.",
       "- `docs.summaries()` returns the index — a card per document + section summaries. Read first.",
       "- `docs.neighbors(chunk_id, limit=10)` returns passages nearest one in the graph — a hop.",
-      "- `docs.answer(question, mode='agentic')` returns text, citations, and `grounded`.",
+      "- `docs.answer(question, mode='agentic')` returns `text`, `citations`, `grounded`, and `steps`; each citation has `page` and `regions` when it was read off a page image.",
       "- `docs.list()` lists documents; `docs.files()` lists uploaded files with originals.",
       "- `docs.structure(file)` returns the PageIndex heading tree.",
       "- `docs.chunks(document_id)` returns indexed passages.",
@@ -622,7 +666,7 @@ print(result.answer, result.tool_calls)`
     "- `docs.search(query, { limit, files })` returns `{ matches, traceId }`.",
     "- `docs.summaries()` returns the index — a card per document + section summaries. Read first.",
     "- `docs.neighbors(chunkId, { limit })` returns passages nearest one in the graph — a hop.",
-    "- `docs.answer(question, { mode: 'agentic' })` returns text, citations, and `grounded`.",
+    "- `docs.answer(question, { mode: 'agentic' })` returns `text`, `citations`, `grounded`, and `steps`; each citation has `page` and `regions` when it was read off a page image.",
     "- `docs.list()` lists documents; `docs.files()` lists uploaded files with originals.",
     "- `docs.structure(file)` returns the PageIndex heading tree.",
     "- `docs.chunks(documentId)` returns indexed passages.",

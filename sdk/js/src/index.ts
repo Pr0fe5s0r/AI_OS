@@ -23,6 +23,7 @@ export type {
   MintedKey,
   Neighbor,
   Original,
+  Region,
   Results,
   Section,
   Source,
@@ -31,4 +32,4 @@ export type {
 } from "./models.js";
 export { walkSections } from "./models.js";
 
-export const VERSION = "0.2.0";
+export { VERSION } from "./version.js";

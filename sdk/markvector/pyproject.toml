@@ -1,6 +1,6 @@
 [project]
 name = "markvector"
-version = "0.2.0"
+version = "0.3.0"
 description = "Python client for MarkVector — store documents, search them by meaning and wording, get grounded answers with citations, keep the original files, and run a streaming, tool-using agent over your own LLM."
 readme = "README.md"
 requires-python = ">=3.10"

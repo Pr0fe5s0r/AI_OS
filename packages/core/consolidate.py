@@ -74,6 +74,8 @@ class Outcome:
     decayed: int = 0
     dropped: int = 0
     promoted: int = 0
+    # Authored typed edges written this pass (non-'none' relations).
+    labelled: int = 0
     duration_ms: int = 0
     # The threshold this pass used, and the closest pair it saw. Together they
     # answer "why did nothing merge?" without anyone having to guess.
@@ -440,6 +442,17 @@ async def run_once(session: AsyncSession, scope: Scope) -> Outcome:
     await graph.replace_near_edges(scope, edges)
     degrees = _degrees_from_edges(edges)
     outcome.promoted = await promote(session, scope, degrees)
+
+    # Authored typed edges over the NEAR pairs — the one relationship similarity
+    # cannot reconstruct. Bounded and opt-in; best-effort, so a labelling
+    # failure never fails the pass.
+    from packages.core import relate
+
+    if relate.typed_edges_enabled():
+        try:
+            outcome.labelled = await relate.label_edges(session, scope)
+        except Exception:  # noqa: BLE001 - enrichment must never fail the pass
+            outcome.labelled = 0
     outcome.duration_ms = int((time.perf_counter() - started) * 1000)
 
     await session.execute(

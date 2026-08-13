@@ -200,15 +200,22 @@ services:
     build:
       context: ./apps/web
       dockerfile: Dockerfile
+      args:
+        # rewrites() is baked into the build, so the proxy target must be known
+        # here as well as at runtime. Same value both places, deliberately.
+        API_URL: http://api:8000
     environment:
       # Server-side rewrite target so the browser only ever calls /api/*
       API_URL: http://api:8000
-      WATCHPACK_POLLING: "true"
-    volumes:
-      # Hot reload: edit apps/web on the host, see it live. node_modules stays in-image.
-      - ./apps/web:/app
-      - /app/node_modules
-      - /app/.next
+    # No volumes. The old set bind-mounted ./apps/web over /app and then tried to
+    # rescue the shadowed dependencies with anonymous volumes for node_modules and
+    # .next. Anonymous volumes are created once and REUSED on every recreate, so
+    # /app/node_modules kept serving whatever `npm ci` produced the first time the
+    # container ever ran — Next 14.2.5, no d3 — and no amount of rebuilding could
+    # dislodge it. That is what "Module not found: Can't resolve 'd3'" was, with
+    # package.json and package-lock.json both pinning d3 7.9.0 the whole time.
+    # The image already contains the source and the installed deps; let it.
+    # For hot reload, run `npm run dev` in apps/web on the host instead.
     ports:
       - "3005:3000"
     depends_on:

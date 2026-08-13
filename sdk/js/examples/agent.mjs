@@ -2,12 +2,15 @@ import { AgentAnswer, Markvector, Thinking, ToolCall, ToolResult } from "markvec
 
 const question = process.argv.slice(2).join(" ") || "who is  R. Anitha?";
 
-const mv = new Markvector({apiKey: "kb_live_PmIEhz0lebWBS1h2xWm3azF-9Wn5WbaPCxZMjODAjnQ", baseUrl: "http://localhost:8000"}); // MARKVECTOR_API_KEY / MARKVECTOR_URL
+// Reads MARKVECTOR_API_KEY and MARKVECTOR_URL from the environment when the
+// constructor arguments are omitted. Keys do not belong in a file that gets
+// committed — an example is the easiest place in a repository to leak one.
+const mv = new Markvector();
 
-const agent = mv.collection("checking-collection").agent({
-  apiKey: "v1.CmMKHHN0YXRpY2tleS1lMDBoajFjNTZiaHQ0M3BiNjUSIXNlcnZpY2VhY2NvdW50LWUwMGdhNmtrdnAxNDdxMXhxdzILCKbp29AGEPr69yc6DAik7PObBxDAw671AkACWgNlMDA.AAAAAAAAAAEbKvVycfxZnzQDxNeyjzAMx1bTwSUobZmE69qw655yYIdw5vrH2B-Q8QNUrHRkxGDaUV41fZ1lSJZ-ZG7pFCMM",
-  baseUrl: "https://api.tokenfactory.uk-south1.nebius.com/v1",
-  model: "zai-org/GLM-5.2",
+const agent = mv.collection(process.env.MARKVECTOR_COLLECTION ?? "cookbook").agent({
+  apiKey: process.env.OPENAI_API_KEY,
+  baseUrl: process.env.OPENAI_BASE_URL, // any OpenAI-compatible endpoint
+  model: process.env.OPENAI_MODEL ?? "gpt-4o-mini",
 });
 
 for await (const event of agent.stream(question)) {

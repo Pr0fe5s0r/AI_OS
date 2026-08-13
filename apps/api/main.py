@@ -1635,7 +1635,11 @@ async def chunk_neighbors(
                 "heading": n["heading"],
                 "title": n["title"],
                 "node_type": n["node_type"],
-                "relation": "near",
+                # The edge kind: an authored relation (elaborates/defines/…) when
+                # one was written, else "near" for a cosine link. `typed` says
+                # which, so a caller can prefer the judged links.
+                "relation": n.get("relation") or "near",
+                "typed": bool(n.get("typed")),
                 "similarity": (
                     round(n["similarity"], 4) if n["similarity"] is not None else None
                 ),

@@ -12,3 +12,7 @@ apps/web/tsconfig.tsbuildinfo
 PageIndex/
 # Reference implementations cloned for reading, not part of this repo.
 PixelRAG/
+
+# Release artifacts — built on demand, never committed.
+sdk/js/*.tgz
+sdk/markvector/dist/

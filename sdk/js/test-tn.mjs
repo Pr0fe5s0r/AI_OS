@@ -4,9 +4,14 @@
 // predates the /neighbors endpoint (rebuild the api image to pick it up).
 import { Markvector } from "./dist/index.js";
 
-const KEY = "kb_live_SzftqASz9j89vL7eNQp__kWjtvuOyXwSMRB0iONmYEs";
-const BASE = "http://localhost:8000";
-const COLLECTION = "tn-organization-brain";
+const KEY = process.env.MARKVECTOR_API_KEY;
+const BASE = process.env.MARKVECTOR_URL ?? "http://localhost:8000";
+const COLLECTION = process.env.MARKVECTOR_COLLECTION ?? "tn-organization-brain";
+
+if (!KEY) {
+  console.error("Set MARKVECTOR_API_KEY to run this smoke test.");
+  process.exit(1);
+}
 
 const line = (s) => console.log(s);
 const hr = () => line("─".repeat(60));
@@ -66,7 +71,9 @@ await stage("neighbors (graph hop)", async () => {
     return;
   }
   for (const n of hops) {
-    line(`    ${n.similarity.toFixed(3)}  ${n.relation}  ${n.nodeType.padEnd(7)}  ${n.heading?.slice(0, 45) ?? ""}  → ${n.neighborId}`);
+    // "*" marks an authored relation; without it the edge is only cosine "near".
+    const rel = `${n.relation}${n.typed ? "*" : ""}`;
+    line(`    ${n.similarity.toFixed(3)}  ${rel.padEnd(13)}  ${n.nodeType.padEnd(7)}  ${n.heading?.slice(0, 45) ?? ""}  → ${n.neighborId}`);
   }
 });
 

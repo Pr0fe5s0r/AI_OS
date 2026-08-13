@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFile } from "node:fs/promises";
 
 import {
   AgentAnswer,
@@ -8,6 +9,7 @@ import {
   Thinking,
   ToolCall,
   ToolResult,
+  VERSION,
 } from "../dist/index.js";
 
 const document = {
@@ -24,7 +26,7 @@ const document = {
 
 function mockFetch(input, init) {
   const url = new URL(input);
-  assert.equal(init.headers["X-Markvector-Client"], "javascript/0.2.0");
+  assert.equal(init.headers["X-Markvector-Client"], `javascript/${VERSION}`);
   if (!url.pathname.startsWith("/api/traces/")) {
     assert.equal(init.headers["X-Collection"], "sdk-demo");
   }
@@ -52,7 +54,7 @@ function mockFetch(input, init) {
     return Promise.resolve(Response.json({
       trace_id: "trace-1",
       query: "why did paid results fall",
-      via: "sdk:javascript/0.2.0",
+      via: `sdk:javascript/${VERSION}`,
       timings_ms: { total: 12 },
     }));
   }
@@ -85,7 +87,7 @@ test("trace lookup works for the trace id returned by an SDK search", async () =
   const result = await mv.collection("sdk-demo").search("why did paid results fall");
   const trace = await mv.trace(result.traceId);
   assert.equal(trace.trace_id, result.traceId);
-  assert.equal(trace.via, "sdk:javascript/0.2.0");
+  assert.equal(trace.via, `sdk:javascript/${VERSION}`);
 });
 
 class FakeLLM {
@@ -167,4 +169,15 @@ test("custom instructions are appended to the protected system prompt", async ()
   assert.match(system, /using ONLY the tools provided/);
   assert.match(system, /Additional instructions from the caller/);
   assert.match(system, /terse JSON object in Spanish/);
+});
+
+test("the published version and the version the SDK reports are the same", async () => {
+  // These drifted once: 0.2.4 went to npm while the client kept telling the
+  // server it was 0.2.0, so four releases' worth of client telemetry was wrong.
+  // The header assertions above derive from VERSION and so cannot catch that —
+  // only comparing against package.json can.
+  const manifest = JSON.parse(
+    await readFile(new URL("../package.json", import.meta.url), "utf8"),
+  );
+  assert.equal(manifest.version, VERSION);
 });

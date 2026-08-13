@@ -291,7 +291,11 @@ class Neighbor:
     heading: str
     title: str
     node_type: str = "fact"
+    # The edge kind. An authored judgement — "elaborates", "defines",
+    # "supports", "contradicts", "precedes" — when the labeller wrote one
+    # (`typed` is then True), else "near" for a plain cosine link.
     relation: str = "near"
+    typed: bool = False
     similarity: float = 0.0
 
     @classmethod
@@ -303,6 +307,7 @@ class Neighbor:
             title=d.get("title", "") or "",
             node_type=d.get("node_type", "fact") or "fact",
             relation=d.get("relation", "near") or "near",
+            typed=bool(d.get("typed")),
             similarity=float(d.get("similarity", 0) or 0),
         )
 
@@ -341,6 +346,32 @@ class IndexSummary:
 
 
 @dataclass(slots=True)
+class Region:
+    """A box on a page, in PERCENT of the page — not pixels and not points.
+
+    Multiply by the width and height you render the page at. The server clamps
+    every box to the page and discards any that covers most of it, so a region
+    that survives is a pointer at something specific.
+    """
+
+    x: float
+    y: float
+    w: float
+    h: float
+    label: str = ""
+
+    @classmethod
+    def from_json(cls, d: dict[str, Any]) -> Region:
+        return cls(
+            x=float(d.get("x", 0) or 0),
+            y=float(d.get("y", 0) or 0),
+            w=float(d.get("w", 0) or 0),
+            h=float(d.get("h", 0) or 0),
+            label=d.get("label", "") or "",
+        )
+
+
+@dataclass(slots=True)
 class Citation:
     """A passage an answer leaned on, addressable by its marker `[n]`."""
 
@@ -351,9 +382,19 @@ class Citation:
     heading: str
     text: str
     score: float = 0.0
+    # Set when the passage was read off a PICTURE of the page rather than out of
+    # its text. Show the page beside the words: that is what makes a transcribed
+    # table checkable instead of merely plausible. None means it came from text,
+    # where there is no single page to point at.
+    page: int | None = None
+    # And where on that page. Without these a reader is told "page 14" and left
+    # to search it; with them the highlight lands on the row that was actually
+    # read. Empty whenever the passage came from text.
+    regions: list[Region] = field(default_factory=list)
 
     @classmethod
     def from_json(cls, d: dict[str, Any]) -> Citation:
+        page = d.get("page")
         return cls(
             marker=int(d.get("marker", 0) or 0),
             chunk_id=d.get("chunk_id", ""),
@@ -362,6 +403,8 @@ class Citation:
             heading=d.get("heading", ""),
             text=d.get("text", ""),
             score=float(d.get("score", 0) or 0),
+            page=int(page) if page is not None else None,
+            regions=[Region.from_json(r) for r in d.get("regions") or []],
         )
 
 
@@ -383,6 +426,12 @@ class Answer:
     trace_id: str = ""
     took_ms: int = 0
     degraded: str | None = None
+    # The route the agent took to get here: which sections it opened, which ids
+    # it reached for and missed, where it stopped. It travels on the answer
+    # rather than in the trace because "why should I believe this" is answered
+    # by the route taken, and nobody opens a trace to find out. Empty for
+    # `mode="hybrid"`, which has no route — it ranks and hands over.
+    steps: list[dict[str, Any]] = field(default_factory=list)
 
     def __bool__(self) -> bool:
         return self.grounded and bool(self.text)
@@ -401,6 +450,7 @@ class Answer:
             trace_id=d.get("trace_id", ""),
             took_ms=int(d.get("took_ms", 0) or 0),
             degraded=d.get("degraded"),
+            steps=list(d.get("steps") or []),
         )
 
 

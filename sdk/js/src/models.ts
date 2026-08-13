@@ -183,7 +183,10 @@ export interface Neighbor {
   heading: string;
   title: string;
   nodeType: string;
+  /** The edge kind: an authored judgement ("elaborates", "defines", "supports",
+   *  "contradicts", "precedes") when `typed` is true, else "near" (cosine). */
   relation: string;
+  typed: boolean;
   similarity: number;
 }
 
@@ -195,6 +198,7 @@ export function toNeighbor(d: Raw): Neighbor {
     title: d.title ?? "",
     nodeType: d.node_type ?? "fact",
     relation: d.relation ?? "near",
+    typed: Boolean(d.typed),
     similarity: Number(d.similarity ?? 0) || 0,
   };
 }
@@ -246,6 +250,28 @@ export function toIndexSummary(d: Raw): IndexSummary {
   };
 }
 
+/** A box on a page, in PERCENT of the page — not pixels and not points.
+ *  Multiply by the width and height you render the page at. The server clamps
+ *  every box to the page and drops any that covers most of it, so a region that
+ *  survives is a pointer at something specific. */
+export interface Region {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  label: string;
+}
+
+export function toRegion(d: Raw): Region {
+  return {
+    x: Number(d.x ?? 0) || 0,
+    y: Number(d.y ?? 0) || 0,
+    w: Number(d.w ?? 0) || 0,
+    h: Number(d.h ?? 0) || 0,
+    label: d.label ?? "",
+  };
+}
+
 /** A passage an answer leaned on, addressable by its `[n]` marker. */
 export interface Citation {
   marker: number;
@@ -255,6 +281,15 @@ export interface Citation {
   heading: string;
   text: string;
   score: number;
+  /** Set when the passage was read off a PICTURE of the page rather than out of
+   *  its text. Show that page beside the words — it is what makes a transcribed
+   *  table checkable instead of merely plausible. `null` means the passage came
+   *  from text, where there is no single page to point at. */
+  page: number | null;
+  /** Where on that page. Without these a reader is told "page 14" and left to
+   *  search it; with them the highlight lands on the row that was actually
+   *  read. Empty whenever the passage came from text. */
+  regions: Region[];
 }
 
 export function toCitation(d: Raw): Citation {
@@ -266,6 +301,8 @@ export function toCitation(d: Raw): Citation {
     heading: d.heading ?? "",
     text: d.text ?? "",
     score: Number(d.score ?? 0) || 0,
+    page: d.page === null || d.page === undefined ? null : Number(d.page),
+    regions: (d.regions ?? []).map(toRegion),
   };
 }
 
@@ -279,6 +316,12 @@ export interface Answer {
   traceId: string;
   tookMs: number;
   degraded: string | null;
+  /** The route the agent took to get here: which sections it opened, which ids
+   *  it reached for and missed, where it stopped. It travels on the answer
+   *  rather than in the trace because "why should I believe this" is answered
+   *  by the route taken, and nobody opens a trace to find out. Empty for
+   *  `mode: "hybrid"`, which has no route — it ranks and hands over. */
+  steps: Raw[];
 }
 
 export function toAnswer(d: Raw): Answer {
@@ -291,6 +334,7 @@ export function toAnswer(d: Raw): Answer {
     traceId: d.trace_id ?? "",
     tookMs: Number(d.took_ms ?? 0),
     degraded: d.degraded ?? null,
+    steps: d.steps ?? [],
   };
 }
 

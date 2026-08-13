@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from collections.abc import Generator, Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -50,10 +51,29 @@ tell which document to open.
 `neighbors` on its chunk_id to reach the passages nearest it in the store's \
 graph — often the rest of the answer sits one hop away.
 
+Read the `relation` on every neighbour before you use it. Where `typed` is \
+true, someone judged how those two passages stand to each other, and the \
+judgements mean different things to you:
+- `contradicts` — the two sources disagree. Never quietly pick one. Say that \
+the knowledge base disagrees with itself and cite BOTH, so the reader decides.
+- `elaborates` / `defines` — the detail or the definition behind a passage you \
+already have. Follow these when the answer is thin or a term needs pinning down.
+- `supports` — a second, independent source for the same claim. Worth citing \
+alongside the first; it is corroboration, not repetition.
+- `precedes` — the earlier state of something. Check for a later passage before \
+presenting it as current, or you will report superseded facts as today's.
+Where `typed` is false the relation is only "near": a cosine resemblance nobody \
+vouched for. Treat it as a lead to check, never as evidence of a relationship.
+
 Ground every claim in what the tools returned — do not use outside knowledge. \
 The overview is a MAP, not evidence: never cite it; cite the real document \
-(item_id / filename) a claim came from. If the knowledge base does not contain \
-the answer, say so plainly rather than guessing."""
+(item_id / filename) a claim came from.
+
+Say plainly what you could not establish. If the knowledge base does not \
+contain the answer, say so rather than guessing; if it answers only part, give \
+that part and name the gap; if the sources conflict, report the conflict as the \
+finding. A hedged paragraph that hides which of these happened is worse than a \
+short answer that names it."""
 
 
 # --------------------------------- events ---------------------------------
@@ -184,8 +204,11 @@ TOOLS: list[dict[str, Any]] = [
             "earlier neighbors hop), list the passages nearest it in meaning — the store's "
             "own similarity graph. Use it to explore around a promising hit: related "
             "material often sits one hop away, where a fresh search would miss it. Returns "
-            "each neighbour's chunk_id (hop again from it), the document it belongs to, and "
-            "how close it is.",
+            "each neighbour's chunk_id (hop again from it), the document it belongs to, how "
+            "close it is, and `relation`: when `typed` is true this is an authored judgement "
+            "about how the two passages stand to each other — elaborates, defines, supports, "
+            "contradicts, precedes — and when false it is merely \"near\", a cosine "
+            "resemblance nobody vouched for.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -495,6 +518,12 @@ class Agent:
                         "item_id": n.item_id,
                         "heading": n.heading,
                         "title": n.title,
+                        # The edge, not just the distance. "contradicts" and
+                        # "elaborates" are opposite instructions to a reader, and
+                        # collapsing both into a similarity score threw away the
+                        # one thing that told them apart.
+                        "relation": n.relation,
+                        "typed": n.typed,
                         "similarity": round(n.similarity, 4),
                     }
                     for n in found
@@ -508,7 +537,19 @@ class Agent:
 def _summarise(result: Any) -> str:
     """A one-line, human-readable gist of a tool result for the transcript."""
     if isinstance(result, list):
-        return f"{len(result)} result{'' if len(result) == 1 else 's'}"
+        gist = f"{len(result)} result{'' if len(result) == 1 else 's'}"
+        # Name the authored relations a hop found. "10 results" hides the one
+        # thing worth watching for — that a `contradicts` edge came back and the
+        # answer is about to have to report a disagreement rather than a fact.
+        kinds = Counter(
+            str(r.get("relation"))
+            for r in result
+            if isinstance(r, dict) and r.get("typed")
+        )
+        if kinds:
+            named = ", ".join(f"{n}× {k}" for k, n in kinds.most_common())
+            return f"{gist} ({named})"
+        return gist
     if isinstance(result, dict):
         if "error" in result:
             return f"error: {result['error']}"
