@@ -302,6 +302,120 @@ async def test_a_long_list_of_pages_is_not_a_hint():
         del figures.scan
 
 
+# --------------------------- looking at a figure ---------------------------
+
+
+def test_a_box_measured_on_a_crop_is_moved_back_onto_the_page():
+    """The model measures against the picture it was handed.
+
+    The reader is shown the whole PAGE with the boxes drawn on it, so without
+    this every highlight lands in the wrong place — and a box round the wrong
+    thing is worse than no box, which is the rule the region feature is built
+    on.
+    """
+    from packages.core.navigator import _regions_onto_the_page
+
+    # The crop covers x 10-90 and y 15-75 of the page.
+    moved = _regions_onto_the_page(
+        "Report.\nREGION x=10 y=20 w=30 h=40 | the gateway box",
+        (10.0, 15.0, 90.0, 75.0),
+    )
+    assert "x=18.00" in moved  # 10 + 10% of 80
+    assert "y=27.00" in moved  # 15 + 20% of 60
+    assert "w=24.00" in moved  # 30% of 80
+    assert "h=24.00" in moved  # 40% of 60
+    assert "the gateway box" in moved
+
+
+def test_a_degenerate_crop_leaves_the_boxes_alone():
+    from packages.core.navigator import _regions_onto_the_page
+
+    text = "REGION x=10 y=20 w=30 h=40 | thing"
+    assert _regions_onto_the_page(text, (50.0, 50.0, 50.0, 50.0)) == text
+
+
+@pytest.mark.asyncio
+async def test_a_page_with_two_figures_is_looked_at_whole():
+    """There is no way to know WHICH one the question is about without asking
+    the model — which is the call being made cheaper."""
+    from packages.core.navigator import _crop_to_the_figure
+
+    async def two(_ws, _item, _page):
+        return [
+            {"x": 10, "y": 10, "w": 30, "h": 20, "kind": "image", "caption": ""},
+            {"x": 55, "y": 10, "w": 30, "h": 20, "kind": "image", "caption": ""},
+        ]
+
+    figures.for_page = two  # type: ignore[assignment]
+    try:
+        png, box = await _crop_to_the_figure("ws", "item", 1, b"png-bytes")
+        assert box is None and png == b"png-bytes"
+    finally:
+        del figures.for_page
+
+
+@pytest.mark.asyncio
+async def test_a_failure_falls_back_to_the_whole_page():
+    """A page is always a correct thing to look at. An optimisation that can
+    fail the request is not one."""
+    from packages.core.navigator import _crop_to_the_figure
+
+    async def boom(_ws, _item, _page):
+        raise RuntimeError("no object store")
+
+    figures.for_page = boom  # type: ignore[assignment]
+    try:
+        png, box = await _crop_to_the_figure("ws", "item", 1, b"png-bytes")
+        assert box is None and png == b"png-bytes"
+    finally:
+        del figures.for_page
+
+
+@pytest.mark.asyncio
+async def test_a_figure_that_fills_the_page_is_not_cropped():
+    # A crop that is nearly the whole page is not a crop: it pays the
+    # conversion for nothing and loses the reader's frame.
+    from packages.core.navigator import _crop_to_the_figure
+
+    async def huge(_ws, _item, _page):
+        return [{"x": 2, "y": 2, "w": 95, "h": 95, "kind": "image", "caption": ""}]
+
+    figures.for_page = huge  # type: ignore[assignment]
+    try:
+        _png, box = await _crop_to_the_figure("ws", "item", 1, b"png-bytes")
+        assert box is None
+    finally:
+        del figures.for_page
+
+
+@pytest.mark.asyncio
+async def test_a_lone_figure_is_cropped_with_a_margin_for_its_caption():
+    """A figure lifted out with a tight box loses the one line that says what
+    it is."""
+    from PIL import Image
+
+    from packages.core.navigator import FIGURE_MARGIN_PCT, _crop_to_the_figure
+
+    page = Image.new("RGB", (800, 1000), "white")
+    buffer = io.BytesIO()
+    page.save(buffer, format="PNG")
+
+    async def one(_ws, _item, _page):
+        return [{"x": 30, "y": 30, "w": 30, "h": 30, "kind": "drawing", "caption": ""}]
+
+    figures.for_page = one  # type: ignore[assignment]
+    try:
+        png, box = await _crop_to_the_figure("ws", "item", 1, buffer.getvalue())
+        assert box is not None
+        left, top, right, bottom = box
+        assert left == 30 - FIGURE_MARGIN_PCT
+        assert bottom == 60 + FIGURE_MARGIN_PCT
+        with Image.open(io.BytesIO(png)) as out:
+            assert out.size[0] < 800  # it really was cut down
+    finally:
+        del figures.for_page
+
+
 def test_the_scan_is_bounded():
     """Unbounded, a 700-page book would spend seconds of a live answer proving
     that most of it is prose. The scan aims ONE look."""

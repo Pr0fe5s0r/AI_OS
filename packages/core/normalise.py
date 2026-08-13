@@ -96,7 +96,7 @@ def tidy(text: str) -> str:
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r" *\n *", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
-    return mark_spoken_headings(text.strip())
+    return text.strip()
 
 
 # Structure a document states in words instead of in Markdown. A .txt book, a
@@ -122,8 +122,23 @@ MIN_SPOKEN_HEADINGS = 3
 
 
 def _names_a_part(rest: str) -> bool:
-    """Does what follows the structural word actually identify a part?"""
-    return bool(re.search(r"[0-9A-Za-z]", rest))
+    """Does what follows the structural word actually identify a part?
+
+    Two ways it does not, both found on real text once this pass began seeing
+    whole documents instead of single pages:
+
+      "part. The responder can also make alternative proposals"
+      "chapter. So be it."
+
+    A sentence that happens to begin with the word, at the start of a line. The
+    full stop is the tell — a heading is "CHAPTER I" or "PART TWO: 1807", never
+    "chapter." — and a heading does not run to a dozen words either.
+    """
+    if not re.search(r"[0-9A-Za-z]", rest):
+        return False
+    if re.match(r"\s*[.!?]", rest):
+        return False
+    return len(rest.split()) <= 8
 
 
 def mark_spoken_headings(text: str) -> str:
@@ -179,6 +194,70 @@ def mark_spoken_headings(text: str) -> str:
     return "".join(out)
 
 
+# The other way a document states its structure: numbering. "2.2.2 Twisted
+# Pairs". Technical books, standards, specifications, tenders and reports all
+# use it, and none of them says the word CHAPTER anywhere.
+#
+# At least one dot is required, so a bare page number at the top of a page
+# ("36") can never qualify, and the title must begin with a capital.
+_NUMBERED_HEADING = re.compile(
+    r"^(\d{1,2}(?:\.\d{1,3}){1,3})[ \t]+([A-Z][^\n]{1,70})$",
+    re.MULTILINE,
+)
+# A table of contents is made of the same lines with a page number on the end.
+# Promoting those splits the contents page into three hundred empty sections —
+# the document's own index, shredded into sections that contain nothing.
+_CONTENTS_LINE = re.compile(r"[,.\s]\s*\d{1,4}\s*$")
+# Numbering is only structure when it is used throughout. Below this it is more
+# likely a list, a version history, or a couple of cross-references.
+MIN_NUMBERED_HEADINGS = 8
+
+
+def mark_numbered_headings(text: str) -> str:
+    """Promote "2.2.2 Twisted Pairs" to a Markdown heading.
+
+    Found on a real book: Tanenbaum's *Computer Networks*, 962 pages, states
+    its structure entirely in section numbers. It says CHAPTER only inside a
+    running page header ("36 INTRODUCTION CHAP. 1"), so the spoken-heading pass
+    found nothing, and all 4,035 stored passages came out with an EMPTY
+    heading — one distinct heading across a 2.4 MB book. The agent's table of
+    contents was 4,035 unnamed sections, which is not a table of contents; it
+    is a list of the same word four thousand times.
+
+    Nesting follows the numbering, so 1.3.1 sits inside 1.3 and a citation
+    reads as an address rather than as one of hundreds of identical labels.
+    """
+    if re.search(r"(?m)^#{1,6} ", text):
+        return text
+
+    matches = [m for m in _NUMBERED_HEADING.finditer(text) if not _CONTENTS_LINE.search(m.group(2))]
+    if len(matches) < MIN_NUMBERED_HEADINGS:
+        return text
+
+    out: list[str] = []
+    last = 0
+    for match in matches:
+        depth = match.group(1).count(".")
+        out.append(text[last : match.start()])
+        out.append(f"{'#' * min(depth + 1, 6)} {match.group(0).strip()}")
+        last = match.end()
+    out.append(text[last:])
+    return "".join(out)
+
+
+def find_structure(text: str) -> str:
+    """Recover the headings a document states rather than marks up.
+
+    Applied to the WHOLE document, once, after every page has been read. That
+    matters more than it looks: both passes below need to see the pattern
+    repeat before they trust it, and a PDF read page by page never shows them
+    more than one heading at a time. The promoter existed and was wired into
+    tidy(), which PdfParser calls per page — so on a 962-page book with 327
+    numbered headings it fired exactly zero times.
+    """
+    return mark_numbered_headings(mark_spoken_headings(text))
+
+
 def despace(text: str) -> str:
     """Rejoin text a PDF extractor split into individual characters.
 
@@ -207,6 +286,24 @@ def despace(text: str) -> str:
     return "\n".join(out)
 
 
+# Front matter that is printed ON a page but is not what the document is
+# CALLED. A 962-page networking textbook came into the store titled "This page
+# intentionally left blank", because that is the first line of text in the
+# file: the cover is a picture with no text layer, so page 2 was the first page
+# with any words on it at all.
+_FRONT_MATTER = re.compile(
+    r"^(?:this page (?:is )?(?:intentionally|deliberately) left blank"
+    r"|intentionally left blank"
+    r"|blank page"
+    r"|page \d+(?: of \d+)?"
+    r"|copyright(?: ?[©(c)]+.*)?"
+    r"|all rights reserved"
+    r"|table of contents|contents|index|preface|foreword"
+    r"|draft|confidential|for internal use only)\.?$",
+    re.IGNORECASE,
+)
+
+
 def title_from(body: str, filename: str) -> str:
     """First real line of content, else the filename.
 
@@ -214,13 +311,19 @@ def title_from(body: str, filename: str) -> str:
     and horizontal rules are things WE inserted, and titling an item with its
     own scaffolding ("<!-- page 1 -->") makes every document in the index look
     identical to a person scanning it.
+
+    Printed boilerplate is skipped for the same reason, and it is not a rare
+    case: front matter is exactly where a scan's first WORDS live, because the
+    cover is a picture. "This page intentionally left blank" is a sentence
+    about paper, not a title, and a store whose books are named after their
+    blank pages cannot be browsed at all.
     """
     for line in body.splitlines():
         cleaned = line.strip()
         if cleaned.startswith("<!--") or set(cleaned) <= {"-", "=", "*", " "}:
             continue
         cleaned = cleaned.lstrip("# ").strip()
-        if len(cleaned) > 2:
+        if len(cleaned) > 2 and not _FRONT_MATTER.match(cleaned):
             return cleaned[:200]
     return filename.rsplit("/", 1)[-1][:200] or "untitled"
 
@@ -234,7 +337,7 @@ class TextParser:
     extensions: tuple[str, ...] = (".md", ".markdown", ".txt", ".text")
 
     def parse(self, data: bytes, filename: str) -> Normalised:
-        body = tidy(data.decode("utf-8", errors="replace"))
+        body = find_structure(tidy(data.decode("utf-8", errors="replace")))
         return Normalised(title=title_from(body, filename), body=body)
 
 
@@ -275,7 +378,10 @@ class PdfParser:
                 page_count=len(reader.pages),
             )
 
-        body = "\n\n---\n\n".join(pages)
+        # Structure is recovered from the WHOLE document, never per page. Both
+        # promoters need to see a pattern repeat before they trust it, and one
+        # page never shows them more than one heading.
+        body = find_structure("\n\n---\n\n".join(pages))
         info: dict[str, Any] = dict(reader.metadata or {})
         declared = str(info.get("/Title") or "").strip()
         return Normalised(
@@ -487,7 +593,7 @@ def normalise_text(body: str, title: str | None = None, source_name: str = "text
     already rendered — these enter through the same door as files so that the
     write path stays singular.
     """
-    cleaned = tidy(body)
+    cleaned = find_structure(tidy(body))
     return Normalised(title=(title or title_from(cleaned, source_name))[:200], body=cleaned)
 
 

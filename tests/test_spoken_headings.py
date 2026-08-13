@@ -86,12 +86,33 @@ def test_too_few_matches_is_not_structure():
     assert MIN_SPOKEN_HEADINGS >= 3
 
 
-def test_it_runs_as_part_of_the_one_cleanup_every_parser_shares():
-    """In tidy(), not in the tree — because the tree is not the only reader.
+def test_every_parser_produces_the_headings():
+    """Not in the tree — because the tree is not the only reader.
 
     The first attempt taught the OUTLINE to find these headings and stopped
     there. The chunker parses headings independently, so every stored passage
     was still headingless: vectorless improved and hybrid, the section
     summaries and the whole stored index did not.
+
+    It used to live in tidy() to guarantee that. It no longer can: tidy() is
+    called PER PAGE by the PDF parser, and every promoter here needs to see a
+    pattern repeat before it trusts it — so on a 962-page book with 327
+    numbered headings it fired exactly zero times. The guarantee is the same
+    one; it is now made where a whole document is in hand.
     """
-    assert "## CHAPTER I" in tidy(BOOK)
+    from packages.core.normalise import TextParser, find_structure, normalise_text
+
+    assert "## CHAPTER I" in find_structure(BOOK)
+    assert "## CHAPTER I" in TextParser().parse(BOOK.encode(), "book.txt").body
+    assert "## CHAPTER I" in normalise_text(BOOK).body
+
+
+def test_tidy_only_tidies():
+    """Whitespace is tidy()'s whole job, and structure is not whitespace.
+
+    Kept separate because they run at different SCALES: whitespace is correct
+    per page, and structure is only visible per document. Merging them is what
+    hid the bug.
+    """
+    assert "#" not in tidy(BOOK)
+    assert tidy("a  b\n\n\n\nc") == "a b\n\nc"

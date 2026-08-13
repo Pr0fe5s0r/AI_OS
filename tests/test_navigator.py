@@ -1010,6 +1010,41 @@ def test_a_document_id_never_reaches_the_reader():
     assert "55c07521" not in _tidy_answer(bare)
 
 
+def test_every_shape_a_document_id_arrives_in():
+    """Three seen in real answers, all saying the same useless thing."""
+    from packages.core.navigator import _tidy_answer
+
+    for said in (
+        "The diagram is on page 6 of *Casino Platform* (doc: 688c22cb904d30e7e3a3c31a25614499) [2].",
+        "Shown in Figure 4-2 (document ID: 55c07521b81abbd8570b9b469b912733) [2].",
+        "Open the original document (55c07521b81abbd8570b9b469b912733) [2].",
+    ):
+        out = _tidy_answer(said)
+        assert "688c22cb" not in out and "55c07521" not in out
+        # And it does not leave the empty brackets behind.
+        assert "()" not in out
+        assert "[2]" in out
+
+
+def test_a_bracketed_hash_the_document_printed_is_left_alone():
+    """The bracket has to be naming a document to US.
+
+    A paper about hashing may legitimately print a 32-character hex string in
+    parentheses, and this store holds the Bitcoin paper.
+    """
+    from packages.core.navigator import _tidy_answer
+
+    quoted = "The genesis block hash is (000000000019d6689c085ae165831e93) as printed [1]."
+    assert _tidy_answer(quoted) == quoted
+
+
+def test_ordinary_parentheses_survive():
+    from packages.core.navigator import _tidy_answer
+
+    plain = "The gateway (see page 4) handles signalling [1]."
+    assert _tidy_answer(plain) == plain
+
+
 def test_a_hash_quoted_by_a_document_is_left_alone():
     """Deliberately narrow. A store that silently deleted hex out of answers
     would corrupt every answer about hashing — which this store is asked, since

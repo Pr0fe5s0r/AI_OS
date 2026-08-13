@@ -375,6 +375,108 @@ _LOOK_PROMPT = (
     "nothing and a box round the wrong thing is worse than none at all. If you "
     "cannot place something confidently, leave it out."
 )
+# Sent with a crop so the coordinates come back in the units the reader draws
+# in. The model is told what it is looking at, because a figure lifted off its
+# page has lost the running header that says which chapter it belongs to.
+_CROPPED_NOTE = (
+    "\n\nNOTE: this picture is a FIGURE cut out of page {page} — a diagram, "
+    "chart or photograph — not the whole page. Report the figure. Give the "
+    "REGION lines as percentages OF THIS PICTURE, from its own top-left corner."
+)
+
+# A margin left around a cropped figure, as a fraction of the page. Enough to
+# carry the caption printed under it and the label above it: a figure lifted
+# out with a tight box loses the one line that says what it is.
+FIGURE_MARGIN_PCT = 5.0
+
+# Cropping only happens when the page holds exactly one figure. Two, and there
+# is no way to know which one the question is about without asking the model —
+# which is the call we are trying to make cheaper.
+async def _crop_to_the_figure(
+    workspace_id: str, item_id: str, page: int, png: bytes
+) -> tuple[bytes, tuple[float, float, float, float] | None]:
+    """Send the diagram rather than the sheet of paper it is printed on.
+
+    Measured on the casino architecture page, twice each: the whole page took
+    74.3s and 49.8s, the figure crop 33.8s and 35.6s. And the crop came back
+    LONGER — 2901 and 2955 characters against 2408 and 2656 — so it is not
+    buying speed by reporting less. The saving is not payload either; the crop
+    is 88% of the page's bytes. It is that the model stops transcribing the
+    column of prose surrounding the picture and reads the picture.
+
+    That matters beyond the clock. One vision call was 109s of a 130s answer —
+    84% of it — so this is the only place in an agentic walk where there is
+    real time to win.
+
+    Falls back to the whole page on anything unexpected. A page is always a
+    correct thing to look at; this is an optimisation, and an optimisation that
+    can fail the request is not one.
+    """
+    try:
+        from packages.core import figures
+
+        found = await figures.for_page(workspace_id, item_id, page)
+        if len(found) != 1:
+            return png, None
+        figure = found[0]
+
+        import io
+
+        from PIL import Image
+
+        with Image.open(io.BytesIO(png)) as opened:
+            width, height = opened.size
+            left = max(0.0, figure["x"] - FIGURE_MARGIN_PCT)
+            top = max(0.0, figure["y"] - FIGURE_MARGIN_PCT)
+            right = min(100.0, figure["x"] + figure["w"] + FIGURE_MARGIN_PCT)
+            bottom = min(100.0, figure["y"] + figure["h"] + FIGURE_MARGIN_PCT)
+            # A crop that is nearly the whole page is not a crop. Sending it
+            # would pay the conversion for nothing and lose the reader's frame.
+            if (right - left) * (bottom - top) >= 8000:
+                return png, None
+            crop = opened.crop(
+                (
+                    int(left / 100 * width),
+                    int(top / 100 * height),
+                    int(right / 100 * width),
+                    int(bottom / 100 * height),
+                )
+            ).convert("RGB")
+            buffer = io.BytesIO()
+            crop.save(buffer, format="PNG", optimize=True)
+            return buffer.getvalue(), (left, top, right, bottom)
+    except Exception:
+        return png, None
+
+
+def _regions_onto_the_page(
+    text: str, box: tuple[float, float, float, float]
+) -> str:
+    """Move REGION boxes from crop coordinates back onto the page.
+
+    The model measures against the picture it was handed. The reader is shown
+    the whole page with the boxes drawn on it, so without this every highlight
+    lands in the wrong place — and a box round the wrong thing is worse than no
+    box at all, which is the rule the whole region feature is built on.
+    """
+    left, top, right, bottom = box
+    span_x, span_y = right - left, bottom - top
+    if span_x <= 0 or span_y <= 0:
+        return text
+
+    def move(match: re.Match[str]) -> str:
+        try:
+            x, y, w, h = (float(match.group(i)) for i in range(1, 5))
+        except ValueError:
+            return match.group(0)
+        return (
+            f"REGION x={left + x / 100 * span_x:.2f} y={top + y / 100 * span_y:.2f} "
+            f"w={w / 100 * span_x:.2f} h={h / 100 * span_y:.2f} | {match.group(5)}"
+        )
+
+    return _REGION.sub(move, text)
+
+
 _NOT_ON_PAGE = "NOT_ON_THIS_PAGE"
 
 # An answer that concludes the store does not say something.
@@ -807,16 +909,40 @@ _CANNOT_SHOW = re.compile(
 # fires on the DISCLOSURE phrasing, not on any long hex string, because a
 # document may legitimately quote a hash and eating that would corrupt a real
 # answer.
-_DOC_ID_ASIDE = re.compile(
-    # Either the disclosure spelled out — "document ID: 55c0…" — or a bare
-    # store id parenthesised beside the document it names, which is how it
-    # actually appeared: "the original document (55c07521b81abbd857…)".
-    r"[ \t]*[(\[]\s*(?:(?:document|doc|item|file)[ \t]+(?:id|ID|identifier)"
-    r"[ \t]*[:=]?[ \t]*)?[0-9a-f]{32}\s*[)\]]"
-    r"|[ \t]*(?:document|doc|item|file)[ \t]+(?:id|ID|identifier)"
+# Every bracketed aside holding a store id, plus the spelled-out form outside
+# brackets. Three shapes have been seen in real answers, all saying the same
+# useless thing:
+#
+#     the original document (55c07521b81abbd8570b9b469b912733)
+#     ... by Tanenbaum and Wetherall (document ID: 55c07521…)
+#     ... Experience Platform* (doc: 688c22cb904d30e7e3a3c31a25614499)
+_DOC_ID_BRACKET = re.compile(r"[ \t]*[(\[]([^()\[\]\n]*[0-9a-f]{32}[^()\[\]\n]*)[)\]]")
+_DOC_ID_SPELLED = re.compile(
+    r"[ \t]*\b(?:document|doc|item|file)[ \t]+(?:id|ID|identifier)"
     r"[ \t]*[:=][ \t]*[0-9a-f]{16,}",
     re.IGNORECASE,
 )
+# What makes a bracketed hex string OURS rather than the document's. Required,
+# because this store holds the Bitcoin paper: a bare 32-hex in parentheses is
+# a plausible thing for a document about hashing to print, and deleting it
+# would corrupt a real answer.
+_NAMES_A_DOCUMENT = re.compile(r"\b(?:document|doc|item|file|id|identifier)\b", re.IGNORECASE)
+
+
+def _drop_the_id(match: re.Match[str]) -> str:
+    """Delete a bracketed aside, but only when it is naming a document to us.
+
+    Either the bracket labels itself — "(doc: 688c…)", "(document ID: 55c0…)" —
+    or the words just before it do: "the original document (55c0…)". Anything
+    else keeps its brackets: a paper about hashing may legitimately print a
+    32-character hex string in parentheses, and a store that silently deleted
+    it would be corrupting the answer it was asked for.
+    """
+    inside = match.group(1)
+    if _NAMES_A_DOCUMENT.search(inside):
+        return ""
+    before = match.string[max(0, match.start() - 40) : match.start()]
+    return "" if _NAMES_A_DOCUMENT.search(before) else match.group(0)
 
 
 def _strip_medium_apology(text: str) -> str:
@@ -827,7 +953,11 @@ def _strip_medium_apology(text: str) -> str:
     a blank card. Cutting text is riskier than leaving it, the same rule
     _strip_answer_label works to.
     """
-    trimmed = _DOC_ID_ASIDE.sub("", text)
+    # Brackets first. The other way round, the spelled-out pass hollows out
+    # "(document ID: 55c0…)" and leaves "()" behind, which the bracket pass can
+    # no longer recognise as ours.
+    trimmed = _DOC_ID_BRACKET.sub(_drop_the_id, text)
+    trimmed = _DOC_ID_SPELLED.sub("", trimmed)
     trimmed = _CANNOT_SHOW.sub("", trimmed)
     # Collapse the blank lines the removals leave behind.
     trimmed = re.sub(r"\n{3,}", "\n\n", trimmed).strip()
@@ -987,7 +1117,15 @@ async def _read_page(
     if png is None:
         return None
 
-    key = (workspace_id, item_id, page, " ".join(looking_for.lower().split()))
+    png, crop_box = await _crop_to_the_figure(workspace_id, item_id, page, png)
+
+    key = (
+        workspace_id,
+        item_id,
+        page,
+        " ".join(looking_for.lower().split()),
+        bool(crop_box),
+    )
     cached = _READ_CACHE.get(key)
     if cached is not None:
         # Reading the page again would cost the most expensive call this
@@ -1001,11 +1139,18 @@ async def _read_page(
         seen = await asyncio.to_thread(
             look,
             png,
-            _LOOK_PROMPT.format(looking_for=looking_for),
+            _LOOK_PROMPT.format(looking_for=looking_for)
+            + (_CROPPED_NOTE.format(page=page) if crop_box else ""),
             model=pages.vision_model(),
         )
     except Exception:
         return None
+
+    if crop_box and seen:
+        # The model measured against the crop it was shown. The reader is shown
+        # the PAGE, so the boxes are moved back onto it — otherwise every
+        # highlight lands in the top-left corner of the wrong thing.
+        seen = _regions_onto_the_page(seen, crop_box)
 
     reading = (seen or "").strip() or None
     # A refusal is the one answer that must never be cached. NOT_ON_THIS_PAGE
