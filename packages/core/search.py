@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import secrets
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from functools import lru_cache
 from typing import Any
@@ -52,6 +52,16 @@ class RetrievalConfig:
     semantic_weight: float = 0.7  # the remainder goes to recency
     sources: tuple[str, ...] = ()  # empty = every source
     item_ids: tuple[str, ...] = ()  # empty = every document; else search only these
+    # Filter on the metadata a document was ingested with: client id, category,
+    # document type, anything the caller wrote. A tuple of (key, value) pairs
+    # rather than a dict so a config stays immutable and hashable like every
+    # other field here.
+    #
+    # DIFFERENT keys are ANDed and the SAME key is ORed — ("kind","policy") with
+    # ("kind","notice") and ("client","acme") reads as: client acme, and either
+    # a policy or a notice. That is the shape a filter actually arrives in from
+    # a query string, and it needs no syntax to express.
+    metadata: tuple[tuple[str, str], ...] = ()
     period_from: datetime | None = None
     period_to: datetime | None = None
     include_superseded: bool = False
@@ -67,7 +77,14 @@ class RetrievalConfig:
         # When the search is confined to specific documents, cast a much wider
         # net per arm so their passages survive to hydration even in a large
         # collection — the item filter there then keeps only them.
-        if self.item_ids:
+        #
+        # A metadata filter needs the same widening for the same reason, and it
+        # is the more dangerous of the two: naming ten document ids is visibly a
+        # narrow search, while `client=acme` looks broad and may select five
+        # documents out of ten thousand. Without this the top forty candidates
+        # could contain none of them and the store would answer "nothing found"
+        # about content it holds.
+        if self.item_ids or self.metadata:
             return max(base, 200)
         return base
 
@@ -78,6 +95,7 @@ class RetrievalConfig:
             "semantic_weight": self.semantic_weight,
             "sources": list(self.sources),
             "item_ids": list(self.item_ids),
+            "metadata": [list(pair) for pair in self.metadata],
             "period_from": self.period_from.isoformat() if self.period_from else None,
             "period_to": self.period_to.isoformat() if self.period_to else None,
             "include_superseded": self.include_superseded,
@@ -160,8 +178,98 @@ _HYDRATE = """
 """
 
 
+def _by_key(pairs: tuple[tuple[str, str], ...]) -> list[tuple[str, list[str]]]:
+    """Group (key, value) pairs so one key carries all the values asked for.
+
+    This is what turns a flat list of pairs into "AND across keys, OR within
+    one" without the caller needing a query language: ?meta=kind:policy
+    &meta=kind:notice&meta=client:acme means client acme, policy or notice.
+    Order is kept so the SQL and the trace read the way the request did.
+    """
+    grouped: dict[str, list[str]] = {}
+    for key, value in pairs:
+        grouped.setdefault(key, []).append(value)
+    return list(grouped.items())
+
+
+# Above this many matching documents, a metadata filter is not narrowing the
+# search, it is describing most of it. Past the ceiling the filter still applies
+# at hydration — it is never ignored — but the document set is not carried into
+# the arms, because passing fifty thousand ids into `= ANY(...)` costs more than
+# the ranking it was meant to help.
+MAX_NARROWED_ITEMS = 2000
+
+
+async def _narrow_to_metadata(
+    session: AsyncSession, scope: Scope, cfg: RetrievalConfig
+) -> list[str] | None:
+    """The document set for this config's metadata filter, intersected with any
+    explicit document list. See items_with_metadata for the rules."""
+    found = await items_with_metadata(
+        session, scope, cfg.metadata, include_superseded=cfg.include_superseded
+    )
+    if found is None:
+        return None
+    # An explicit document list still wins: asking for these documents AND this
+    # metadata means the intersection, never the union.
+    if cfg.item_ids:
+        allowed = set(cfg.item_ids)
+        return [item for item in found if item in allowed]
+    return found
+
+
+async def items_with_metadata(
+    session: AsyncSession,
+    scope: Scope,
+    metadata: tuple[tuple[str, str], ...],
+    include_superseded: bool = False,
+) -> list[str] | None:
+    """Which documents carry this metadata. None when there is nothing to do.
+
+    None means "do not narrow" — either no metadata filter was asked for, or it
+    matches so much of the collection that narrowing would cost more than it
+    saves. An empty LIST is a different answer entirely: the filter is real and
+    nothing matches it.
+
+    Scoped to the workspace and collection, which are indexed, so this reads one
+    tenant's documents rather than the table. `->>` compares as text on purpose:
+    a filter arrives from a query string, where 2024 and "2024" are the same
+    thing to the person typing it, and a filter that silently missed numeric
+    metadata would be worse than one that never existed.
+    """
+    if not metadata:
+        return None
+
+    clauses = ["workspace_id = :workspace"]
+    params: dict[str, Any] = {"workspace": scope.workspace_id}
+    if scope.collection_id is not None:
+        clauses.append("collection_id = :collection")
+        params["collection"] = scope.collection_id
+    if not include_superseded:
+        clauses.append("status = :active")
+        params["active"] = str(Lifecycle.ACTIVE)
+    for index, (key, values) in enumerate(_by_key(metadata)):
+        clauses.append(f"metadata ->> :mkey{index} = ANY(:mval{index})")
+        params[f"mkey{index}"] = key
+        params[f"mval{index}"] = values
+    params["ceiling"] = MAX_NARROWED_ITEMS + 1
+
+    rows = (
+        await session.execute(
+            text(  # noqa: S608 - every clause is a fixed literal; keys and values are bound
+                f"SELECT item_id FROM kb_items WHERE {' AND '.join(clauses)} LIMIT :ceiling"
+            ),
+            params,
+        )
+    ).scalars()
+    found = list(rows)
+    if len(found) > MAX_NARROWED_ITEMS:
+        return None
+    return found
+
+
 def _filters(scope: Scope, cfg: RetrievalConfig) -> tuple[str, dict[str, Any]]:
-    """Scope, lifecycle, source and period — applied to every arm alike."""
+    """Scope, lifecycle, source, period and metadata — every arm alike."""
     clauses = ["workspace_id = :workspace"]
     params: dict[str, Any] = {"workspace": scope.workspace_id}
     if scope.collection_id is not None:
@@ -179,6 +287,19 @@ def _filters(scope: Scope, cfg: RetrievalConfig) -> tuple[str, dict[str, Any]]:
     if cfg.item_ids:
         clauses.append("item_id = ANY(:item_ids)")
         params["item_ids"] = list(cfg.item_ids)
+    # Metadata, applied in exactly the same place and for exactly the same
+    # reason. The graph knows nothing about what a document was tagged with, so
+    # a candidate the vector index offered that the filter excludes dies at
+    # hydration with everything else — one clause, both arms, and the trace
+    # shows the drop.
+    #
+    # The KEY is bound, never interpolated. It arrives from a caller, and a
+    # metadata filter that built SQL out of it would be an injection hole
+    # dressed as a feature.
+    for index, (key, values) in enumerate(_by_key(cfg.metadata)):
+        clauses.append(f"metadata ->> :mkey{index} = ANY(:mval{index})")
+        params[f"mkey{index}"] = key
+        params[f"mval{index}"] = values
     # Time-aware: filter on the period the content DESCRIBES, falling back to
     # when it was created. A July report about Q2 must match a Q2 query.
     if cfg.period_from is not None:
@@ -281,6 +402,35 @@ async def search_traced(
     happened.
     """
     started = time.perf_counter()
+
+    # A selective metadata filter narrows the search BEFORE either arm runs.
+    #
+    # Filtering only at hydration would be correct and quietly useless: the
+    # arms would rank the whole collection, hand up their best forty, and the
+    # filter would keep whichever happened to match. Ask for five documents out
+    # of ten thousand and the answer is "nothing found" about content the store
+    # is holding. Resolving the filter to a document set first means the arms
+    # search inside it.
+    resolved = await _narrow_to_metadata(session, scope, cfg)
+    if resolved is not None:
+        if not resolved:
+            # The filter matches no document at all. Said with an empty result
+            # and a trace that shows why, rather than by searching everything.
+            empty = Trace(
+                trace_id=new_trace_id(),
+                query=query,
+                config=cfg.as_dict(),
+                filters={
+                    "workspace_id": scope.workspace_id,
+                    "collection_id": scope.collection_id,
+                    "metadata": dict(_by_key(cfg.metadata)),
+                    "matched_documents": 0,
+                },
+                timings_ms={"total": int((time.perf_counter() - started) * 1000)},
+            )
+            return [], empty
+        cfg = replace(cfg, item_ids=tuple(resolved))
+
     where, params = _filters(scope, cfg)
     trace = Trace(
         trace_id=new_trace_id(),
@@ -291,6 +441,11 @@ async def search_traced(
             "collection_id": scope.collection_id,
             "sources": list(cfg.sources),
             "item_ids": list(cfg.item_ids),
+            # Recorded because a filter is part of why an answer came back the
+            # way it did. "Nothing found" under a metadata filter and "nothing
+            # found" without one are different events, and a trace that cannot
+            # tell them apart cannot explain either.
+            "metadata": {key: values for key, values in _by_key(cfg.metadata)},
             "include_superseded": cfg.include_superseded,
         },
     )

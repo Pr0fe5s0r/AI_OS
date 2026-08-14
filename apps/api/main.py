@@ -194,6 +194,14 @@ async def ingest_file_item(
     url: str | None = Form(None),
     period_start: datetime | None = Form(None),
     period_end: datetime | None = Form(None),
+    metadata: str | None = Form(
+        None,
+        description=(
+            'Arbitrary metadata as a JSON object, e.g. {"client":"acme",'
+            '"kind":"policy"}. Retrieval can filter on it — see ?meta= on '
+            "/api/search and /api/answer."
+        ),
+    ),
     scope: Scope = Depends(workspace_scope),
 ) -> Accepted:
     """Upload a document. The bytes become Markdown and are then discarded.
@@ -205,6 +213,18 @@ async def ingest_file_item(
     data = await file.read()
     if not data:
         raise HTTPException(400, "Empty file.")
+
+    # Rejected loudly rather than dropped. Metadata that silently failed to
+    # attach is worse than metadata that was refused: retrieval filtered on it
+    # would quietly exclude the document, and the upload said 202.
+    tags: dict[str, Any] = {}
+    if metadata:
+        try:
+            tags = json.loads(metadata)
+        except ValueError as exc:
+            raise HTTPException(422, f"metadata is not valid JSON: {exc}") from exc
+        if not isinstance(tags, dict):
+            raise HTTPException(422, "metadata must be a JSON object.")
 
     # An upper bound, because the whole file is in memory by the line above and
     # several API replicas each holding a large upload is how a container gets
@@ -275,7 +295,7 @@ async def ingest_file_item(
             url,
             period_start,
             period_end,
-            None,
+            tags or None,
         )
         return Accepted(job_id=job.job_id if job else None)
     except Exception as exc:
@@ -292,6 +312,37 @@ async def formats() -> dict[str, list[str]]:
 # ----------------------------- retrieval contract -----------------------------
 
 
+_META_HELP = (
+    "Filter by the metadata a document was ingested with, as key:value. "
+    "Repeatable: ?meta=client:acme&meta=kind:policy. Different keys must all "
+    "match; the same key repeated matches any of its values — so "
+    "?meta=kind:policy&meta=kind:notice&meta=client:acme reads as 'client acme, "
+    "and either a policy or a notice'. Values are compared as text."
+)
+
+
+def _metadata_pairs(raw: list[str] | None) -> tuple[tuple[str, str], ...]:
+    """Parse `key:value` filters off the query string.
+
+    Split on the FIRST colon only, so a value may contain one — a URL, a
+    timestamp, a path. A pair with no colon, or with an empty key, is rejected
+    rather than ignored: a filter that silently does nothing is how a caller
+    ends up trusting an answer drawn from documents they meant to exclude,
+    which is the one failure this feature must never have.
+    """
+    pairs: list[tuple[str, str]] = []
+    for entry in raw or ():
+        key, sep, value = entry.partition(":")
+        if not sep or not key.strip():
+            raise HTTPException(
+                422,
+                f"Metadata filter {entry!r} is not key:value. "
+                "Example: ?meta=client:acme",
+            )
+        pairs.append((key.strip(), value))
+    return tuple(pairs)
+
+
 @app.get("/api/search")
 async def retrieve(
     q: str = Query(min_length=1),
@@ -301,6 +352,7 @@ async def retrieve(
     item_ids: list[str] | None = Query(
         None, description="Restrict the search to these document ids."
     ),
+    meta: list[str] | None = Query(None, description=_META_HELP),
     period_from: datetime | None = None,
     period_to: datetime | None = None,
     include_superseded: bool = False,
@@ -319,6 +371,7 @@ async def retrieve(
         min_score=min_score,
         sources=tuple(sources or ()),
         item_ids=tuple(item_ids or ()),
+        metadata=_metadata_pairs(meta),
         period_from=period_from,
         period_to=period_to,
         include_superseded=include_superseded,
@@ -407,6 +460,7 @@ async def answer_question(
             "question is about."
         ),
     ),
+    meta: list[str] | None = Query(None, description=_META_HELP),
     vision: bool = Query(
         True,
         description=(
@@ -466,7 +520,9 @@ async def answer_question(
     back on the response, because two answers to one question can differ
     entirely on it.
     """
-    cfg = RetrievalConfig(limit=limit, sources=tuple(sources or ()))
+    cfg = RetrievalConfig(
+        limit=limit, sources=tuple(sources or ()), metadata=_metadata_pairs(meta)
+    )
     try:
         result, trace = await asyncio.wait_for(
             answer(
@@ -525,6 +581,7 @@ async def answer_stream(
             "question is about."
         ),
     ),
+    meta: list[str] | None = Query(None, description=_META_HELP),
     vision: bool = Query(True, description="See /api/answer."),
     behaviour: str = Query("", max_length=MAX_BEHAVIOUR_CHARS, description="See /api/answer."),
     open_document: bool = Query(True, description="See /api/answer."),
@@ -541,7 +598,9 @@ async def answer_stream(
     this exists to show the work. The trace is recorded once, at the end, under
     the retrieval that produced it — identical to the blocking route.
     """
-    cfg = RetrievalConfig(limit=limit, sources=tuple(sources or ()))
+    cfg = RetrievalConfig(
+        limit=limit, sources=tuple(sources or ()), metadata=_metadata_pairs(meta)
+    )
 
     async def events() -> AsyncIterator[str]:
         queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()

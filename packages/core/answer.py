@@ -10,7 +10,14 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core import support
-from packages.core.search import DEFAULT, RetrievalConfig, Trace, search_traced
+from packages.core.search import (
+    DEFAULT,
+    RetrievalConfig,
+    Trace,
+    items_with_metadata,
+    new_trace_id,
+    search_traced,
+)
 from packages.shared.schema import Hit, Passage, Scope
 
 # A progress sink, matching the navigator's: one event dict per step, awaited so
@@ -484,6 +491,43 @@ async def _write(
     return "".join(parts)
 
 
+def _nothing_matched(
+    question: str, mode: str, cfg: RetrievalConfig, started: float
+) -> tuple[Answer, Trace]:
+    """No document carries the metadata that was asked for.
+
+    Answered rather than searched. Once the filter has excluded everything,
+    there is nothing to retrieve from, and running the query anyway would either
+    waste a model call or — worse — quietly answer from documents the caller
+    excluded.
+
+    Ungrounded and explicit about WHY. "No matching documents" and "nothing
+    found in the documents" are different facts about a store, and a caller
+    acting on the wrong one either widens a filter that was right or trusts an
+    absence that was never tested.
+    """
+    trace = Trace(
+        trace_id=new_trace_id(),
+        query=question,
+        config=cfg.as_dict(),
+        filters={"metadata": dict(cfg.metadata), "matched_documents": 0},
+        timings_ms={"total": int((time.perf_counter() - started) * 1000)},
+        degraded="no document carries the metadata that was filtered on",
+    )
+    return (
+        Answer(
+            question=question,
+            text="No document in this collection carries the metadata that was filtered on.",
+            trace_id=trace.trace_id,
+            took_ms=trace.timings_ms["total"],
+            grounded=False,
+            degraded=trace.degraded,
+            mode=mode,
+        ),
+        trace,
+    )
+
+
 async def answer(
     session: AsyncSession,
     scope: Scope,
@@ -532,6 +576,22 @@ async def answer(
     is not one anybody can argue with.
     """
     started = time.perf_counter()
+
+    # A metadata filter has to reach the AGENT, not just the search inside it.
+    # Agentic mode navigates a catalogue of documents, and a filter applied only
+    # to hybrid_search would leave the agent reading the table of contents of
+    # documents the caller excluded — then citing them. So the filter is
+    # resolved to a document set here, once, and both modes are confined to it.
+    if cfg.metadata:
+        matched = await items_with_metadata(
+            session, scope, cfg.metadata, include_superseded=cfg.include_superseded
+        )
+        if matched is not None:
+            allowed = set(item_ids) & set(matched) if item_ids else set(matched)
+            if not allowed:
+                return _nothing_matched(question, mode, cfg, started)
+            item_ids = tuple(sorted(allowed))
+        cfg = replace(cfg, item_ids=item_ids)
 
     if mode in ("vectorless", "agentic"):
         # The navigator answers as it reads, so there is no second pass here.
