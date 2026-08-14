@@ -81,58 +81,102 @@ def test_the_model_is_told_not_to_decide_ownership():
 # ------------------------------- what is kept -------------------------------
 
 
-def test_the_field_set_is_closed():
-    """An open-ended "describe this document" produces a different vocabulary
-    per document, and a facet nobody can enumerate is one nobody can filter or
-    boost on."""
+def test_the_vocabulary_is_open():
+    """The model names its own fields.
+
+    A closed set was tried first and was the wrong instinct for this mechanism.
+    A fixed enum helps FILTERING, where two documents must agree on a label to
+    be selected together. Here the attributes are rendered into the card and the
+    card is embedded, so a document-shaped phrase carries more signal than a
+    generic bucket. Forcing a vocabulary discards the part that helps.
+    """
     out = derive.sanitise(
         {
-            "doc_type": "Statement of Work",
-            "topics": ["Conversational AI", "casino"],
-            "entities": ["Temprl", "Whisper"],
-            "year": "2026",
-            "sentiment": "positive",
-            "confidence": 0.9,
+            "document_kind": "Statement of Work",
+            "purpose": "define scope and deliverables",
+            "audience": ["casino operators", "engineering"],
+            "systems_named": ["Whisper", "Kokoro TTS"],
+            "period": "2026",
         }
     )
-    assert set(out) == {"doc_type", "topics", "entities", "year"}
-    assert out["doc_type"] == "statement of work"
-    assert out["topics"] == ["conversational ai", "casino"]
-    assert out["entities"] == ["Temprl", "Whisper"]  # names keep their case
+    assert set(out) == {
+        "document_kind",
+        "purpose",
+        "audience",
+        "systems_named",
+        "period",
+    }
+    assert out["audience"] == ["casino operators", "engineering"]
 
 
-def test_lists_are_capped_and_deduplicated():
+def test_two_documents_may_be_described_completely_differently():
+    a = derive.sanitise({"legal_form": "tender", "jurisdiction": "karnataka"})
+    b = derive.sanitise({"protocol_layer": "data link", "standard": "ieee 802.3"})
+    assert set(a).isdisjoint(set(b))
+    assert a and b
+
+
+def test_the_shape_is_not_open_even_though_the_vocabulary_is():
+    """Flat keys, scalars or lists of scalars, everything capped.
+
+    Open vocabulary is not open season on the record: a nested object cannot be
+    reached by `->>` and an unbounded one would let a runaway model write a page
+    into a navigation surface.
+    """
+    out = derive.sanitise({"meta": {"a": 1}, "topics": [{"x": 1}, "real"], "count": 5})
+    assert "meta" not in out
+    assert out["topics"] == ["real"]
+    assert out["count"] == "5"  # scalars are kept, as text
+
+
+def test_everything_is_capped():
     out = derive.sanitise(
         {
-            "topics": ["a", "a", "b", "c", "d", "e", "f", "g", "h"],
-            "entities": [f"E{n}" for n in range(20)],
+            **{f"field_{n}": "value" for n in range(40)},
+            "many": [f"v{n}" for n in range(50)],
+            "long": "x" * 500,
         }
     )
-    assert len(out["topics"]) <= derive.MAX_TOPICS
-    assert len(out["entities"]) <= derive.MAX_ENTITIES
-    assert out["topics"].count("a") == 1
+    assert len(out) <= derive.MAX_KEYS
+    if "many" in out:
+        assert len(out["many"]) <= derive.MAX_LIST
+    if "long" in out:
+        assert len(out["long"]) <= derive.MAX_VALUE_CHARS
 
 
-def test_a_year_must_look_like_a_year():
-    assert derive.sanitise({"year": "2026"})["year"] == "2026"
-    for nonsense in ("last year", "20260", "n/a", "3026", ""):
-        assert "year" not in derive.sanitise({"year": nonsense})
+def test_a_reserved_word_anywhere_in_a_field_name_is_refused():
+    """Not only the exact spellings someone thought to list.
+
+    `client_name`, `owner_email` and `account_reference` all name ownership as
+    surely as `client_id` does, and a per-word check catches the ones nobody
+    enumerated.
+    """
+    out = derive.sanitise(
+        {
+            "client_name": "acme",
+            "owner_email": "x@y.z",
+            "account_reference": "A1",
+            "tenant_slug": "globex",
+            "topics": ["kept"],
+        }
+    )
+    assert out == {"topics": ["kept"]}
+
+
+def test_a_reserved_key_spelled_differently_is_still_refused():
+    """Normalisation runs BEFORE the reserved check, which is the whole reason
+    it exists here: "Client ID" and "client-id" must both fail."""
+    out = derive.sanitise(
+        {"Client ID": "acme", "client-id": "acme", "CLIENT_ID": "acme", "ok_field": "kept"}
+    )
+    assert out == {"ok_field": "kept"}
 
 
 def test_empty_is_a_correct_answer():
     """A wrong tag is worse than a missing one, so nothing is invented to avoid
-    an empty field."""
+    an empty object."""
     assert derive.sanitise({}) == {}
-    assert derive.sanitise({"topics": [], "entities": [], "doc_type": ""}) == {}
-
-
-def test_nested_junk_is_refused():
-    # Only scalars and lists of scalars. A nested object would not be reachable
-    # by `->>` anyway, so storing one would be a filter that silently never
-    # matches.
-    out = derive.sanitise({"doc_type": {"kind": "invoice"}, "topics": [{"a": 1}, "real"]})
-    assert "doc_type" not in out
-    assert out["topics"] == ["real"]
+    assert derive.sanitise({"topics": [], "kind": ""}) == {}
 
 
 # ------------------------------ the improvement ------------------------------
@@ -146,15 +190,14 @@ def test_the_card_line_reads_as_text_not_json():
     """
     line = derive.as_card_line(
         {
-            "doc_type": "statement of work",
-            "topics": ["conversational ai"],
-            "entities": ["Temprl"],
-            "year": "2026",
+            "document_kind": "statement of work",
+            "subjects": ["conversational ai"],
+            "systems_named": ["Temprl"],
         }
     )
     assert "{" not in line and '"' not in line
-    assert "Document type: statement of work." in line
-    assert "Mentions: Temprl." in line
+    assert "Document kind: statement of work." in line
+    assert "Systems named: Temprl." in line
 
 
 def test_nothing_derived_means_nothing_appended():
@@ -210,6 +253,32 @@ async def test_a_failed_extraction_is_not_a_failed_ingest():
 
 
 @pytest.mark.asyncio
+async def test_a_transient_error_is_retried_not_abandoned():
+    """The failure a retry exists for.
+
+    This gave up on the first exception, so a backfill firing one call per
+    document met a rate limit and four of eight came back undescribed — while
+    the model was answering every one of them correctly when asked again.
+    """
+    calls = 0
+
+    async def rate_limited_once(_card, _model):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("429 Too Many Requests")
+        return '{"document_type": "policy"}'
+
+    original = derive._ask
+    derive._ask = rate_limited_once  # type: ignore[assignment]
+    try:
+        assert await derive.describe("a card") == {"document_type": "policy"}
+        assert calls == 2
+    finally:
+        derive._ask = original  # type: ignore[assignment]
+
+
+@pytest.mark.asyncio
 async def test_prose_instead_of_json_yields_nothing():
     async def prose(_card, _model):
         return "Sure! This document appears to be a statement of work."
@@ -251,5 +320,142 @@ async def test_an_empty_card_asks_nothing():
     try:
         assert await derive.describe("   ") == {}
         assert called is False
+    finally:
+        derive._ask = original  # type: ignore[assignment]
+
+
+# ------------------- generated once, at ingest, and reused -------------------
+
+
+def test_no_retrieval_path_ever_regenerates():
+    """Derived once, at ingest, and read from then on.
+
+    A model call on the read path would put a per-question cost on every
+    question — the exact mistake query expansion made inside the navigator,
+    where agentic went from 5s to 70s because each search spent its own
+    expansion call and no cache could help.
+
+    So this is a tripwire, not a convention: every module a question passes
+    through is read, and none of them may call describe().
+    """
+    from packages.core import answer, navigator, routing, search
+
+    for module in (search, answer, navigator, routing):
+        source = inspect.getsource(module)
+        assert "derive.describe" not in source, (
+            f"{module.__name__} regenerates derived metadata on the read path"
+        )
+        assert "derive.sanitise" not in source
+
+
+def test_it_is_generated_where_the_card_is():
+    """The card and the section summaries are the input, so extraction belongs
+    where they are written — one place, holding everything it needs, on the
+    ingest side of the line."""
+    from packages.core import summarize
+
+    source = inspect.getsource(summarize.summarize_document)
+    assert "derive.describe" in source
+    assert "derive.store" in source
+
+
+def test_the_stored_attributes_are_what_retrieval_reuses():
+    """Written to their own column AND into the card text.
+
+    The column is the record; the card text is what routing and the vector
+    index actually see. Storing only the column would be a fact nobody could
+    retrieve on.
+    """
+    from packages.core import summarize
+
+    source = inspect.getsource(summarize.summarize_document)
+    assert "as_card_line" in source
+    assert "card_body" in source
+
+
+# ------------------------- what a model actually sends -------------------------
+
+
+def test_a_javascript_object_literal_is_still_read():
+    """Not an edge case — measured, and expensive.
+
+    Asked for JSON with an open field set, the provider replied with unquoted
+    keys and sometimes unquoted values. `json.loads` rejects all of it, and
+    three of eight real documents were silently derived as `{}` before this
+    existed.
+    """
+    got = derive._loads_lenient(
+        "{   document_type: technical overview\n"
+        "  subject: bitcoin\n"
+        "  topics: [peer-to-peer electronic cash, merkle trees, proof-of-work] }"
+    )
+    assert got == {
+        "document_type": "technical overview",
+        "subject": "bitcoin",
+        "topics": ["peer-to-peer electronic cash", "merkle trees", "proof-of-work"],
+    }
+
+
+def test_unquoted_keys_with_quoted_values_are_read():
+    got = derive._loads_lenient(
+        '{ document_type: "technical design specification",\n'
+        '  systems_integrated: ["loyalty system", "gaming system"] }'
+    )
+    assert got["document_type"] == "technical design specification"
+    assert got["systems_integrated"] == ["loyalty system", "gaming system"]
+
+
+def test_well_formed_json_is_never_touched():
+    """The repair only ever runs after a strict parse has already failed."""
+    strict = '{"a": "b", "c": ["d", "e"], "n": 3, "ok": true}'
+    assert derive._loads_lenient(strict) == {
+        "a": "b",
+        "c": ["d", "e"],
+        "n": 3,
+        "ok": True,
+    }
+
+
+def test_unrepairable_output_yields_nothing_rather_than_guesswork():
+    assert derive._loads_lenient("not an object at all") is None
+    assert derive._loads_lenient("{{{") is None
+
+
+@pytest.mark.asyncio
+async def test_an_empty_extraction_is_retried_once():
+    """The failure is not deterministic: across two runs of the same eight
+    documents, three came back unusable the first time and a different one the
+    second."""
+    replies = iter(["sorry, no JSON here", '{"document_type": "policy"}'])
+    calls = 0
+
+    async def flaky(_card, _model):
+        nonlocal calls
+        calls += 1
+        return next(replies)
+
+    original = derive._ask
+    derive._ask = flaky  # type: ignore[assignment]
+    try:
+        assert await derive.describe("a card") == {"document_type": "policy"}
+        assert calls == 2
+    finally:
+        derive._ask = original  # type: ignore[assignment]
+
+
+@pytest.mark.asyncio
+async def test_it_does_not_retry_forever():
+    calls = 0
+
+    async def never(_card, _model):
+        nonlocal calls
+        calls += 1
+        return "no json"
+
+    original = derive._ask
+    derive._ask = never  # type: ignore[assignment]
+    try:
+        assert await derive.describe("a card") == {}
+        assert calls == 2
     finally:
         derive._ask = original  # type: ignore[assignment]

@@ -69,39 +69,121 @@ RESERVED_KEYS = frozenset(
     }
 )
 
-# What the model is asked for. Deliberately small and closed: an open-ended
-# "describe this document" produces a different vocabulary per document, and a
-# facet nobody can enumerate is one nobody can filter or boost on.
-_FIELDS = ("doc_type", "topics", "entities", "year")
+# The same idea one word at a time, so a name nobody thought to list still
+# fails: `client_name`, `owner_email`, `account_reference`, `tenant_slug`.
+_RESERVED_WORDS = frozenset(
+    {
+        "acl",
+        "access",
+        "account",
+        "client",
+        "customer",
+        "owner",
+        "permission",
+        "permissions",
+        "scope",
+        "scopes",
+        "tenant",
+        "visibility",
+        "workspace",
+    }
+)
 
-MAX_TOPICS = 6
-MAX_ENTITIES = 8
-MAX_VALUE_CHARS = 60
+# The vocabulary is OPEN. The model names whatever characterises the document —
+# type, topics, subjects, entities, purpose, audience, period, jurisdiction,
+# whatever a reader would actually use to recognise it.
+#
+# A closed field set was tried first and it was the wrong instinct for this
+# mechanism. A fixed enum helps FILTERING, where two documents must agree on a
+# label to be selected together. Here the attributes are rendered into the
+# document's card, and the card is embedded — so a specific, document-shaped
+# phrase ("statement of work for a casino loyalty platform") carries more signal
+# to an embedding than a generic bucket ("specification") ever could. Forcing a
+# vocabulary throws away exactly the part that helps.
+#
+# What is NOT open is the shape: flat keys, scalar or list-of-scalar values,
+# bounded in every direction, with reserved names refused. Open vocabulary is
+# not open season on the record.
+MAX_KEYS = 12
+MAX_LIST = 8
+MAX_VALUE_CHARS = 80
+MAX_KEY_CHARS = 32
+# Everything rendered into the card, together. A card is a NAVIGATION surface a
+# model reads dozens of at a time; attributes that ran to a page would drown the
+# summary they are meant to sharpen.
+MAX_CARD_LINE_CHARS = 700
 
 _PROMPT = (
-    "You are reading a summary of ONE document from a knowledge base. Return "
-    "JSON describing it, for search and filtering. No prose, JSON only.\n\n"
-    "{\n"
-    '  "doc_type": one short lowercase noun phrase for what KIND of document '
-    'this is — "invoice", "research paper", "policy", "statement of work", '
-    '"user manual". Not what it is about.\n'
-    '  "topics": up to 6 short lowercase subject tags.\n'
-    '  "entities": up to 8 proper names actually named in the text — '
-    "organisations, products, systems, places. Names only.\n"
-    '  "year": the four-digit year the document is ABOUT, as a string, or null '
-    "if it does not say.\n"
-    "}\n\n"
+    "You are reading a summary of ONE document from a knowledge base. Describe "
+    "it so that someone searching later can FIND it. Reply with JSON only, no "
+    "prose.\n\n"
+    "Choose the fields yourself — whatever actually characterises THIS "
+    "document. There is no fixed schema, and two documents should not be "
+    "described alike unless they are alike. Useful things to consider, none of "
+    "them required: what kind of document it is, what it is about, its "
+    "purpose, who it is for, the subjects and concepts it covers, the systems, "
+    "organisations, products, people or places it names, the period it "
+    "concerns, the jurisdiction or standard it belongs to.\n\n"
+    "Shape:\n"
+    '- A flat JSON object: {"field": "value"} or {"field": ["a", "b"]}.\n'
+    "- Lowercase snake_case field names. No nesting, no objects inside values.\n"
+    "- Short values. A phrase, not a sentence.\n\n"
     "Rules:\n"
-    "- Only what the summary supports. Never guess, never infer from the "
-    "filename, and never fill a field to avoid leaving it empty. An empty list "
-    "is a correct answer and a wrong tag is not.\n"
-    "- Do not output any field naming a client, customer, owner, tenant, "
-    "account, permission or visibility. Those are not yours to decide.\n"
-    "- Lowercase everything except entity names.\n\n"
+    "- Only what the summary supports. Never guess, never infer from a "
+    "filename, and never add a field to avoid leaving the object small. Four "
+    "true fields beat ten padded ones, and an empty object is a correct answer "
+    "for a document that says nothing definite.\n"
+    "- Be specific. 'topics: networking' is worth little; 'topics: [routing "
+    "algorithms, congestion control, the data link layer]' is worth a lot.\n"
+    "- Never output a field naming a client, customer, owner, tenant, account, "
+    "workspace, permission, visibility or access control. Those are not yours "
+    "to decide, and they will be discarded.\n\n"
     "SUMMARY:\n"
 )
 
 _JSON = re.compile(r"\{.*\}", re.DOTALL)
+
+# A bare key: `{ document_type: ...` rather than `{ "document_type": ...`.
+# Start-of-line counts as a boundary too: the same replies also omit the commas
+# between entries, so every key after the first is preceded only by a newline.
+_BARE_KEY = re.compile(r"([{,]\s*|\n\s*)([A-Za-z_][A-Za-z0-9_ \-]{0,40}?)\s*:(?=\s)")
+# A bare scalar value, up to the next comma or brace: `: technical overview,`.
+_BARE_VALUE = re.compile(
+    r'(:\s*)(?!["\[{\s])(?!true\b|false\b|null\b|-?\d)([^,\]\}\n]*[^,\]\}\s])'
+)
+# A bare item inside a list: `[peer-to-peer cash, merkle trees]`.
+_BARE_ITEM = re.compile(r'([\[,]\s*)(?!["\[{\s])(?!true\b|false\b|null\b|-?\d)([^,\]\n]*[^,\]\s])')
+
+
+def _loads_lenient(blob: str) -> Any:
+    """Parse JSON, then parse what a model actually sent.
+
+    Measured, and it is not an edge case: asked for JSON with an open set of
+    fields, this provider replied with JavaScript object literals — unquoted
+    keys, and sometimes unquoted values too:
+
+        { document_type: technical overview
+          subject: bitcoin
+          topics: [peer-to-peer electronic cash, merkle trees] }
+
+    `json.loads` rejects all of that, and three of eight real documents were
+    silently derived as `{}` because of it. The repair is mechanical and only
+    ever runs after a strict parse has already failed, so a well-formed reply
+    is never touched by it.
+    """
+    try:
+        return json.loads(blob)
+    except (ValueError, TypeError):
+        pass
+    repaired = _BARE_KEY.sub(r'\1"\2":', blob)
+    repaired = _BARE_VALUE.sub(lambda m: f'{m.group(1)}"{m.group(2).strip()}"', repaired)
+    repaired = _BARE_ITEM.sub(lambda m: f'{m.group(1)}"{m.group(2).strip()}"', repaired)
+    # A missing comma between entries is the other half of the same habit.
+    repaired = re.sub(r'(["\]\}\d]|true|false|null)(\s*\n\s*)(")', r"\1,\2\3", repaired)
+    try:
+        return json.loads(repaired)
+    except (ValueError, TypeError):
+        return None
 
 
 def _clean_value(value: Any) -> str | None:
@@ -114,8 +196,6 @@ def _clean_value(value: Any) -> str | None:
 
 
 def _clean_list(value: Any, cap: int) -> list[str]:
-    if not isinstance(value, list):
-        return []
     out: list[str] = []
     for entry in value:
         cleaned = _clean_value(entry)
@@ -126,30 +206,75 @@ def _clean_list(value: Any, cap: int) -> list[str]:
     return out
 
 
-def sanitise(raw: dict[str, Any]) -> dict[str, Any]:
-    """Keep only the closed field set, cleaned, with reserved keys refused.
+_KEY_JUNK = re.compile(r"[^a-z0-9_]+")
 
-    Refusal is silent and total: a model that emits `client_id` has that key
-    dropped, not renamed or nested. There is no path by which a value it
-    invented becomes something the store treats as asserted.
+
+def _clean_key(key: Any) -> str | None:
+    """Normalise a field name the model chose, or reject it.
+
+    Normalisation happens BEFORE the reserved check, which is the whole reason
+    it exists here rather than in a caller: "Client ID" and "client-id" must
+    both become `client_id` and be refused, not slip through because they were
+    spelled differently from the list.
     """
+    if not isinstance(key, str):
+        return None
+    name = _KEY_JUNK.sub("_", key.strip().lower()).strip("_")[:MAX_KEY_CHARS]
+    if not name or not name[0].isalpha():
+        return None
+    return name
+
+
+def _is_reserved(name: str) -> bool:
+    """True for anything naming ownership, tenancy or access.
+
+    Checked per word, not per whole name, so `client_id` and `owner_email` and
+    `account_reference` all fail rather than only the exact spellings anyone
+    thought to list.
+
+    This will occasionally refuse an honest descriptive field — a networking
+    textbook might reasonably want `access_control`, since that is a real
+    chapter of one. That is the trade taken deliberately: refusing a field
+    costs a small ranking nudge, while allowing one named `access_control` to
+    exist in a store where a future migration might copy derived values into
+    asserted ones costs the boundary this whole design is built on.
+    """
+    if name in RESERVED_KEYS:
+        return True
+    return bool(_RESERVED_WORDS & set(name.split("_")))
+
+
+def sanitise(raw: dict[str, Any]) -> dict[str, Any]:
+    """Open vocabulary, bounded shape, reserved names refused.
+
+    The model names its own fields, because a description that fits the
+    document is worth more here than one that fits a schema. What it may not do
+    is change the SHAPE of the record: flat keys, scalar or list-of-scalar
+    values, everything capped, and nothing that names ownership or access.
+
+    Refusal is silent and total. A model that emits `client_id` has that key
+    dropped — not renamed, not nested, not kept under a warning — so there is
+    no path by which a value it invented becomes something the store treats as
+    asserted.
+    """
+    if not isinstance(raw, dict):
+        return {}
     out: dict[str, Any] = {}
-    doc_type = _clean_value(raw.get("doc_type"))
-    if doc_type:
-        out["doc_type"] = doc_type.lower()
-    topics = [topic.lower() for topic in _clean_list(raw.get("topics"), MAX_TOPICS)]
-    if topics:
-        out["topics"] = topics
-    entities = _clean_list(raw.get("entities"), MAX_ENTITIES)
-    if entities:
-        out["entities"] = entities
-    year = _clean_value(raw.get("year"))
-    if year and re.fullmatch(r"(1[89]|20)\d{2}", year):
-        out["year"] = year
-    # Belt and braces. Nothing above can produce a reserved key, and this still
-    # runs — the cost is a set lookup and the alternative is trusting that no
-    # future field ever collides.
-    return {key: value for key, value in out.items() if key not in RESERVED_KEYS}
+    for key, value in raw.items():
+        if len(out) >= MAX_KEYS:
+            break
+        name = _clean_key(key)
+        if name is None or _is_reserved(name):
+            continue
+        if isinstance(value, list):
+            cleaned_list = _clean_list(value, MAX_LIST)
+            if cleaned_list:
+                out[name] = cleaned_list
+        else:
+            cleaned = _clean_value(value)
+            if cleaned:
+                out[name] = cleaned
+    return out
 
 
 async def describe(card: str, *, model: str | None = None) -> dict[str, Any]:
@@ -167,20 +292,31 @@ async def describe(card: str, *, model: str | None = None) -> dict[str, Any]:
     """
     if not card.strip():
         return {}
-    try:
-        reply = await _ask(card, model)
-    except Exception:
-        return {}
-    match = _JSON.search(reply or "")
-    if not match:
-        return {}
-    try:
-        raw = json.loads(match.group(0))
-    except (ValueError, TypeError):
-        return {}
-    if not isinstance(raw, dict):
-        return {}
-    return sanitise(raw)
+    # Tried twice, because the failure is not deterministic. Across two runs of
+    # the same eight documents, three came back unusable the first time and a
+    # different one the second — a document that describes itself fine on one
+    # attempt and not on the next. One retry is a cheap fix for a document
+    # otherwise left undescribed until somebody re-ingests it.
+    for _attempt in range(2):
+        try:
+            reply = await _ask(card, model)
+        except Exception:
+            # Retried, not abandoned. This said `return {}` first, which gave up
+            # on exactly the failure a retry exists for: a backfill firing one
+            # call per document in quick succession meets a rate limit or a
+            # timeout, and four of eight documents came back undescribed while
+            # the model was answering every one of them correctly when asked
+            # again a minute later.
+            continue
+        match = _JSON.search(reply or "")
+        if not match:
+            continue
+        raw = _loads_lenient(match.group(0))
+        if isinstance(raw, dict):
+            cleaned = sanitise(raw)
+            if cleaned:
+                return cleaned
+    return {}
 
 
 async def _ask(card: str, model: str | None) -> str:
@@ -210,15 +346,25 @@ def as_card_line(derived: dict[str, Any]) -> str:
     if not derived:
         return ""
     parts: list[str] = []
-    if derived.get("doc_type"):
-        parts.append(f"Document type: {derived['doc_type']}.")
-    if derived.get("topics"):
-        parts.append(f"Topics: {', '.join(derived['topics'])}.")
-    if derived.get("entities"):
-        parts.append(f"Mentions: {', '.join(derived['entities'])}.")
-    if derived.get("year"):
-        parts.append(f"Year: {derived['year']}.")
-    return " ".join(parts)
+    for name, value in derived.items():
+        label = name.replace("_", " ").strip().capitalize()
+        said = ", ".join(value) if isinstance(value, list) else str(value)
+        if said:
+            parts.append(f"{label}: {said}.")
+    line = " ".join(parts)
+    if len(line) <= MAX_CARD_LINE_CHARS:
+        return line
+    # Trimmed at a field boundary rather than mid-phrase: half a truncated
+    # entity name is noise in an embedding, and the fields are already in the
+    # order the model thought most characteristic.
+    kept: list[str] = []
+    used = 0
+    for part in parts:
+        if used + len(part) + 1 > MAX_CARD_LINE_CHARS:
+            break
+        kept.append(part)
+        used += len(part) + 1
+    return " ".join(kept)
 
 
 async def store(
@@ -244,8 +390,8 @@ async def store(
 
 
 __all__ = [
-    "MAX_ENTITIES",
-    "MAX_TOPICS",
+    "MAX_KEYS",
+    "MAX_LIST",
     "RESERVED_KEYS",
     "as_card_line",
     "describe",
