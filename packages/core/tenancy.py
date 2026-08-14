@@ -98,7 +98,12 @@ async def resolve_caller(
     return {
         **principal,
         "via": "session",
-        "scopes": ["read", "write"],
+        # A signed-in person holds every scope. Scopes exist to narrow a KEY —
+        # a credential handed to a program, which should be given only what
+        # that program needs. A person is bounded by their membership of the
+        # workspace instead, and the console reads documents and administers
+        # collections in the same session.
+        "scopes": ["read", "write", "manage"],
         "collection_id": None,
         "client": x_markvector_client,
     }
@@ -108,6 +113,41 @@ def require_write(principal: dict[str, Any]) -> None:
     """A read-only key must not be able to write. Checked at the edge, once."""
     if "write" not in principal.get("scopes", ["write"]):
         raise HTTPException(403, "This key is read-only.")
+
+
+def require_read(principal: dict[str, Any]) -> None:
+    """A key without `read` must not see document contents.
+
+    This did not exist, and its absence was the whole reason a scoped key was
+    not a boundary. Counted before writing it: fifty routes, eight of them
+    calling require_write, and NOTHING anywhere checking read. So `read` did
+    not mean "may read" — it meant "not write", and any valid key could reach
+    every document in its workspace no matter what it had been minted with.
+
+    Absence of a check meant permitted. That is fail-open, and it is why an
+    operator key that could create collections without reading them was
+    impossible to issue.
+    """
+    if "read" not in principal.get("scopes", ["read"]):
+        raise HTTPException(
+            403, "This key may not read collection contents."
+        )
+
+
+def require_manage(principal: dict[str, Any]) -> None:
+    """Administration of the containers, which is not authority over what is in
+    them.
+
+    `manage` creates, renames and deletes collections and issues keys. It reads
+    no document, no passage, no answer and no trace. That separation is the
+    point: a platform operator running a multi-tenant deployment has to be able
+    to set a tenant up and wind them down without being able to read their
+    documents, and until this existed the two came together.
+    """
+    if "manage" not in principal.get("scopes", ["manage"]):
+        raise HTTPException(
+            403, "This key may not manage collections or keys."
+        )
 
 
 def enforce_binding(principal: dict[str, Any], collection_id: str) -> None:

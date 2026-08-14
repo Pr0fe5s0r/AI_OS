@@ -22,6 +22,41 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 PREFIX = "kb"
 
+# Every scope that means anything. `read` sees document contents; `write`
+# ingests and edits them; `manage` administers collections and keys and reads
+# nothing.
+SCOPES = ("read", "write", "manage")
+
+
+def parse_scopes(raw: str | None) -> set[str]:
+    """The scopes a stored string actually grants, ignoring anything unknown."""
+    return {part.strip().lower() for part in (raw or "").split(",")} & set(SCOPES)
+
+
+class Escalation(ValueError):
+    """A key was asked to mint one more powerful than itself."""
+
+
+def check_subset(minter: set[str] | None, requested: set[str]) -> None:
+    """A key may only issue keys no stronger than itself.
+
+    Without this the `manage` scope is decoration. An operator holding a
+    manage-only key — deliberately unable to read a single tenant document —
+    could call POST /api/keys, mint itself a `read` key, and read all of them.
+    One API call, and the isolation the whole separation exists for is gone.
+
+    `minter` is None for a signed-in person, who is not a key and is bounded by
+    their membership instead.
+    """
+    if minter is None:
+        return
+    beyond = requested - minter
+    if beyond:
+        raise Escalation(
+            "A key cannot grant scopes it does not hold: "
+            + ", ".join(sorted(beyond))
+        )
+
 
 def _hash(key: str) -> str:
     """SHA-256, not bcrypt.
@@ -49,6 +84,7 @@ async def create_key(
     created_by: str | None = None,
     scopes: str = "read,write",
     collection_id: str | None = None,
+    minter_scopes: set[str] | None = None,
 ) -> dict[str, Any]:
     """Issue a key. The plaintext comes back exactly once, here.
 
@@ -59,6 +95,12 @@ async def create_key(
     the workspace does not have is a mistake worth catching at creation rather
     than as a 404 on first use.
     """
+    wanted = parse_scopes(scopes)
+    if not wanted:
+        raise ValueError(f"A key needs at least one scope of {', '.join(SCOPES)}.")
+    check_subset(minter_scopes, wanted)
+    scopes = ",".join(scope for scope in SCOPES if scope in wanted)
+
     if collection_id is not None:
         known = (
             await session.execute(
@@ -129,7 +171,10 @@ async def resolve_key(session: AsyncSession, presented: str) -> dict[str, Any] |
         "key_id": row.key_id,
         "workspace_id": row.workspace_id,
         "name": row.name,
-        "scopes": row.scopes.split(","),
+        # Parsed rather than split: a stored " Read, write" would otherwise
+        # produce [" Read", " write"] and match nothing, silently turning a key
+        # somebody meant to be powerful into one that can do nothing.
+        "scopes": sorted(parse_scopes(row.scopes)),
         "collection_id": row.collection_id,
     }
 

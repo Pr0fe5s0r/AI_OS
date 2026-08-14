@@ -22,6 +22,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.auth_routes import router as auth_router
+from apps.api.authz import authorise
 from apps.common.consolidation import enabled as consolidation_enabled
 from apps.common.consolidation import interval_seconds as consolidation_interval
 from apps.common.summaries import coverage as summary_coverage_for
@@ -52,7 +53,7 @@ from packages.core.consolidate import run_once as run_consolidation
 from packages.core.db import Session
 from packages.core.graph import chunk_lineage as graph_lineage
 from packages.core.graph import chunk_neighbours as graph_neighbours
-from packages.core.keys import create_key, list_keys, revoke_key
+from packages.core.keys import Escalation, create_key, list_keys, revoke_key
 from packages.core.navigator import MAX_BEHAVIOUR_CHARS
 from packages.core.neighbours import collection_graph
 from packages.core.normalise import can_parse, supported
@@ -117,7 +118,14 @@ async def lifespan(app: FastAPI):
     await graph.close_driver()
 
 
-app = FastAPI(title="Knowledge Base", lifespan=lifespan)
+# Authorisation is an application-wide dependency, not a call inside each
+# handler. One table (apps/api/authz.py) decides what every route needs, it runs
+# for routes nobody remembered to think about, and a route missing from the
+# table is refused rather than served — the opposite of how this behaved before,
+# when a route with no check was a route anyone could read.
+app = FastAPI(
+    title="Knowledge Base", lifespan=lifespan, dependencies=[Depends(authorise)]
+)
 # Named origins, not "*": the session travels as a cookie, and a browser
 # refuses a wildcard origin on any credentialed request — so "*" would not be
 # permissive, it would simply break every call the UI makes.
@@ -1277,7 +1285,6 @@ async def add_cluster(
     principal: dict[str, Any] = Depends(resolve_caller),
     session: AsyncSession = Depends(db),
 ) -> dict[str, Any]:
-    require_write(principal)
     try:
         created = await create_cluster(
             session, str(principal["company_id"]), payload.name, payload.cluster_id
@@ -1296,7 +1303,6 @@ async def add_collection(
 ) -> dict[str, Any]:
     """Create a collection. Its embedding model and dimensions are fixed now,
     because changing either later invalidates every vector inside it."""
-    require_write(principal)
     try:
         created = await create_collection(
             session,
@@ -1334,7 +1340,6 @@ async def edit_collection(
 ) -> dict[str, Any]:
     """Rename a collection. Only the display name — the id is its stable handle
     and is fixed at creation."""
-    require_write(principal)
     enforce_binding(principal, collection_id)
     renamed = await rename_collection(
         session, str(principal["company_id"]), collection_id, payload.name
@@ -1715,7 +1720,6 @@ async def drop_collection(
     session: AsyncSession = Depends(db),
 ) -> dict[str, Any]:
     """Delete a collection and its contents, reporting how much went."""
-    require_write(principal)
     enforce_binding(principal, collection_id)
     removed = await delete_collection(session, str(principal["company_id"]), collection_id)
     await session.commit()
@@ -1749,7 +1753,6 @@ async def add_key(
     session: AsyncSession = Depends(db),
 ) -> dict[str, Any]:
     """Issue a key. The plaintext is in this response and nowhere else, ever."""
-    require_write(principal)
     try:
         created = await create_key(
             session,
@@ -1758,7 +1761,18 @@ async def add_key(
             created_by=str(principal.get("email") or ""),
             scopes=payload.scopes,
             collection_id=payload.collection_id,
+            # A key may only issue keys no stronger than itself. Without this a
+            # manage-only operator mints themselves a read key and the whole
+            # separation is one API call deep. None for a signed-in person, who
+            # is bounded by their membership rather than by a key.
+            minter_scopes=(
+                set(principal.get("scopes") or ())
+                if principal.get("via") == "api_key"
+                else None
+            ),
         )
+    except Escalation as exc:
+        raise HTTPException(403, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     await session.commit()
@@ -1771,7 +1785,6 @@ async def drop_key(
     principal: dict[str, Any] = Depends(resolve_caller),
     session: AsyncSession = Depends(db),
 ) -> dict[str, bool]:
-    require_write(principal)
     if not await revoke_key(session, str(principal["company_id"]), key_id):
         raise HTTPException(404, "No such key, or it is already revoked.")
     await session.commit()
