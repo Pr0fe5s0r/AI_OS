@@ -8,7 +8,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core import chunks, graph
+from packages.core import chunks, derive, graph
 from packages.shared.schema import Scope
 
 # ---------------------------------------------------------------------------
@@ -170,6 +170,24 @@ async def summarize_document(
     card_body = await _summarise(
         _CARD_PROMPT, card_input, fallback=(section_notes[0][1] if section_notes else title)
     )
+
+    # What kind of document this is, what it is about, who it names. Derived
+    # from the card that was just written, stored in its OWN column, and
+    # appended to the card text.
+    #
+    # That last part is the whole of the retrieval improvement, and it needed
+    # no ranking code: routing already scores documents on their card, and the
+    # card is already embedded and searched — so an inferred topic starts
+    # helping the moment it is written down. It also cannot become evidence,
+    # because chunks.keyword_search has always excluded cards. An answer may be
+    # ROUTED by a guess and can never be CITED to one.
+    attributes = await derive.describe(card_body)
+    if attributes:
+        await derive.store(session, scope, item_id, attributes)
+        line = derive.as_card_line(attributes)
+        if line:
+            card_body = f"{card_body}\n\n{line}"
+
     await write_summary(
         session, scope,
         chunk_id=summary_chunk_id("card", [item_id]),
