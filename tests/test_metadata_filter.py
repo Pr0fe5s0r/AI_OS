@@ -162,6 +162,75 @@ def test_no_filter_at_all_is_not_an_error():
 # ------------------------------ nothing matched ------------------------------
 
 
+# --------------------- when nobody supplied any metadata ---------------------
+
+
+def test_the_two_empty_results_are_told_apart():
+    """An empty result has two causes and they need opposite responses.
+
+    "There are policies, none is acme's" is a correct answer — the filter
+    worked. "No document carries a `client` key at all" is almost never what
+    the caller meant: a typo, or a corpus ingested before anyone tagged
+    anything. Reported identically, the caller either widens a filter that was
+    right or trusts an absence that was never tested.
+    """
+    from packages.core.search import _no_match_reason
+
+    value_missing = _no_match_reason([])
+    key_missing = _no_match_reason(["client"])
+    assert value_missing != key_missing
+    assert "values" in value_missing
+    assert "'client'" in key_missing
+    assert "spelling" in key_missing or "ingested without" in key_missing
+
+
+def test_the_missing_key_is_named():
+    """So the caller can see WHICH one, not merely that something was wrong."""
+    from packages.core.search import _no_match_reason
+
+    reason = _no_match_reason(["client", "region"])
+    assert "'client'" in reason and "'region'" in reason
+    assert "keys" in reason  # plural, because two are named
+
+
+def test_an_untagged_corpus_says_so_rather_than_looking_empty():
+    """The dangerous case is not the empty result, it is the PARTIALLY tagged
+    corpus: tag half the documents, filter, and get a confident answer drawn
+    from half your evidence with nothing on screen saying so."""
+    import time
+
+    from packages.core.answer import _nothing_matched
+
+    result, trace = _nothing_matched(
+        "what is the policy?",
+        "hybrid",
+        RetrievalConfig(metadata=(("client", "acme"),)),
+        time.perf_counter(),
+        unknown_keys=["client"],
+    )
+    assert result.grounded is False
+    assert "'client'" in result.text
+    assert "could never match" in result.text
+    assert trace.filters["unknown_keys"] == ["client"]
+
+
+def test_a_document_is_filterable_before_anyone_tags_it():
+    """Ingest already records what it learned about the file, in the same place
+    a caller's metadata goes.
+
+    So `?meta=format:csv` works on a corpus nobody has touched, and the feature
+    is never useless out of the box — which matters, because the realistic
+    first state of any store is that nothing has been tagged yet.
+    """
+    from packages.core.normalise import normalise
+
+    parsed = normalise(b"a,b\n1,2\n3,4\n", "figures.csv")
+    assert parsed.metadata["format"] == "csv"
+    assert parsed.metadata["rows"] == 3
+    # Top level, so `metadata ->> 'format'` reaches it.
+    assert all(not isinstance(value, dict) for value in parsed.metadata.values())
+
+
 def test_no_matching_document_is_answered_not_searched():
     """Once the filter has excluded everything there is nothing to retrieve
     from, and running the query anyway would either waste a model call or —

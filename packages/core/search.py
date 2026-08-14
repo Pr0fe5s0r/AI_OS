@@ -218,6 +218,76 @@ async def _narrow_to_metadata(
     return found
 
 
+def _no_match_reason(unknown_keys: list[str]) -> str:
+    """Why a metadata filter matched nothing, in words a caller can act on.
+
+    Two different instructions. "No document carries this key" means fix the
+    filter or tag the documents; "no document has this value" means the filter
+    worked and the answer is genuinely absent.
+    """
+    if not unknown_keys:
+        return "no document carries the metadata values that were filtered on"
+    named = ", ".join(repr(key) for key in unknown_keys)
+    plural = "" if len(unknown_keys) == 1 else "s"
+    return (
+        f"no document in scope carries the metadata key{plural} {named} — "
+        "check the spelling, or the documents may have been ingested without it"
+    )
+
+
+async def unknown_metadata_keys(
+    session: AsyncSession,
+    scope: Scope,
+    metadata: tuple[tuple[str, str], ...],
+    include_superseded: bool = False,
+) -> list[str]:
+    """Which filtered-on keys no document in scope carries AT ALL.
+
+    Asked only when a filter matched nothing, because the two ways that happens
+    are different problems wearing the same empty result:
+
+      the key exists, the value does not   A correct, informative empty answer.
+                                           There are policies; none is acme's.
+
+      the key exists nowhere               Almost never what the caller meant.
+                                           A typo — `cleint:acme` — or a corpus
+                                           that was uploaded before anyone
+                                           tagged anything.
+
+    The second is the dangerous one, and the danger is not the empty result. It
+    is the PARTIALLY tagged corpus: tag half the documents, filter, and get a
+    confident answer drawn from half your evidence with nothing on screen
+    saying so. Naming the key that nothing carries is what makes that visible.
+    """
+    if not metadata:
+        return []
+
+    clauses = ["workspace_id = :workspace"]
+    params: dict[str, Any] = {"workspace": scope.workspace_id}
+    if scope.collection_id is not None:
+        clauses.append("collection_id = :collection")
+        params["collection"] = scope.collection_id
+    if not include_superseded:
+        clauses.append("status = :active")
+        params["active"] = str(Lifecycle.ACTIVE)
+
+    missing: list[str] = []
+    for index, (key, _values) in enumerate(_by_key(metadata)):
+        params[f"key{index}"] = key
+        present = (
+            await session.execute(
+                text(  # noqa: S608 - clauses are fixed literals; the key is bound
+                    f"SELECT 1 FROM kb_items WHERE {' AND '.join(clauses)} "
+                    f"AND metadata ? :key{index} LIMIT 1"
+                ),
+                params,
+            )
+        ).first()
+        if present is None:
+            missing.append(key)
+    return missing
+
+
 async def items_with_metadata(
     session: AsyncSession,
     scope: Scope,
@@ -416,6 +486,9 @@ async def search_traced(
         if not resolved:
             # The filter matches no document at all. Said with an empty result
             # and a trace that shows why, rather than by searching everything.
+            unknown = await unknown_metadata_keys(
+                session, scope, cfg.metadata, cfg.include_superseded
+            )
             empty = Trace(
                 trace_id=new_trace_id(),
                 query=query,
@@ -425,8 +498,10 @@ async def search_traced(
                     "collection_id": scope.collection_id,
                     "metadata": dict(_by_key(cfg.metadata)),
                     "matched_documents": 0,
+                    "unknown_keys": unknown,
                 },
                 timings_ms={"total": int((time.perf_counter() - started) * 1000)},
+                degraded=_no_match_reason(unknown),
             )
             return [], empty
         cfg = replace(cfg, item_ids=tuple(resolved))

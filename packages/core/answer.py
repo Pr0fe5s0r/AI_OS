@@ -14,9 +14,12 @@ from packages.core.search import (
     DEFAULT,
     RetrievalConfig,
     Trace,
+    _by_key,
+    _no_match_reason,
     items_with_metadata,
     new_trace_id,
     search_traced,
+    unknown_metadata_keys,
 )
 from packages.shared.schema import Hit, Passage, Scope
 
@@ -492,7 +495,11 @@ async def _write(
 
 
 def _nothing_matched(
-    question: str, mode: str, cfg: RetrievalConfig, started: float
+    question: str,
+    mode: str,
+    cfg: RetrievalConfig,
+    started: float,
+    unknown_keys: list[str] | None = None,
 ) -> tuple[Answer, Trace]:
     """No document carries the metadata that was asked for.
 
@@ -506,22 +513,39 @@ def _nothing_matched(
     acting on the wrong one either widens a filter that was right or trusts an
     absence that was never tested.
     """
+    unknown = unknown_keys or []
+    reason = _no_match_reason(unknown)
+    if unknown:
+        named = ", ".join(repr(key) for key in unknown)
+        plural = "" if len(unknown) == 1 else "s"
+        said = (
+            f"No document in this collection carries the metadata key{plural} "
+            f"{named}, so this filter could never match anything. Check the "
+            "spelling, or the documents may have been ingested without it."
+        )
+    else:
+        said = "No document in this collection carries the metadata that was filtered on."
+
     trace = Trace(
         trace_id=new_trace_id(),
         query=question,
         config=cfg.as_dict(),
-        filters={"metadata": dict(cfg.metadata), "matched_documents": 0},
+        filters={
+            "metadata": dict(_by_key(cfg.metadata)),
+            "matched_documents": 0,
+            "unknown_keys": unknown,
+        },
         timings_ms={"total": int((time.perf_counter() - started) * 1000)},
-        degraded="no document carries the metadata that was filtered on",
+        degraded=reason,
     )
     return (
         Answer(
             question=question,
-            text="No document in this collection carries the metadata that was filtered on.",
+            text=said,
             trace_id=trace.trace_id,
             took_ms=trace.timings_ms["total"],
             grounded=False,
-            degraded=trace.degraded,
+            degraded=reason,
             mode=mode,
         ),
         trace,
@@ -589,7 +613,13 @@ async def answer(
         if matched is not None:
             allowed = set(item_ids) & set(matched) if item_ids else set(matched)
             if not allowed:
-                return _nothing_matched(question, mode, cfg, started)
+                # Which of the two empty results this is. Asked only here, when
+                # something already came back empty, so the common path never
+                # pays for it.
+                unknown = await unknown_metadata_keys(
+                    session, scope, cfg.metadata, cfg.include_superseded
+                )
+                return _nothing_matched(question, mode, cfg, started, unknown)
             item_ids = tuple(sorted(allowed))
         cfg = replace(cfg, item_ids=item_ids)
 
