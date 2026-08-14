@@ -416,6 +416,35 @@ def test_well_formed_json_is_never_touched():
     }
 
 
+def test_a_comma_inside_a_quoted_value_is_not_a_list_separator():
+    """The bug that cost one document every attribute it had.
+
+    A regex cannot tell whether a comma separates two list items or sits inside
+    a quoted string, and the substitution version turned a perfectly well-formed
+
+        "setting": "wizarding world, primarily hogwarts"
+
+    into `"wizarding world, "primarily hogwarts""`, failing the parse and losing
+    the whole object. Scanning the text means quoted strings are copied out
+    verbatim.
+    """
+    got = derive._loads_lenient(
+        '{ genre: fantasy fiction,\n'
+        '  setting: "wizarding world, primarily hogwarts",\n'
+        '  themes: ["friendship", "courage"] }'
+    )
+    assert got == {
+        "genre": "fantasy fiction",
+        "setting": "wizarding world, primarily hogwarts",
+        "themes": ["friendship", "courage"],
+    }
+
+
+def test_an_apostrophe_survives_the_repair():
+    got = derive._loads_lenient("{ title: it's a guide, year: 2008 }")
+    assert got == {"title": "it's a guide", "year": 2008}
+
+
 def test_unrepairable_output_yields_nothing_rather_than_guesswork():
     assert derive._loads_lenient("not an object at all") is None
     assert derive._loads_lenient("{{{") is None

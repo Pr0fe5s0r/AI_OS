@@ -143,47 +143,112 @@ _PROMPT = (
 
 _JSON = re.compile(r"\{.*\}", re.DOTALL)
 
-# A bare key: `{ document_type: ...` rather than `{ "document_type": ...`.
-# Start-of-line counts as a boundary too: the same replies also omit the commas
-# between entries, so every key after the first is preceded only by a newline.
-_BARE_KEY = re.compile(r"([{,]\s*|\n\s*)([A-Za-z_][A-Za-z0-9_ \-]{0,40}?)\s*:(?=\s)")
-# A bare scalar value, up to the next comma or brace: `: technical overview,`.
-_BARE_VALUE = re.compile(
-    r'(:\s*)(?!["\[{\s])(?!true\b|false\b|null\b|-?\d)([^,\]\}\n]*[^,\]\}\s])'
-)
-# A bare item inside a list: `[peer-to-peer cash, merkle trees]`.
-_BARE_ITEM = re.compile(r'([\[,]\s*)(?!["\[{\s])(?!true\b|false\b|null\b|-?\d)([^,\]\n]*[^,\]\s])')
+_STRUCTURAL = frozenset("{}[]:,")
+_NUMBER = re.compile(r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?")
+
+
+def _repair_json_like(blob: str) -> str:
+    """Rewrite a JavaScript-ish object literal as strict JSON.
+
+    A SCANNER rather than substitutions, and that is the whole point of it.
+    Regexes cannot tell whether a comma is separating two list items or sitting
+    inside a quoted string, and the version that tried turned
+
+        "setting": "wizarding world, primarily hogwarts"
+
+    into `"wizarding world, "primarily hogwarts""` — corrupting a value that had
+    been perfectly well formed to begin with, and losing the whole document's
+    attributes to a parse error. Walking the text means quoted strings are
+    copied out verbatim and only what is genuinely outside them is repaired.
+
+    Handles every shape this provider has actually produced: unquoted keys,
+    unquoted values, and entries with no commas between them at all.
+    """
+    out: list[str] = []
+    index, length = 0, len(blob)
+    complete = False  # a whole value was just emitted, so the next one needs a comma
+
+    while index < length:
+        char = blob[index]
+        if char.isspace():
+            index += 1
+            continue
+        if char in "}]":
+            out.append(char)
+            index += 1
+            complete = True
+            continue
+        if char in ":,":
+            out.append(char)
+            index += 1
+            complete = False
+            continue
+        if complete:
+            out.append(",")
+            complete = False
+        if char in "{[":
+            out.append(char)
+            index += 1
+            continue
+        if char == '"':
+            end = index + 1
+            while end < length:
+                if blob[end] == "\\":
+                    end += 2
+                    continue
+                if blob[end] == '"':
+                    break
+                end += 1
+            out.append(blob[index : end + 1])
+            index = end + 1
+            complete = True
+            continue
+
+        end = index
+        while end < length and blob[end] not in _STRUCTURAL and blob[end] != "\n":
+            end += 1
+        token = blob[index:end].strip()
+        index = end
+        if not token:
+            continue
+        lowered = token.lower()
+        if lowered in ("true", "false", "null") or _NUMBER.fullmatch(token):
+            out.append(lowered if lowered in ("true", "false", "null") else token)
+        else:
+            out.append(json.dumps(token))
+        complete = True
+
+    return "".join(out)
 
 
 def _loads_lenient(blob: str) -> Any:
     """Parse JSON, then parse what a model actually sent.
 
-    Measured, and it is not an edge case: asked for JSON with an open set of
-    fields, this provider replied with JavaScript object literals — unquoted
-    keys, and sometimes unquoted values too:
+    Measured, and not an edge case: asked for JSON with an open set of fields,
+    this provider replies with JavaScript object literals — unquoted keys,
+    sometimes unquoted values, sometimes no commas at all:
 
         { document_type: technical overview
           subject: bitcoin
           topics: [peer-to-peer electronic cash, merkle trees] }
 
     `json.loads` rejects all of that, and three of eight real documents were
-    silently derived as `{}` because of it. The repair is mechanical and only
-    ever runs after a strict parse has already failed, so a well-formed reply
-    is never touched by it.
+    silently derived as `{}` because of it. The repair runs only after a strict
+    parse has already failed, so a well-formed reply is never touched by it.
+
+    Returns None for anything that is not an OBJECT. The repair is deliberately
+    forgiving, and forgiving enough that a line of prose becomes a valid JSON
+    string — which parses, and is not a description of a document. Only the one
+    shape this asked for counts as an answer.
     """
-    try:
-        return json.loads(blob)
-    except (ValueError, TypeError):
-        pass
-    repaired = _BARE_KEY.sub(r'\1"\2":', blob)
-    repaired = _BARE_VALUE.sub(lambda m: f'{m.group(1)}"{m.group(2).strip()}"', repaired)
-    repaired = _BARE_ITEM.sub(lambda m: f'{m.group(1)}"{m.group(2).strip()}"', repaired)
-    # A missing comma between entries is the other half of the same habit.
-    repaired = re.sub(r'(["\]\}\d]|true|false|null)(\s*\n\s*)(")', r"\1,\2\3", repaired)
-    try:
-        return json.loads(repaired)
-    except (ValueError, TypeError):
-        return None
+    for candidate in (blob, _repair_json_like(blob)):
+        try:
+            parsed = json.loads(candidate)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
 
 
 def _clean_value(value: Any) -> str | None:
