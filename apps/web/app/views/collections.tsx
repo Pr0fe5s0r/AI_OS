@@ -38,10 +38,6 @@ export function Collections({
   const [k, setK] = useState(3);
   const [shape, setShape] = useState<api.CollectionShape | null>(null);
   const [opened, setOpened] = useState<api.ChunkDetail | null>(null);
-  // What the server says a deletion would destroy. Null when nothing is being
-  // asked about; set, it puts a dialog on screen and nothing has happened yet.
-  const [doomed, setDoomed] = useState<api.DeletionPreview | null>(null);
-  const [deleting, setDeleting] = useState(false);
   const [opening, setOpening] = useState<string | null>(null);
 
   useEffect(() => {
@@ -129,36 +125,6 @@ export function Collections({
     }
   }
 
-  // --------------------------- deleting a document ---------------------------
-  //
-  // Two steps, because there is no undo and no trash to restore from. The first
-  // call asks the server what would go and deletes nothing; only the second,
-  // made after a person has read the answer, carries it out.
-
-  async function askToDelete(itemId: string) {
-    try {
-      setDoomed(await api.previewDelete(itemId));
-    } catch (e) {
-      toast((e as Error).message);
-    }
-  }
-
-  async function reallyDelete() {
-    if (!doomed) return;
-    setDeleting(true);
-    try {
-      const out = await api.deleteDocument(doomed.item_id);
-      setDoomed(null);
-      await onChanged();
-      if (selected) setDocs(await api.documents(selected, 100));
-      toast(`Deleted ${out.title} — ${out.kb_chunks} passage(s) removed`);
-    } catch (e) {
-      toast((e as Error).message);
-    } finally {
-      setDeleting(false);
-    }
-  }
-
   async function rename() {
     if (!detail) return;
     const next = newName.trim();
@@ -190,42 +156,11 @@ export function Collections({
     toast(`Deleted — ${items_removed} document(s) removed`);
   }
 
-  // The alert. Deliberately states the NUMBERS the server reported rather than
-  // a generic "are you sure": a person confirming a destruction they cannot
-  // undo should be told what they are destroying, and a count they did not
-  // expect is the one thing that will stop them.
-  const confirmation = doomed ? (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-canvas/80 p-6 backdrop-blur">
-      <Card className="card-in w-full max-w-md p-5">
-        <h2 className="text-sm font-semibold text-ink">Delete this document?</h2>
-        <p className="mt-2 text-xs leading-relaxed text-muted">
-          <span className="font-medium text-ink">{doomed.title}</span> and
-          everything indexed from it: {doomed.versions}{" "}
-          {doomed.versions === 1 ? "version" : "versions"}, {doomed.passages}{" "}
-          {doomed.passages === 1 ? "passage" : "passages"}, its vectors, the
-          stored original and every page picture rendered from it.
-        </p>
-        <p className="mt-2 font-mono text-2xs text-hot">
-          This cannot be undone. There is no trash to restore it from.
-        </p>
-        <div className="mt-4 flex justify-end gap-2">
-          <Button onClick={() => setDoomed(null)} disabled={deleting}>
-            Cancel
-          </Button>
-          <Button variant="primary" onClick={reallyDelete} disabled={deleting}>
-            {deleting ? "Deleting…" : "Delete permanently"}
-          </Button>
-        </div>
-      </Card>
-    </div>
-  ) : null;
-
   // ------------------------------ one collection ------------------------------
 
   if (selected) {
     return (
       <div className="px-6 py-6">
-        {confirmation}
         <button
           onClick={() => onSelect(null)}
           className="mb-4 font-mono text-2xs text-subtle transition hover:text-ink"
@@ -490,7 +425,6 @@ export function Collections({
                       <Th>Categories</Th>
                       <Th className="text-right">Ver</Th>
                       <Th className="pr-4 text-right">Added</Th>
-                      <Th className="pr-4 text-right"> </Th>
                     </tr>
                   </thead>
                   <tbody>
@@ -531,18 +465,6 @@ export function Collections({
                         </td>
                         <td className="whitespace-nowrap py-2.5 pr-4 text-right font-mono text-2xs text-subtle">
                           {ago(d.createdAt)}
-                        </td>
-                        <td className="whitespace-nowrap py-2.5 pr-4 text-right">
-                          {/* Asks the server what would go before offering to
-                              destroy it. The counts in the dialog are the real
-                              ones, not a guess made on this side. */}
-                          <button
-                            onClick={() => askToDelete(d.id)}
-                            title="Delete this document and everything indexed from it"
-                            className="font-mono text-2xs text-subtle transition hover:text-hot"
-                          >
-                            remove
-                          </button>
                         </td>
                       </tr>
                     ))}

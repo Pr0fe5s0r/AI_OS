@@ -486,6 +486,10 @@ export function Upload({
             setOpenDoc(updated);
             setLibrary((current) => current?.map((doc) => doc.id === updated.id ? updated : doc) ?? null);
           }}
+          onDeleted={(id) => {
+            setOpenDoc(null);
+            setLibrary((current) => current?.filter((doc) => doc.id !== id) ?? null);
+          }}
         />
       )}
     </div>
@@ -504,11 +508,13 @@ function DocPanel({
   collectionId,
   onClose,
   onSaved,
+  onDeleted,
 }: {
   doc: Document;
   collectionId: string | undefined;
   onClose: () => void;
   onSaved: (doc: Document) => void;
+  onDeleted: (id: string) => void;
 }) {
   const [chunks, setChunks] = useState<api.DocChunk[] | null>(null);
   // The original file opens first when there is one; otherwise the panel lands
@@ -523,6 +529,37 @@ function DocPanel({
   const [draftMetadata, setDraftMetadata] = useState("");
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  // What the SERVER says this deletion would destroy. Null while nothing is
+  // being asked about; set, a dialog is on screen and nothing has happened yet.
+  const [doomed, setDoomed] = useState<api.DeletionPreview | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  // Two steps, because there is no undo and no trash to restore from. The first
+  // call asks what would go and deletes nothing; only the second, made after a
+  // person has read the answer, carries it out.
+  async function askToDelete() {
+    setDeleteError(null);
+    try {
+      setDoomed(await api.previewDelete(doc.id));
+    } catch (cause) {
+      setDeleteError(cause instanceof Error ? cause.message : "Could not check what would be deleted.");
+    }
+  }
+
+  async function reallyDelete() {
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await api.deleteDocument(doc.id);
+      setDoomed(null);
+      onDeleted(doc.id);
+    } catch (cause) {
+      setDeleteError(cause instanceof Error ? cause.message : "The document could not be deleted.");
+    } finally {
+      setDeleting(false);
+    }
+  }
 
   useEffect(() => {
     const editableMetadata = Object.fromEntries(
@@ -601,6 +638,39 @@ function DocPanel({
   return (
     <>
       <div onClick={onClose} className="fixed inset-0 z-20 bg-black/50 backdrop-blur-[1px]" />
+      {/* The alert. It states the NUMBERS the server reported rather than a
+          generic "are you sure": a person confirming a destruction they cannot
+          undo should be told what they are destroying, and a count they did not
+          expect is the one thing that will stop them. */}
+      {doomed && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 p-6 backdrop-blur">
+          <Card className="card-in w-full max-w-md p-5">
+            <h2 className="text-sm font-semibold text-ink">Delete this document?</h2>
+            <p className="mt-2 text-xs leading-relaxed text-muted">
+              <span className="font-medium text-ink">{doomed.title}</span> and
+              everything indexed from it: {doomed.versions}{" "}
+              {doomed.versions === 1 ? "version" : "versions"}, {doomed.passages}{" "}
+              {doomed.passages === 1 ? "passage" : "passages"}, its vectors, the
+              stored original and every page picture rendered from it.
+            </p>
+            <p className="mt-2 font-mono text-2xs text-hot">
+              This cannot be undone. There is no trash to restore it from.
+            </p>
+            {deleteError && (
+              <p className="mt-2 font-mono text-2xs text-hot">{deleteError}</p>
+            )}
+            <div className="mt-4 flex justify-end gap-2">
+              <Button onClick={() => setDoomed(null)} disabled={deleting}>
+                Cancel
+              </Button>
+              <Button variant="primary" onClick={reallyDelete} disabled={deleting}>
+                {deleting ? "Deleting…" : "Delete permanently"}
+              </Button>
+            </div>
+          </Card>
+        </div>
+      )}
+
       <aside className="fixed inset-y-0 right-0 z-30 flex w-[min(46rem,94vw)] flex-col border-l border-edge bg-panel shadow-2xl shadow-black/60 animate-slide">
         <header className="border-b border-edge px-5 py-4">
           <div className="flex items-start gap-3">
@@ -610,6 +680,13 @@ function DocPanel({
               </Mono>
               <div className="mt-1 truncate text-2xs text-subtle">{doc.title}</div>
             </div>
+            <button
+              onClick={askToDelete}
+              title="Delete this document and everything indexed from it"
+              className="shrink-0 rounded-lg border border-edge px-2 py-1 font-mono text-2xs text-muted transition hover:border-hot/50 hover:text-hot"
+            >
+              delete
+            </button>
             <button
               onClick={onClose}
               className="shrink-0 rounded-lg border border-edge px-2 py-1 font-mono text-2xs text-muted transition hover:text-ink"
