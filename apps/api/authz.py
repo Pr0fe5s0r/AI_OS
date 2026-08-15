@@ -96,6 +96,11 @@ _MATRIX: dict[tuple[str, str], frozenset[str]] = {
     ("POST", "/api/items"): WRITE,
     ("POST", "/api/items/file"): WRITE,
     ("PATCH", "/api/items/{item_id}"): WRITE,
+    # Deleting a document is changing contents, so it sits with write rather
+    # than with manage. An operator who may not read a document may not destroy
+    # it either — deleting a COLLECTION is the container operation, and that is
+    # where manage's destructive power stops.
+    ("DELETE", "/api/items/{item_id}"): WRITE,
     ("POST", "/api/classes"): WRITE,
     ("DELETE", "/api/classes/{class_id}"): WRITE,
     ("PUT", "/api/items/{item_id}/classes"): WRITE,

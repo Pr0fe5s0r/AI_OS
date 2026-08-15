@@ -662,6 +662,37 @@ async def archive_chunk(scope: Scope, chunk_id: str) -> None:
     )
 
 
+async def delete_item(scope: Scope, item_id: str) -> dict[str, int]:
+    """Remove a document from the graph: its passages, then the document node.
+
+    Passages first, because the Item node is what the scope clause is anchored
+    on for some callers and an orphaned Chunk is worse than an orphaned Item —
+    a Chunk still carries an embedding, so it still answers questions, which is
+    exactly what a deleted document must never do.
+
+    DETACH so the relationships go with them. Scoped like every query here:
+    a workspace can only delete inside itself.
+    """
+    chunk_clause, chunk_params = _scope_clause("c", scope)
+    passages = await _run(
+        f"MATCH (c:Chunk {{item_id: $item_id}}) WHERE {chunk_clause} "
+        "WITH c, count(c) AS _ DETACH DELETE c RETURN count(*) AS gone",
+        item_id=item_id,
+        **chunk_params,
+    )
+    item_clause, item_params = _scope_clause("i", scope)
+    items = await _run(
+        f"MATCH (i:Item {{item_id: $item_id}}) WHERE {item_clause} "
+        "DETACH DELETE i RETURN count(*) AS gone",
+        item_id=item_id,
+        **item_params,
+    )
+    return {
+        "chunks": int(passages[0]["gone"]) if passages else 0,
+        "items": int(items[0]["gone"]) if items else 0,
+    }
+
+
 async def delete_chunk(scope: Scope, chunk_id: str) -> None:
     """Fully decayed: the node goes, and its edges with it."""
     clause, params = _scope_clause("c", scope)

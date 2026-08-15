@@ -51,6 +51,8 @@ from packages.core.collections import (
 from packages.core.consolidate import recent_runs
 from packages.core.consolidate import run_once as run_consolidation
 from packages.core.db import Session
+from packages.core.erasure import delete_item as delete_item_and_index
+from packages.core.erasure import preview_item_deletion
 from packages.core.graph import chunk_lineage as graph_lineage
 from packages.core.graph import chunk_neighbours as graph_neighbours
 from packages.core.keys import Escalation, create_key, list_keys, revoke_key
@@ -791,6 +793,71 @@ async def catalogue(
             {**i.model_dump(), "classes": tagged.get(i.id, [])} for i in items
         ],
     }
+
+
+@app.delete("/api/items/{item_id}")
+async def remove_item(
+    item_id: str,
+    confirm: bool = Query(
+        False,
+        description=(
+            "Must be true to delete. Without it the request is refused with a "
+            "409 describing exactly what would be destroyed — the title, how "
+            "many versions and how many passages — so a caller can show that "
+            "to a person before anything happens."
+        ),
+    ),
+    scope: Scope = Depends(workspace_scope),
+    session: AsyncSession = Depends(db),
+    principal: dict[str, Any] = Depends(resolve_caller),
+) -> dict[str, Any]:
+    """Delete a document, its passages, its vectors and its stored original.
+
+    Two-step by design. A DELETE without `confirm=true` deletes nothing and
+    answers 409 with a summary of what it WOULD delete; the same call with
+    `confirm=true` carries it out. That is not ceremony — there is no undo here
+    and no trash to restore from, and "delete this document?" is a question
+    nobody can answer well. "Delete COMPUTER NETWORKS, 2 versions, 3,915
+    passages, permanently" is.
+
+    Everything derived goes with it: the graph nodes and their embeddings, the
+    stored original, every rendered page and every cached figure. A passage
+    that outlived its document would still hold an embedding, and so would
+    still answer questions — which is the one thing a deleted document must
+    never do.
+    """
+    require_write(principal)
+
+    summary = await preview_item_deletion(session, scope, item_id)
+    if summary is None:
+        raise HTTPException(404, "No such item.")
+
+    if not confirm:
+        raise HTTPException(
+            409,
+            {
+                "message": (
+                    f"This will permanently delete {summary['title']!r} — "
+                    f"{summary['versions']} version(s) and {summary['passages']} "
+                    "passage(s), along with the stored original, its rendered "
+                    "pages and its vectors. There is no undo. Repeat the "
+                    "request with ?confirm=true to proceed."
+                ),
+                "would_delete": summary,
+            },
+        )
+
+    removed = await delete_item_and_index(session, scope, item_id)
+    await audit.record(
+        session,
+        scope.workspace_id,
+        str(principal.get("email") or "unknown"),
+        "item.deleted",
+        item_id,
+        {"title": summary["title"], "removed": removed},
+    )
+    await session.commit()
+    return {"deleted": True, **removed, "title": summary["title"]}
 
 
 class ItemEditIn(BaseModel):

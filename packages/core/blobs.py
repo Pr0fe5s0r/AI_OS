@@ -44,6 +44,12 @@ def key_for(workspace_id: str, item_id: str) -> str:
     return f"{workspace_id}/{item_id}"
 
 
+# How many times a prefix delete re-lists before giving up. The listing lags a
+# burst of writes, so one pass is not enough; an unbounded loop would spin on a
+# bucket somebody else is still writing to.
+MAX_DELETE_SWEEPS = 6
+
+
 @lru_cache(maxsize=1)
 def _client() -> Any:
     return boto3.client(
@@ -105,6 +111,66 @@ async def get(key: str) -> tuple[bytes, str]:
         return obj["Body"].read(), obj.get("ContentType", "application/octet-stream")
 
     return await asyncio.to_thread(_read)
+
+
+async def delete_prefix(prefix: str) -> int:
+    """Remove every object under a prefix. Returns how many went.
+
+    Everything one document owns is stored beneath `{workspace}/{item}` — the
+    original, each rendered page, each page's figure verdicts — so deleting the
+    document is deleting that prefix. Item ids are fixed-length hex, so no other
+    document's key can begin with another's and the prefix cannot over-reach.
+
+    Paginated because a 962-page PDF has nearly a thousand rendered pages, and
+    the list call caps at a thousand keys: without the continuation token the
+    tail would be left behind, which is the quiet half of a deletion that
+    reports success.
+
+    And SWEPT REPEATEDLY, which is the part that is not obvious. Measured
+    against MinIO: write an original plus 1,200 page pictures, then list the
+    prefix, and the listing answers ONE. Delete what it offered, list again,
+    and the same prefix now answers 1,201. The objects were all there the whole
+    time — the listing index lags a burst of writes — so a single
+    list-then-delete pass leaves behind whatever it could not yet see, and
+    reports success while doing it.
+
+    So the sweep repeats until a pass finds nothing, bounded so a bucket that
+    is being written to concurrently cannot spin here forever. Anything that
+    survives all of it is unreachable rather than exposed: every route that
+    serves an object looks the document up in Postgres first, and those rows
+    are gone.
+    """
+    if not enabled():
+        return 0
+
+    def _purge() -> int:
+        client = _client()
+        bucket = _bucket()
+        removed = 0
+        for _sweep in range(MAX_DELETE_SWEEPS):
+            found = 0
+            token: str | None = None
+            while True:
+                page = client.list_objects_v2(
+                    **{
+                        "Bucket": bucket,
+                        "Prefix": prefix,
+                        **({"ContinuationToken": token} if token else {}),
+                    }
+                )
+                keys = [{"Key": row["Key"]} for row in page.get("Contents", [])]
+                if keys:
+                    client.delete_objects(Bucket=bucket, Delete={"Objects": keys})
+                    found += len(keys)
+                token = page.get("NextContinuationToken")
+                if not page.get("IsTruncated"):
+                    break
+            removed += found
+            if found == 0:
+                break
+        return removed
+
+    return await asyncio.to_thread(_purge)
 
 
 async def exists(key: str) -> bool:

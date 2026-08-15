@@ -8,7 +8,8 @@ from sqlalchemy import text
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core import graph
+from packages.core import blobs, graph
+from packages.shared.schema import Scope
 
 # Data deletion (checkpoint 6, part C): one system of record for erasure.
 #
@@ -49,6 +50,111 @@ _TABLES: tuple[tuple[str, str], ...] = (
     ("action_tokens", "company_id"),
     ("credentials", "company_id"),
 )
+
+
+# --------------------------- deleting one document ---------------------------
+#
+# A whole workspace could be erased and a single document could not, which is a
+# strange pair of capabilities to ship together. Same order and the same reason:
+# derived state first, the system of record last, so a failure part way through
+# leaves the document still findable rather than half gone — a row whose
+# passages have been deleted is worse than either outcome, because it is a
+# document that exists and cannot answer.
+
+
+async def preview_item_deletion(
+    session: AsyncSession, scope: Scope, item_id: str
+) -> dict[str, Any] | None:
+    """Exactly what deleting this document would destroy. None if it is absent.
+
+    Counted rather than estimated, and read before anything is touched, because
+    this is what a person is shown when they are asked to confirm. "Delete this
+    document?" is a question nobody can answer well; "delete COMPUTER NETWORKS,
+    2 versions, 3,915 passages and 962 stored pages, permanently" is.
+    """
+    row = (
+        await session.execute(
+            text(
+                """
+                SELECT title, count(*) AS versions, max(version) AS latest,
+                       bool_or(status = 'active') AS live
+                FROM kb_items
+                WHERE workspace_id = :workspace AND item_id = :item
+                GROUP BY title
+                """
+            ),
+            {"workspace": scope.workspace_id, "item": item_id},
+        )
+    ).first()
+    if row is None:
+        return None
+
+    passages = (
+        await session.execute(
+            text(
+                "SELECT count(*) FROM kb_chunks "
+                "WHERE workspace_id = :workspace AND item_id = :item"
+            ),
+            {"workspace": scope.workspace_id, "item": item_id},
+        )
+    ).scalar_one()
+
+    return {
+        "item_id": item_id,
+        "title": row.title,
+        "versions": int(row.versions),
+        "passages": int(passages),
+        "permanent": True,
+    }
+
+
+async def delete_item(
+    session: AsyncSession, scope: Scope, item_id: str
+) -> dict[str, Any]:
+    """Erase one document and everything derived from it.
+
+    Four stores, in the order that makes a partial failure survivable:
+
+      graph     passages and the document node. Deleted FIRST because a Chunk
+                still carries an embedding, so a passage that outlives its
+                document still answers questions — which is the one outcome a
+                deletion may never leave behind.
+      objects   the original, every rendered page, every figure verdict. All
+                beneath one prefix.
+      postgres  passages, class assignments, then every VERSION of the item.
+                Last, because it is the system of record: while these rows
+                exist the document is still explicable.
+
+    Neither the graph nor the object store failing is allowed to abort the row
+    deletion. They hold derived state, and a document whose derived state was
+    partly removed but whose rows remain is a document that answers from
+    nothing — far worse than one whose orphaned page pictures linger in a
+    bucket until the next sweep.
+    """
+    removed: dict[str, Any] = {"item_id": item_id}
+
+    try:
+        removed["graph"] = await graph.delete_item(scope, item_id)
+    except Exception as exc:  # noqa: BLE001 - derived state, never fatal
+        removed["graph_error"] = type(exc).__name__
+
+    try:
+        removed["objects"] = await blobs.delete_prefix(
+            f"{blobs.key_for(scope.workspace_id, item_id)}"
+        )
+    except Exception as exc:  # noqa: BLE001 - derived state, never fatal
+        removed["objects_error"] = type(exc).__name__
+
+    for table in ("kb_chunks", "kb_item_classes", "kb_items"):
+        result = await session.execute(
+            text(  # noqa: S608 - table names come from the fixed tuple above
+                f"DELETE FROM {table} WHERE workspace_id = :workspace AND item_id = :item"
+            ),
+            {"workspace": scope.workspace_id, "item": item_id},
+        )
+        removed[table] = int(cast(CursorResult, result).rowcount or 0)
+
+    return removed
 
 
 def _row_to_dict(r: Any) -> dict[str, Any]:

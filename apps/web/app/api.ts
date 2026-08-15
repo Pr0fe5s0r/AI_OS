@@ -332,6 +332,46 @@ const toDoc = (d: RawDoc): Document => {
   };
 };
 
+/** What deleting a document would destroy, or the result of doing it.
+ *
+ *  Two calls to one route: without `confirm` the API refuses with a 409 and
+ *  this summary, which is what the reader is shown; with it, the deletion runs.
+ *  The counts are real — read from the database before anything is touched —
+ *  because "delete this document?" is a question nobody can answer well and
+ *  "delete COMPUTER NETWORKS, 2 versions, 3,915 passages" is. */
+export type DeletionPreview = {
+  item_id: string;
+  title: string;
+  versions: number;
+  passages: number;
+  permanent: boolean;
+};
+
+export async function previewDelete(itemId: string): Promise<DeletionPreview> {
+  const res = await fetch(`${API}/api/items/${encodeURIComponent(itemId)}`, {
+    method: "DELETE",
+    credentials: "include",
+  });
+  if (res.status === 409) {
+    const body = await res.json();
+    return body.detail.would_delete as DeletionPreview;
+  }
+  // A 409 is the ONLY success here. Anything else means the request was not
+  // the harmless one it was meant to be — including a 200, which would mean
+  // the document has just been deleted by a call that was only asking.
+  if (res.ok) {
+    throw new ApiError(500, "The server deleted without being asked to confirm.");
+  }
+  throw new ApiError(res.status, (await res.json()).detail || res.statusText);
+}
+
+export async function deleteDocument(itemId: string) {
+  return call<{ deleted: boolean; title: string; kb_chunks: number }>(
+    `/api/items/${encodeURIComponent(itemId)}?confirm=true`,
+    { method: "DELETE" }
+  );
+}
+
 export async function updateDocument(
   itemId: string,
   collectionId: string | undefined,
