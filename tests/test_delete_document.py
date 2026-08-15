@@ -208,6 +208,105 @@ async def test_a_missing_document_previews_as_nothing(db):
     assert await erasure.preview_item_deletion(db, SCOPE, "0" * 32) is None
 
 
+# ------------------------- deleting a whole collection -------------------------
+
+
+def test_a_collection_is_deleted_one_document_at_a_time():
+    """Which is what makes it complete.
+
+    Collection delete used to be two DELETE statements against Postgres. The
+    graph passages and the stored originals were never touched, so a deleted
+    collection went on answering questions from vectors nothing pointed at.
+    Reusing delete_item is the fix: it already clears all four stores.
+    """
+    source = inspect.getsource(erasure.delete_collection_and_index)
+    assert "delete_item(" in source
+    assert "DELETE FROM collections" in source
+    # And the collection row goes LAST — while it exists, the collection is
+    # still explicable.
+    assert source.index("delete_item(") < source.index("DELETE FROM collections")
+
+
+def test_the_row_only_module_no_longer_offers_to_delete_a_collection():
+    """A module that knows only about rows cannot delete a collection
+    correctly, so the half-deletion is not left lying around to be called."""
+    from packages.core import collections
+
+    assert not hasattr(collections, "delete_collection")
+
+
+def test_documents_are_deleted_workspace_scoped_not_collection_scoped():
+    """A graph node written before the collection property existed would be
+    invisible to a collection filter and left orphaned — the exact bug being
+    fixed. Item ids already carry their collection (store.stable_item_id), so
+    the workspace scope cannot over-reach."""
+    source = inspect.getsource(erasure.delete_collection_and_index)
+    assert "collection_id=None" in source
+
+
+def test_a_store_failing_is_counted_not_raised():
+    """Half a collection deleted and half not is the worst outcome available.
+    A caller told `graph_errors: 3` can retry; one told nothing cannot."""
+    source = inspect.getsource(erasure.delete_collection_and_index)
+    assert "graph_errors" in source and "objects_errors" in source
+
+
+def test_the_collection_preview_destroys_nothing():
+    source = inspect.getsource(erasure.preview_collection_deletion)
+    for destructive in ("DELETE FROM", "delete_prefix", "graph.delete"):
+        assert destructive not in source
+
+
+@pytest.mark.needs_db
+async def test_deleting_a_collection_reports_every_store(db):
+    from sqlalchemy import text
+
+    from packages.core.collections import create_collection
+    from tests.conftest import SCOPE
+
+    await create_collection(db, SCOPE.workspace_id, "Doomed Collection")
+    item = "coll" + "0" * 28
+    await db.execute(
+        text(
+            """
+            INSERT INTO kb_items (item_id, version, workspace_id, collection_id, title,
+                                  body, source, locator, hash, status, created_at)
+            VALUES (:i, 1, :w, 'doomed-collection', 'Doomed', 'body', 'upload',
+                    'doomed.pdf', 'h', 'active', now())
+            """
+        ),
+        {"i": item, "w": SCOPE.workspace_id},
+    )
+
+    summary = await erasure.preview_collection_deletion(
+        db, SCOPE.workspace_id, "doomed-collection"
+    )
+    assert summary is not None
+    assert summary["documents"] == 1 and summary["name"] == "Doomed Collection"
+
+    removed = await erasure.delete_collection_and_index(
+        db, SCOPE.workspace_id, "doomed-collection"
+    )
+    assert removed["documents"] == 1
+    assert removed["items_removed"] == 1
+    assert removed["collection_removed"] is True
+
+    # And the preview now finds nothing, which is what a 404 is built on.
+    assert (
+        await erasure.preview_collection_deletion(
+            db, SCOPE.workspace_id, "doomed-collection"
+        )
+        is None
+    )
+
+
+@pytest.mark.needs_db
+async def test_a_missing_collection_previews_as_nothing(db):
+    from tests.conftest import SCOPE
+
+    assert await erasure.preview_collection_deletion(db, SCOPE.workspace_id, "nope") is None
+
+
 @pytest.mark.needs_db
 async def test_another_workspace_cannot_be_previewed(db):
     """A preview is a read of somebody's document, and it is scoped like one."""

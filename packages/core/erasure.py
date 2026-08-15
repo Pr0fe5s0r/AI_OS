@@ -166,6 +166,148 @@ async def delete_item(
     return removed
 
 
+# -------------------------- deleting one collection --------------------------
+#
+# Deleting a collection used to be two DELETE statements — the items, then the
+# collection row — and nothing else. Every passage those documents put in the
+# graph stayed, still carrying its embedding, and every stored original stayed
+# in the bucket. So a collection could be reported deleted while its content
+# was still answering questions: the exact outcome deleting a single document
+# is careful to avoid.
+#
+# It is the same work, so it is the same code. A collection is deleted by
+# deleting each document in it through delete_item(), and only then dropping
+# the collection row.
+
+
+async def preview_collection_deletion(
+    session: AsyncSession, workspace_id: str, collection_id: str
+) -> dict[str, Any] | None:
+    """What deleting this collection would destroy. None if there is no such
+    collection — a caller turns that into a 404 rather than reporting a
+    successful delete of nothing."""
+    row = (
+        await session.execute(
+            text(
+                "SELECT name FROM collections "
+                "WHERE workspace_id = :ws AND collection_id = :cid"
+            ),
+            {"ws": workspace_id, "cid": collection_id},
+        )
+    ).first()
+    if row is None:
+        return None
+
+    counts = (
+        await session.execute(
+            text(
+                """
+                SELECT count(DISTINCT item_id) AS documents, count(*) AS versions
+                FROM kb_items
+                WHERE workspace_id = :ws AND collection_id = :cid
+                """
+            ),
+            {"ws": workspace_id, "cid": collection_id},
+        )
+    ).one()
+
+    passages = (
+        await session.execute(
+            text(
+                """
+                SELECT count(*) FROM kb_chunks c
+                WHERE c.workspace_id = :ws
+                  AND EXISTS (
+                    SELECT 1 FROM kb_items i
+                    WHERE i.workspace_id = c.workspace_id
+                      AND i.item_id = c.item_id
+                      AND i.collection_id = :cid
+                  )
+                """
+            ),
+            {"ws": workspace_id, "cid": collection_id},
+        )
+    ).scalar_one()
+
+    return {
+        "collection_id": collection_id,
+        "name": row.name,
+        "documents": int(counts.documents),
+        "versions": int(counts.versions),
+        "passages": int(passages),
+        "permanent": True,
+    }
+
+
+async def delete_collection_and_index(
+    session: AsyncSession, workspace_id: str, collection_id: str
+) -> dict[str, Any]:
+    """Delete a collection, its documents, and everything they derived.
+
+    Each document goes through delete_item(), which is what makes this
+    complete: graph passages and their embeddings first, then the stored
+    original and every rendered page, then the rows. Dropping the collection
+    row is the last thing that happens, for the same reason Postgres is last
+    inside delete_item — while it exists the collection is still explicable.
+
+    The per-document errors are COUNTED rather than raised. A graph or bucket
+    that is unreachable must not leave half the collection deleted and half
+    not, and a caller that is told `graph_errors: 3` can retry; one that is
+    told nothing cannot.
+
+    Scoped to the workspace, not the collection, when the documents are
+    deleted: an item id is derived from its collection already (see
+    ``store.stable_item_id``), so it cannot reach another collection's
+    document — while a graph node written before the collection property
+    existed would be missed by a collection filter and orphaned, which is the
+    bug this function exists to fix.
+    """
+    item_ids = list(
+        (
+            await session.execute(
+                text(
+                    "SELECT DISTINCT item_id FROM kb_items "
+                    "WHERE workspace_id = :ws AND collection_id = :cid"
+                ),
+                {"ws": workspace_id, "cid": collection_id},
+            )
+        ).scalars()
+    )
+
+    scope = Scope(workspace_id=workspace_id, collection_id=None)
+    totals: dict[str, Any] = {
+        "collection_id": collection_id,
+        "documents": len(item_ids),
+        "items_removed": 0,
+        "passages": 0,
+        "graph_chunks": 0,
+        "graph_items": 0,
+        "objects": 0,
+        "graph_errors": 0,
+        "objects_errors": 0,
+    }
+
+    for item_id in item_ids:
+        removed = await delete_item(session, scope, item_id)
+        totals["items_removed"] += int(removed.get("kb_items", 0))
+        totals["passages"] += int(removed.get("kb_chunks", 0))
+        graph_counts = removed.get("graph") or {}
+        totals["graph_chunks"] += int(graph_counts.get("chunks", 0))
+        totals["graph_items"] += int(graph_counts.get("items", 0))
+        totals["objects"] += int(removed.get("objects", 0))
+        if "graph_error" in removed:
+            totals["graph_errors"] += 1
+        if "objects_error" in removed:
+            totals["objects_errors"] += 1
+
+    dropped = await session.execute(
+        text("DELETE FROM collections WHERE workspace_id = :ws AND collection_id = :cid"),
+        {"ws": workspace_id, "cid": collection_id},
+    )
+    totals["collection_removed"] = bool(cast(CursorResult, dropped).rowcount or 0)
+    return totals
+
+
 def _row_to_dict(r: Any) -> dict[str, Any]:
     return {
         "id": r.id,

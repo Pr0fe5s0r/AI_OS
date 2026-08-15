@@ -6,13 +6,13 @@ from fastapi import HTTPException
 from packages.core.collections import (
     create_cluster,
     create_collection,
-    delete_collection,
     get_collection,
     list_clusters,
     rename_collection,
     slugify,
     valid_id,
 )
+from packages.core.erasure import delete_collection_and_index
 from packages.core.keys import create_key, list_keys, resolve_key, revoke_key
 from packages.core.store import put_item
 from packages.core.tenancy import enforce_binding, workspace_scope
@@ -123,12 +123,13 @@ async def test_dropping_a_collection_reports_what_it_removed(db):
     await put_item(db, doc("y", "y.md", scope))
     await db.commit()
 
-    removed = await delete_collection(db, WORKSPACE, "doomed")
+    removed = await delete_collection_and_index(db, WORKSPACE, "doomed")
     await db.commit()
 
     # "Deleted: true" with no number is exactly the report that hides a scope
     # bug quietly deleting nothing at all.
-    assert removed == 2
+    assert removed["items_removed"] == 2
+    assert removed["documents"] == 2
     assert await get_collection(db, WORKSPACE, "doomed") is None
 
 

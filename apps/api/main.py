@@ -43,7 +43,6 @@ from packages.core.classify import (
 from packages.core.collections import (
     create_cluster,
     create_collection,
-    delete_collection,
     get_collection,
     list_clusters,
     rename_collection,
@@ -51,8 +50,12 @@ from packages.core.collections import (
 from packages.core.consolidate import recent_runs
 from packages.core.consolidate import run_once as run_consolidation
 from packages.core.db import Session
+from packages.core.erasure import (
+    delete_collection_and_index,
+    preview_collection_deletion,
+    preview_item_deletion,
+)
 from packages.core.erasure import delete_item as delete_item_and_index
-from packages.core.erasure import preview_item_deletion
 from packages.core.graph import chunk_lineage as graph_lineage
 from packages.core.graph import chunk_neighbours as graph_neighbours
 from packages.core.keys import Escalation, create_key, list_keys, revoke_key
@@ -1793,11 +1796,36 @@ async def drop_collection(
     principal: dict[str, Any] = Depends(resolve_caller),
     session: AsyncSession = Depends(db),
 ) -> dict[str, Any]:
-    """Delete a collection and its contents, reporting how much went."""
+    """Delete a collection, its documents, and everything they derived.
+
+    Not only its rows. Every passage in the graph goes with it, and so does
+    every stored original and rendered page — this used to delete the Postgres
+    rows alone and leave the vectors behind, which meant a deleted collection
+    carried on answering questions from passages nothing pointed at any more.
+
+    The counts come back per store, because "deleted: true" is exactly the
+    report that hides a deletion which reached only one of them.
+    """
     enforce_binding(principal, collection_id)
-    removed = await delete_collection(session, str(principal["company_id"]), collection_id)
+    workspace = str(principal["company_id"])
+
+    summary = await preview_collection_deletion(session, workspace, collection_id)
+    if summary is None:
+        raise HTTPException(404, "No such collection.")
+
+    removed = await delete_collection_and_index(session, workspace, collection_id)
+    await audit.record(
+        session,
+        workspace,
+        str(principal.get("email") or "unknown"),
+        "collection.deleted",
+        collection_id,
+        {"name": summary["name"], "removed": removed},
+    )
     await session.commit()
-    return {"deleted": True, "items_removed": removed}
+    # items_removed keeps its meaning — kb_items rows, i.e. versions — because
+    # the console and both SDKs already read it.
+    return {"deleted": True, "items_removed": removed["items_removed"], **removed}
 
 
 # ---------------------------------- keys ----------------------------------

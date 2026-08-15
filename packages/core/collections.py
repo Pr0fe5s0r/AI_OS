@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Any, cast
+from typing import Any
 
 from sqlalchemy import text
-from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.shared.schema import Scope
@@ -275,27 +274,13 @@ async def rename_collection(
     return {"collection_id": collection_id, "name": name}
 
 
-async def delete_collection(
-    session: AsyncSession, workspace_id: str, collection_id: str
-) -> int:
-    """Drop a collection and everything in it.
-
-    Returns how many items went with it, because "deleted" with no number is
-    exactly the report that hides a scope bug deleting nothing.
-    """
-    removed = await session.execute(
-        text(
-            "DELETE FROM kb_items WHERE workspace_id = :ws AND collection_id = :cid"
-        ),
-        {"ws": workspace_id, "cid": collection_id},
-    )
-    await session.execute(
-        text(
-            "DELETE FROM collections WHERE workspace_id = :ws AND collection_id = :cid"
-        ),
-        {"ws": workspace_id, "cid": collection_id},
-    )
-    return int(cast(CursorResult, removed).rowcount or 0)
+# Deleting a collection lives in `erasure.delete_collection_and_index`, with
+# the rest of the deletion story. It used to live here, as two DELETE
+# statements against Postgres, and that is precisely what was wrong with it:
+# the graph passages and the stored originals were never touched, so a deleted
+# collection went on answering questions from vectors nobody could see. A
+# module that knows only about rows cannot delete a collection correctly, so
+# it no longer offers to.
 
 
 def scope_for(workspace_id: str, collection_id: str | None) -> Scope:
@@ -306,7 +291,6 @@ __all__ = [
     "DEFAULT_CLUSTER",
     "create_cluster",
     "create_collection",
-    "delete_collection",
     "ensure_default_cluster",
     "get_collection",
     "list_clusters",
