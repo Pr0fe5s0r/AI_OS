@@ -76,17 +76,26 @@ async def preview_item_deletion(
         await session.execute(
             text(
                 """
-                SELECT title, count(*) AS versions, max(version) AS latest,
-                       bool_or(status = 'active') AS live
+                SELECT count(*) AS versions,
+                       max(version) AS latest,
+                       -- The title a person would recognise: the live one, or
+                       -- the newest when nothing is live. Titles CHANGE between
+                       -- versions — this book was 'This page intentionally left
+                       -- blank' until its parser learned to skip front matter —
+                       -- so picking one has to be deliberate.
+                       (array_agg(title ORDER BY (status = 'active') DESC,
+                                  version DESC))[1] AS title
                 FROM kb_items
                 WHERE workspace_id = :workspace AND item_id = :item
-                GROUP BY title
                 """
             ),
             {"workspace": scope.workspace_id, "item": item_id},
         )
     ).first()
-    if row is None:
+    # An aggregate with no GROUP BY always returns a row, so `row is None` can
+    # never fire here and a missing document would have been offered for
+    # deletion with a count of zero. The absence has to be read from the count.
+    if row is None or not row.versions:
         return None
 
     passages = (

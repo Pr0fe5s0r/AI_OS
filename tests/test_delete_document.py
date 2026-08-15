@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import inspect
 
+import pytest
+
 from apps.api import authz
 from packages.core import blobs, erasure
 
@@ -147,3 +149,82 @@ def test_the_deletion_is_audited():
     source = inspect.getsource(__import__("apps.api.main", fromlist=["remove_item"]).remove_item)
     assert "audit.record" in source
     assert '"item.deleted"' in source
+
+
+# --------------------- what the alert says it will destroy ---------------------
+
+
+@pytest.mark.needs_db
+async def test_the_version_count_survives_a_renamed_document(db):
+    """Titles CHANGE between versions, and the count must not be split by them.
+
+    The first version of this query said GROUP BY title, so a document whose
+    title changed reported only the versions sharing the CURRENT one. Found on
+    a real book: Tanenbaum's Computer Networks entered the store titled "This
+    page intentionally left blank", was re-ingested once the parser learned to
+    skip front matter, and the deletion dialog then offered to delete "1
+    version" of a document that had two.
+    """
+    from sqlalchemy import text
+
+    from tests.conftest import SCOPE
+
+    item = "renamed" + "0" * 25
+    for version, title, status in (
+        (1, "This page intentionally left blank", "superseded"),
+        (2, "COMPUTER NETWORKS", "active"),
+    ):
+        await db.execute(
+            text(
+                """
+                INSERT INTO kb_items (item_id, version, workspace_id, title, body,
+                                      source, locator, hash, status, created_at)
+                VALUES (:i, :v, :w, :t, 'body', 'upload', 'renamed.pdf', :h, :s, now())
+                """
+            ),
+            {"i": item, "v": version, "w": SCOPE.workspace_id, "t": title,
+             "h": f"h{version}", "s": status},
+        )
+
+    summary = await erasure.preview_item_deletion(db, SCOPE, item)
+    assert summary is not None
+    assert summary["versions"] == 2, "both versions must be counted"
+    # And the title shown is the one a person would recognise, not the
+    # superseded boilerplate.
+    assert summary["title"] == "COMPUTER NETWORKS"
+
+
+@pytest.mark.needs_db
+async def test_a_missing_document_previews_as_nothing(db):
+    """The trap inside the fix.
+
+    An aggregate with no GROUP BY always returns a row, so the old `row is
+    None` check could never fire once the grouping went — and a document that
+    does not exist would have been offered for deletion with a count of zero
+    instead of answering 404.
+    """
+    from tests.conftest import SCOPE
+
+    assert await erasure.preview_item_deletion(db, SCOPE, "0" * 32) is None
+
+
+@pytest.mark.needs_db
+async def test_another_workspace_cannot_be_previewed(db):
+    """A preview is a read of somebody's document, and it is scoped like one."""
+    from sqlalchemy import text
+
+    from tests.conftest import OTHER, SCOPE
+
+    item = "scoped" + "0" * 26
+    await db.execute(
+        text(
+            """
+            INSERT INTO kb_items (item_id, version, workspace_id, title, body,
+                                  source, locator, hash, status, created_at)
+            VALUES (:i, 1, :w, 'Mine', 'body', 'upload', 'mine.pdf', 'h', 'active', now())
+            """
+        ),
+        {"i": item, "w": SCOPE.workspace_id},
+    )
+    assert await erasure.preview_item_deletion(db, SCOPE, item) is not None
+    assert await erasure.preview_item_deletion(db, OTHER, item) is None
