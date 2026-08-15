@@ -3,8 +3,27 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import Depends, HTTPException, Request
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from packages.core.tenancy import resolve_caller
+
+# Declared so the API documents how it is authenticated, which is not cosmetic:
+# Swagger UI refuses to send an `Authorization` header that is described as an
+# ordinary parameter — it sends one only through its Authorize dialog, and that
+# dialog exists only when the spec declares a security scheme. Without this the
+# interactive documentation could not make a single authenticated call, and
+# every request from it came back 401 with the field filled in.
+#
+# `auto_error=False` because a bearer token is not the only credential: the
+# console signs in with a cookie, and refusing a request that has no
+# Authorization header would lock the browser out of its own API. The value is
+# never read here — resolve_caller does the actual work — it is declared so the
+# scheme reaches the spec.
+_bearer = HTTPBearer(
+    auto_error=False,
+    scheme_name="API key",
+    description="An API key from POST /api/keys, sent as `Bearer kb_live_…`.",
+)
 
 # ---------------------------------------------------------------------------
 # WHAT EACH ROUTE REQUIRES — the whole authorisation matrix, in one table.
@@ -128,7 +147,9 @@ def matrix() -> dict[tuple[str, str], frozenset[str]]:
 
 
 async def authorise(
-    request: Request, principal: dict[str, Any] = Depends(resolve_caller)
+    request: Request,
+    principal: dict[str, Any] = Depends(resolve_caller),
+    _bearer_declared: HTTPAuthorizationCredentials | None = Depends(_bearer),
 ) -> dict[str, Any]:
     """Refuse the request unless the caller's scopes cover this route.
 

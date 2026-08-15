@@ -124,7 +124,14 @@ async def lifespan(app: FastAPI):
 # table is refused rather than served — the opposite of how this behaved before,
 # when a route with no check was a route anyone could read.
 app = FastAPI(
-    title="Knowledge Base", lifespan=lifespan, dependencies=[Depends(authorise)]
+    title="Knowledge Base",
+    lifespan=lifespan,
+    dependencies=[Depends(authorise)],
+    # Keep the key across a page reload. Without it, every reload of the
+    # interactive docs silently drops the credential and the next call comes
+    # back 401 with nothing on screen explaining why — which reads as the API
+    # being broken rather than the documentation forgetting.
+    swagger_ui_parameters={"persistAuthorization": True},
 )
 # Named origins, not "*": the session travels as a cookie, and a browser
 # refuses a wildcard origin on any credentialed request — so "*" would not be
