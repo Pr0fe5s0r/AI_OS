@@ -48,16 +48,32 @@ async def client(monkeypatch):
             "company_id": WORKSPACE,
             "via": "test",
             "client": x_markvector_client,
-            "scopes": ["read", "write"],
+            # Every scope. These tests are about the HTTP contract — what a
+            # route accepts, refuses and returns — and what each scope may
+            # reach has its own file in tests/test_scopes.py. A caller here
+            # short of `manage` would fail on collection routes for a reason
+            # that has nothing to do with what is being tested.
+            "scopes": ["read", "write", "manage"],
         }
 
-    from packages.core.tenancy import resolve_caller, workspace_scope
+    from packages.core.tenancy import (
+        resolve_caller,
+        resolve_caller_optional,
+        workspace_scope,
+    )
     from packages.shared.schema import Scope
 
     async def fake_scope():
         return Scope(workspace_id=WORKSPACE, collection_id=None)
 
     api.app.dependency_overrides[resolve_caller] = fake_caller
+    # BOTH resolvers. The application-wide authorisation dependency resolves the
+    # caller optionally — so that a route needing no scope needs no credential —
+    # and overriding only the strict one leaves authorisation looking at a real,
+    # empty request. Every route then answers 401 before its handler runs, which
+    # is what happened: twelve contract tests turned red at once, all of them
+    # reporting the wrong status code for the right reason.
+    api.app.dependency_overrides[resolve_caller_optional] = fake_caller
     api.app.dependency_overrides[workspace_scope] = fake_scope
     api.app.state.queue = queue
 
