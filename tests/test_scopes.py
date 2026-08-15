@@ -58,6 +58,29 @@ def test_the_matrix_names_no_route_that_does_not_exist():
     assert [entry for entry in authz.matrix() if entry not in live] == []
 
 
+def test_an_open_route_needs_no_credential_at_all():
+    """A route that requires no scope must require no CREDENTIAL.
+
+    Asking the authorisation dependency for a principal on every request made
+    /api/health answer 401, and that is not a policy decision — it is a
+    container reporting itself unhealthy and an orchestrator refusing to start
+    it. Caught by the Docker healthcheck going red, which is the cheapest place
+    this could have been caught and not somewhere a unit test was looking.
+    """
+    import inspect
+
+    source = inspect.getsource(authz.authorise)
+    # The optional resolver, not the raising one.
+    assert "resolve_caller_optional" in inspect.getsource(authz)
+    # And the open branch returns BEFORE anything demands a principal.
+    assert source.index("if not needed:") < source.index("if principal is None:")
+
+
+def test_health_is_open():
+    assert authz.requirement("GET", "/api/health") == authz.OPEN
+    assert authz.requirement("GET", "/api/formats") == authz.OPEN
+
+
 def test_an_undeclared_route_is_refused_not_served():
     """The direction this has to fail.
 

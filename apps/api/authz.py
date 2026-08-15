@@ -5,7 +5,7 @@ from typing import Any
 from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from packages.core.tenancy import resolve_caller
+from packages.core.tenancy import resolve_caller_optional
 
 # Declared so the API documents how it is authenticated, which is not cosmetic:
 # Swagger UI refuses to send an `Authorization` header that is described as an
@@ -148,9 +148,9 @@ def matrix() -> dict[tuple[str, str], frozenset[str]]:
 
 async def authorise(
     request: Request,
-    principal: dict[str, Any] = Depends(resolve_caller),
+    principal: dict[str, Any] | None = Depends(resolve_caller_optional),
     _bearer_declared: HTTPAuthorizationCredentials | None = Depends(_bearer),
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     """Refuse the request unless the caller's scopes cover this route.
 
     Registered as an application-wide dependency, so it runs for every route
@@ -179,7 +179,15 @@ async def authorise(
             "apps/api/authz.py before serving it.",
         )
     if not needed:
+        # No scope required means no CREDENTIAL required. Asking for one made
+        # /api/health answer 401, which is not a policy decision — it is a
+        # container reporting itself unhealthy and an orchestrator refusing to
+        # start it.
         return principal
+    if principal is None:
+        raise HTTPException(
+            401, "Not signed in. Provide a session cookie or an API key."
+        )
 
     held = set(principal.get("scopes") or ())
     if not needed & held:

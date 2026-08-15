@@ -109,6 +109,32 @@ async def resolve_caller(
     }
 
 
+async def resolve_caller_optional(
+    authorization: str | None = Header(default=None),
+    markos_session: str | None = Cookie(default=None),
+    x_markvector_client: str | None = Header(default=None),
+) -> dict[str, Any] | None:
+    """The caller, or None when there is no usable credential.
+
+    Exists for one reason: a route that requires NO scope must also require no
+    credential. The authorisation dependency runs on every request, and asking
+    it for a principal made `/api/health` answer 401 — which is not a policy
+    decision, it is a container that reports itself unhealthy and an
+    orchestrator that will not start it.
+
+    Every route that actually needs a caller resolves one for itself, so
+    returning None here narrows nothing.
+    """
+    try:
+        return await resolve_caller(
+            authorization=authorization,
+            markos_session=markos_session,
+            x_markvector_client=x_markvector_client,
+        )
+    except HTTPException:
+        return None
+
+
 def require_write(principal: dict[str, Any]) -> None:
     """A read-only key must not be able to write. Checked at the edge, once."""
     if "write" not in principal.get("scopes", ["write"]):
