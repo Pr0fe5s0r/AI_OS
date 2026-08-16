@@ -150,7 +150,8 @@ async def resolve_key(session: AsyncSession, presented: str) -> dict[str, Any] |
         await session.execute(
             text(
                 """
-                SELECT key_id, workspace_id, name, scopes, collection_id, revoked_at
+                SELECT key_id, workspace_id, name, scopes, collection_id,
+                       rate_limits, revoked_at
                 FROM api_keys WHERE key_hash = :hash
                 """
             ),
@@ -176,6 +177,11 @@ async def resolve_key(session: AsyncSession, presented: str) -> dict[str, Any] |
         # somebody meant to be powerful into one that can do nothing.
         "scopes": sorted(parse_scopes(row.scopes)),
         "collection_id": row.collection_id,
+        # Carried on the principal so the rate limiter costs no second query.
+        # Every request already resolves the key; asking the database again for
+        # this key's limits would put a round trip in front of every call in
+        # order to decide whether to allow the call.
+        "rate_limits": row.rate_limits or {},
     }
 
 

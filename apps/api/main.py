@@ -14,7 +14,16 @@ from pathlib import Path
 from typing import Any
 
 from arq import create_pool
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
@@ -23,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.auth_routes import router as auth_router
 from apps.api.authz import authorise
+from apps.api.throttle import throttle
 from apps.common.consolidation import enabled as consolidation_enabled
 from apps.common.consolidation import interval_seconds as consolidation_interval
 from apps.common.summaries import coverage as summary_coverage_for
@@ -59,6 +69,7 @@ from packages.core.erasure import delete_item as delete_item_and_index
 from packages.core.graph import chunk_lineage as graph_lineage
 from packages.core.graph import chunk_neighbours as graph_neighbours
 from packages.core.keys import Escalation, create_key, list_keys, revoke_key
+from packages.core.limits import Limiter
 from packages.core.navigator import MAX_BEHAVIOUR_CHARS
 from packages.core.neighbours import collection_graph
 from packages.core.normalise import can_parse, supported
@@ -118,7 +129,13 @@ async def lifespan(app: FastAPI):
     await graph.bootstrap()
     await blobs.ensure_bucket()
     app.state.queue = await create_pool(redis_settings())
+    # A connection of its own rather than the job queue's. The limiter runs on
+    # the request path and must not compete for the pool the worker depends on,
+    # and it has to keep answering when the queue is busy — which is exactly
+    # when a limit is being approached.
+    app.state.limiter = Limiter(await create_pool(redis_settings()))
     yield
+    await app.state.limiter.close()
     await app.state.queue.close()
     await graph.close_driver()
 
@@ -131,7 +148,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Knowledge Base",
     lifespan=lifespan,
-    dependencies=[Depends(authorise)],
+    # Order matters. Authorisation runs first so a 401 never consumes anybody's
+    # rate budget, and so an unauthenticated flood is refused by the cheaper
+    # check of the two.
+    dependencies=[Depends(authorise), Depends(throttle)],
     # Keep the key across a page reload. Without it, every reload of the
     # interactive docs silently drops the credential and the next call comes
     # back 401 with nothing on screen explaining why — which reads as the API
@@ -153,6 +173,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(auth_router)
+
+
+@app.middleware("http")
+async def report_rate_limit(request: Request, call_next: Any) -> Any:
+    """Put the RateLimit fields on successful responses too.
+
+    A ceiling you can only discover by hitting it is one no client can pace
+    itself against — they find it during a demo instead of during development.
+    The refusal carries its own headers from the exception; this is for the
+    requests that were allowed.
+    """
+    response = await call_next(request)
+    decision = getattr(request.state, "rate_limit", None)
+    if decision is not None:
+        for name, value in decision.headers().items():
+            response.headers[name] = value
+    return response
 
 # There was none. Two handlers already called ``log.exception`` — so the moment
 # either of them fired, the handler itself raised NameError and a clean 500 with

@@ -82,6 +82,7 @@ async def resolve_caller(
             # makes to that one collection. Read by workspace_scope and
             # enforce_binding, never trusted from the request.
             "collection_id": holder.get("collection_id"),
+            "rate_limits": holder.get("rate_limits") or {},
             "via": "api_key",
             "client": x_markvector_client,
         }
