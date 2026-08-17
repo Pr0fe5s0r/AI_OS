@@ -177,6 +177,31 @@ def require_manage(principal: dict[str, Any]) -> None:
         )
 
 
+class CrossCollectionAttempt(HTTPException):
+    """A bound key asked for a collection that is not its own.
+
+    A distinct type rather than a bare 403 so the refusal can be RECORDED. The
+    caller who trips this is usually not an attacker — it is a workflow that
+    failed to resolve which client it was acting for, and the whole value of a
+    hard barrier is that such a bug becomes visible instead of silently
+    returning the wrong client's knowledge. Blocking it is half the job;
+    saying it happened is the other half.
+    """
+
+    def __init__(
+        self,
+        key_id: str | None,
+        bound: str,
+        requested: str | None,
+        workspace_id: str = "",
+    ) -> None:
+        super().__init__(403, f"This key is limited to collection {bound!r}.")
+        self.key_id = key_id
+        self.bound = bound
+        self.requested = requested
+        self.workspace_id = workspace_id
+
+
 def enforce_binding(principal: dict[str, Any], collection_id: str) -> None:
     """A collection-bound key may only touch the collection it names.
 
@@ -188,7 +213,12 @@ def enforce_binding(principal: dict[str, Any], collection_id: str) -> None:
     """
     bound = principal.get("collection_id")
     if bound is not None and bound != collection_id:
-        raise HTTPException(403, f"This key is limited to collection {bound!r}.")
+        raise CrossCollectionAttempt(
+            principal.get("key_id"),
+            str(bound),
+            collection_id,
+            str(principal.get("company_id") or ""),
+        )
 
 
 async def company_scope(principal: dict[str, Any] = Depends(current_principal)) -> str:
@@ -222,7 +252,9 @@ async def workspace_scope(
     bound = principal.get("collection_id")
     if bound is not None:
         if x_collection is not None and x_collection != bound:
-            raise HTTPException(403, f"This key is limited to collection {bound!r}.")
+            raise CrossCollectionAttempt(
+                principal.get("key_id"), str(bound), x_collection, workspace_id
+            )
         return Scope(workspace_id=workspace_id, collection_id=bound)
 
     if x_collection is None:

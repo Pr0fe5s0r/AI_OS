@@ -94,10 +94,16 @@ async def for_item(session: AsyncSession, scope: Scope, item_id: str) -> list[St
                   -- Real passages only: a summary is not a passage of the
                   -- document, so it must not be embedded or replaced as one.
                   AND node_type = 'fact'
+                  -- And only inside the caller's collection. Filtering on the
+                  -- workspace alone meant a key bound to one collection could
+                  -- read every passage of another collection's document by
+                  -- naming its id — measured at 210 passages of full text
+                  -- before this line existed.
+                  AND (CAST(:coll AS text) IS NULL OR collection_id = :coll)
                 ORDER BY ordinal
                 """
             ),
-            {"w": scope.workspace_id, "i": item_id},
+            {"w": scope.workspace_id, "i": item_id, "coll": scope.collection_id},
         )
     ).all()
     return [StoredChunk(r.chunk_id, r.item_id, r.ordinal, r.heading, r.text) for r in rows]
@@ -114,9 +120,13 @@ async def by_ids(
                 """
                 SELECT chunk_id, item_id, ordinal, heading, text FROM kb_chunks
                 WHERE workspace_id = :w AND chunk_id = ANY(:ids)
+                  -- Hydration is where passage TEXT is handed back, so it is
+                  -- the last place a collection filter may be omitted: every
+                  -- caller that resolves ids into content comes through here.
+                  AND (CAST(:coll AS text) IS NULL OR collection_id = :coll)
                 """
             ),
-            {"w": scope.workspace_id, "ids": chunk_ids},
+            {"w": scope.workspace_id, "ids": chunk_ids, "coll": scope.collection_id},
         )
     ).all()
     return {

@@ -25,7 +25,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -78,6 +78,7 @@ from packages.core.search import RetrievalConfig, search_traced
 from packages.core.snippets import build as build_snippets
 from packages.core.store import edit_item, get_item, get_items_by_ids, item_versions, list_items
 from packages.core.tenancy import (
+    CrossCollectionAttempt,
     enforce_binding,
     require_write,
     resolve_caller,
@@ -173,6 +174,45 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(auth_router)
+
+
+@app.exception_handler(CrossCollectionAttempt)
+async def record_cross_collection_attempt(
+    request: Request, exc: CrossCollectionAttempt
+) -> Response:
+    """Refuse, and write down that it happened.
+
+    A bound key reaching for another collection is almost never an attack — it
+    is a workflow that failed to resolve which client it was acting for. That
+    is exactly the bug a hard barrier is supposed to make VISIBLE: blocked, and
+    findable afterwards by key, by requested collection, and by time. A 403
+    that leaves no trace tells the operator nothing about how often their own
+    id-threading is wrong.
+
+    The write is best-effort. Failing to record a refusal must never turn the
+    refusal into something else — the 403 goes out either way.
+    """
+    try:
+        async with Session() as session:
+            await audit.record(
+                session,
+                exc.workspace_id or "unknown",
+                f"key:{exc.key_id or 'unknown'}",
+                "collection.access_denied",
+                exc.requested or "",
+                {
+                    "bound_collection": exc.bound,
+                    "requested_collection": exc.requested,
+                    "key_id": exc.key_id,
+                    "method": request.method,
+                    "path": request.url.path,
+                },
+            )
+            await session.commit()
+    except Exception:  # noqa: BLE001 - telemetry must not change the answer
+        log.exception("could not record a cross-collection attempt")
+
+    return JSONResponse(status_code=403, content={"detail": exc.detail})
 
 
 @app.middleware("http")
@@ -1708,7 +1748,7 @@ async def summaries_coverage(
 @app.get("/api/chunks/{chunk_id}")
 async def read_chunk(
     chunk_id: str,
-    principal: dict[str, Any] = Depends(resolve_caller),
+    scope: Scope = Depends(workspace_scope),
     session: AsyncSession = Depends(db),
 ) -> dict[str, Any]:
     """One passage, in full, with the document it belongs to.
@@ -1716,8 +1756,15 @@ async def read_chunk(
     What the graph opens when a point is clicked. A point on a chart that
     cannot tell you what it represents is decoration; this is what makes it an
     index you can read.
+
+    Scoped to the COLLECTION, not merely the workspace. This route used to
+    resolve the caller and filter on workspace_id alone, which meant a key
+    bound to one collection could read any passage in the workspace by naming
+    its id — the binding held on every route that took a Scope and was absent
+    on the three that did not. A barrier with three doors left open is not a
+    barrier, and a caller who guesses or is handed an id must not be able to
+    walk through them.
     """
-    workspace = str(principal["company_id"])
     row = (
         await session.execute(
             text(
@@ -1730,13 +1777,29 @@ async def read_chunk(
                        ON i.item_id = c.item_id AND i.workspace_id = c.workspace_id
                       AND i.status = 'active'
                 WHERE c.workspace_id = :w AND c.chunk_id = :c
+                  -- The collection is read from the chunk, falling back to its
+                  -- document for the handful of rows written before chunks
+                  -- carried one (21 of 41,819 here). A chunk whose collection
+                  -- cannot be established either way stays HIDDEN from a bound
+                  -- key rather than visible to it: an unknown owner is not the
+                  -- same as a permitted one.
+                  -- CAST because asyncpg cannot infer the type of a parameter
+                  -- that only appears in an IS NULL test.
+                  AND (
+                    CAST(:coll AS text) IS NULL
+                    OR c.collection_id = :coll
+                    OR (c.collection_id IS NULL AND i.collection_id = :coll)
+                  )
                 """
             ),
-            {"w": workspace, "c": chunk_id},
+            {"w": scope.workspace_id, "c": chunk_id, "coll": scope.collection_id},
         )
     ).first()
     if row is None:
-        raise HTTPException(404, "No such passage in this workspace.")
+        # Not "in this workspace" any more: for a bound key the passage may
+        # exist in the workspace and simply not be theirs to read. Saying which
+        # would confirm it exists, so the answer is the same either way.
+        raise HTTPException(404, "No such passage.")
 
     return {
         "chunk_id": row.chunk_id,
@@ -1761,7 +1824,7 @@ async def read_chunk(
 @app.get("/api/chunks/{chunk_id}/lineage")
 async def chunk_sources(
     chunk_id: str,
-    principal: dict[str, Any] = Depends(resolve_caller),
+    scope: Scope = Depends(workspace_scope),
     session: AsyncSession = Depends(db),
 ) -> dict[str, Any]:
     """What a summary node was built from.
@@ -1769,8 +1832,12 @@ async def chunk_sources(
     A summary is text a model wrote, so this is the difference between a
     memory and an assertion: it names the passages behind the claim, and they
     remain resolvable after they are archived.
+
+    Collection-scoped, like every other read. It used to build its own
+    workspace-wide Scope, which let a bound key read the passages behind
+    another collection's summary — and lineage returns the source TEXT, so it
+    was a content read, not a metadata one.
     """
-    scope = Scope(workspace_id=str(principal["company_id"]))
     sources = await graph_lineage(scope, chunk_id)
     hydrated = await chunks_by_ids(session, scope, [s["chunk_id"] for s in sources])
     return {
@@ -1792,7 +1859,7 @@ async def chunk_sources(
 async def chunk_neighbors(
     chunk_id: str,
     limit: int = Query(10, ge=1, le=50),
-    principal: dict[str, Any] = Depends(resolve_caller),
+    scope: Scope = Depends(workspace_scope),
 ) -> dict[str, Any]:
     """The passages nearest this one — the graph's traversal primitive.
 
@@ -1801,8 +1868,11 @@ async def chunk_neighbors(
     passage a search turned up to related material, following the thread rather
     than searching again from the top. The same primitive serves our own
     navigator and a caller's own-LLM agent through the SDK.
+
+    The hop is scoped at BOTH ends — see graph.chunk_neighbours. Scoping only
+    the passage you start from lets an edge carry the answer out of the
+    collection, which is the one thing a traversal primitive must never do.
     """
-    scope = Scope(workspace_id=str(principal["company_id"]))
     neighbours = await graph_neighbours(scope, chunk_id, limit=limit)
     return {
         "chunk_id": chunk_id,
@@ -1909,6 +1979,14 @@ async def add_key(
                 if principal.get("via") == "api_key"
                 else None
             ),
+            # And no stronger a BINDING than itself either: a key confined to
+            # one collection may only issue keys confined to the same one, or
+            # the confinement is one API call deep.
+            minter_collection=(
+                principal.get("collection_id")
+                if principal.get("via") == "api_key"
+                else None
+            ),
         )
     except Escalation as exc:
         raise HTTPException(403, str(exc)) from exc
@@ -1939,7 +2017,14 @@ async def code_snippets(
 
     The key is never interpolated — snippets get copied into chat, tickets and
     screenshots, so they read it from the environment instead.
+
+    Bound like every other collection-named request. It discloses no document
+    content, only a code template, but a bound key handing back working
+    snippets addressed to another client's collection is the wrong answer to
+    the wrong question — and an operator reading it would reasonably conclude
+    the collection was theirs to use.
     """
+    enforce_binding(principal, collection)
     return build_snippets(os.getenv("PUBLIC_API_URL", "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me"), collection)
 
 

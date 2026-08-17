@@ -85,6 +85,7 @@ async def create_key(
     scopes: str = "read,write",
     collection_id: str | None = None,
     minter_scopes: set[str] | None = None,
+    minter_collection: str | None = None,
 ) -> dict[str, Any]:
     """Issue a key. The plaintext comes back exactly once, here.
 
@@ -99,6 +100,18 @@ async def create_key(
     if not wanted:
         raise ValueError(f"A key needs at least one scope of {', '.join(SCOPES)}.")
     check_subset(minter_scopes, wanted)
+
+    # A bound key may only issue keys inside its own binding. Without this, the
+    # binding is one API call deep: a key confined to collection A mints an
+    # unbound key and reads collection B with it — the containment defeated by
+    # the very credential it was meant to contain. The scope check above stops
+    # a key becoming MORE powerful; this stops it becoming less confined, and
+    # both have to hold for a binding to mean anything.
+    if minter_collection is not None and collection_id != minter_collection:
+        raise Escalation(
+            f"This key is limited to collection {minter_collection!r} and may "
+            "only issue keys bound to the same collection."
+        )
     scopes = ",".join(scope for scope in SCOPES if scope in wanted)
 
     if collection_id is not None:

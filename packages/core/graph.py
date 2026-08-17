@@ -517,11 +517,18 @@ async def chunk_neighbours(scope: Scope, chunk_id: str, limit: int = 10) -> list
     authored-first, then by weight. Archived neighbours are excluded.
     """
     clause, params = _scope_clause("c", scope)
+    # The FAR end of the hop is scoped too, and that is the point. Scoping only
+    # the chunk you start from lets a single edge carry the answer into another
+    # collection — a caller bound to one client would receive another client's
+    # passage as a "neighbour", which is precisely the leak the binding exists
+    # to make impossible. An edge is not permission to cross a boundary.
+    neighbour_clause, _ = _scope_clause("n", scope)
     return await _run(
         f"""
         MATCH (c:Chunk {{chunk_id: $chunk_id}}) WHERE {clause}
         MATCH (c)-[r:NEAR|RELATED]-(n:Chunk)
-        WHERE n.status = $active
+        WHERE {neighbour_clause}
+          AND n.status = $active
           AND NOT (type(r) = 'RELATED' AND coalesce(r.relation, 'none') = 'none')
         WITH n, collect(r) AS rels
         WITH n,
@@ -706,10 +713,13 @@ async def delete_chunk(scope: Scope, chunk_id: str) -> None:
 async def chunk_lineage(scope: Scope, chunk_id: str) -> list[dict]:
     """What a summary was built from — the evidence behind a written claim."""
     clause, params = _scope_clause("c", scope)
+    # Both ends, for the same reason as chunk_neighbours: a DERIVED_FROM edge
+    # must not hand back a source passage from another collection.
+    source_clause, _ = _scope_clause("s", scope)
     return await _run(
         f"""
         MATCH (c:Chunk {{chunk_id: $chunk_id}})-[:DERIVED_FROM]->(s:Chunk)
-        WHERE {clause}
+        WHERE {clause} AND {source_clause}
         RETURN s.chunk_id AS chunk_id, s.heading AS heading,
                s.item_id AS item_id, properties(s)['archived'] AS archived
         """,

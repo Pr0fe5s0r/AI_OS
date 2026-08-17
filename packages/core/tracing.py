@@ -126,7 +126,15 @@ async def list_traces(
 async def get_trace(
     session: AsyncSession, scope: Scope, trace_id: str
 ) -> dict[str, Any] | None:
-    """One trace in full — every arm, every score, every timing."""
+    """One trace in full — every arm, every score, every timing.
+
+    Scoped to the collection when the caller is bound to one. A trace holds the
+    question somebody typed and excerpts of the passages that answered it, so
+    reading another collection's trace is reading another client's content one
+    query at a time. `list_traces` filtered on the collection from the start;
+    fetching a single trace by id did not, which made the listing's scoping
+    decorative — anyone holding an id went straight past it.
+    """
     row = (
         await session.execute(
             text(
@@ -137,9 +145,17 @@ async def get_trace(
                        COALESCE(config->>'retrieval', 'hybrid') AS retrieval
                 FROM query_traces
                 WHERE workspace_id = :ws AND trace_id = :tid
+                  -- CAST because asyncpg cannot infer the type of a parameter
+                  -- that only ever appears in an IS NULL test, and answers
+                  -- "could not determine data type of parameter" at runtime.
+                  AND (CAST(:coll AS text) IS NULL OR collection_id = :coll)
                 """
             ),
-            {"ws": scope.workspace_id, "tid": trace_id},
+            {
+                "ws": scope.workspace_id,
+                "tid": trace_id,
+                "coll": scope.collection_id,
+            },
         )
     ).first()
     if row is None:
