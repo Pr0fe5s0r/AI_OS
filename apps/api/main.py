@@ -1159,7 +1159,35 @@ async def one_item(
     # detail view showed "not filed yet" for an item the list had just shown
     # three categories against.
     tagged = await classes_for(session, scope, [item.id])
-    return {**item.model_dump(), "classes": tagged.get(item.id, [])}
+    return {
+        **item.model_dump(),
+        "classes": tagged.get(item.id, []),
+        # What this document can be asked for, DECLARED rather than discovered.
+        # An application building on this store used to learn that a deck has
+        # no page pictures by requesting one and reading a 404 — which is a
+        # capability check disguised as an error, and it cannot tell "this
+        # document has no pictures" apart from "this page does not exist" or
+        # "the object store is down".
+        **_addressability(item),
+    }
+
+
+def _addressability(item: Any) -> dict[str, Any]:
+    """How a caller can address parts of this document, and what it can get.
+
+    `pages` counts the addressable parts, `page_unit` names them the way the
+    document's own readers do ("slide" for a deck), and `page_image` says
+    whether a picture of one can be fetched. A deck answers 79 / "slide" /
+    false: the citation can say "slide 34" and the caller knows not to ask for
+    a picture of it.
+    """
+    locator = (item.source.locator if item.source else "") or ""
+    counted = tree.page_count(item.body or "")
+    return {
+        "pages": counted,
+        "page_unit": pages.unit(locator) if counted else None,
+        "page_image": bool(counted) and pages.renderable("", locator),
+    }
 
 
 @app.get("/api/items/{item_id}/versions")

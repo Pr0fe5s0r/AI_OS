@@ -74,6 +74,36 @@ def renderable(content_type: str, locator: str = "") -> bool:
     return is_image(content_type, locator)
 
 
+# What a document's pages are CALLED, in the terms its own readers use. A deck
+# has slides; nobody says "page 12 of the deck". This is not decoration: the
+# consuming application shows this word to its own users, and a knowledge base
+# that only says "34" forces every caller to re-derive the noun from the file
+# extension — which is the sort of per-format special case an API exists to
+# absorb.
+_UNITS: tuple[tuple[tuple[str, ...], str], ...] = (
+    ((".pptx",), "slide"),
+    ((".pdf",), "page"),
+)
+
+
+def unit(locator: str = "", content_type: str = "") -> str:
+    """The noun for one addressable part of this document."""
+    lowered = (locator or "").lower()
+    for suffixes, name in _UNITS:
+        if lowered.endswith(suffixes):
+            return name
+    if content_type == "application/pdf":
+        return "page"
+    return "page"
+
+
+def label(page: int | None, locator: str = "", content_type: str = "") -> str | None:
+    """`slide 34` / `page 12` — what a citation should say it came from."""
+    if page is None:
+        return None
+    return f"{unit(locator, content_type)} {page}"
+
+
 def page_key(workspace_id: str, item_id: str, page: int) -> str:
     return f"{workspace_id}/{item_id}/pages/{page}.png"
 

@@ -548,6 +548,23 @@ def page_containing(markdown: str, snippet: str) -> int | None:
 _PAGE_FLAT = re.compile(r"<!--\s*page\s+(\d+)\s*-->")
 
 
+def page_count(markdown: str) -> int:
+    """How many addressable parts this document has — pages, or slides.
+
+    Read from the `<!-- page N -->` markers the parsers write, so it needs no
+    schema change and cannot go stale. The HIGHEST marker rather than the
+    number of them: a page whose content is empty writes no marker in some
+    paths, and a count of markers would then report a deck of 79 slides as
+    having 74 — a number that disagrees with the citation saying "slide 79".
+
+    Zero for everything with no pages: pasted text, Markdown, a spreadsheet.
+    """
+    highest = 0
+    for match in _PAGE.finditer(markdown or ""):
+        highest = max(highest, int(match.group(1)))
+    return highest
+
+
 def page_of(markdown: str, node: Node) -> int | None:
     """Which page of the original a section begins on, or None.
 
@@ -625,6 +642,7 @@ __all__ = [
     "count",
     "find",
     "outline_json",
+    "page_count",
     "page_of",
     "section_text",
 ]

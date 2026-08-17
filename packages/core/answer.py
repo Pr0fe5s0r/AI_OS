@@ -125,10 +125,27 @@ class Citation:
     heading: str
     text: str
     score: float
-    # The page it was read off, when it was read from a picture rather than
-    # from text. The reader gets shown that page beside the words, which is
-    # what makes a transcribed table checkable instead of merely plausible.
+    # WHERE in the document this was read — page 12, slide 34. Returned for
+    # every document that has addressable parts, whether or not a picture of
+    # that part can be produced.
+    #
+    # It used to be returned only when the page could be RENDERED, so a deck's
+    # citation came back with page: null even though the passage came from a
+    # known slide and the body carries a marker for all 79 of them. That was a
+    # fix for our own console showing a broken image, and it cost every
+    # consuming application the ability to say "slide 34" at all. A knowledge
+    # base other applications build on cannot answer a smaller question than it
+    # knows the answer to.
     page: int | None = None
+    # The same location in the document's own words: "slide 34", "page 12".
+    # Consuming applications show this to their users, and deriving the noun
+    # from the file extension is exactly the per-format special case an API
+    # should absorb rather than export.
+    page_label: str | None = None
+    # Where the picture of that page can be fetched, or None when this document
+    # has no picture to give. STATED, so a caller never has to discover it by
+    # requesting the URL and reading a 404.
+    page_image: str | None = None
     # And where on that page, so the highlight lands on the row that was read
     # rather than leaving the reader to search the page themselves.
     regions: list[dict[str, Any]] = field(default_factory=list)
@@ -180,6 +197,8 @@ class Answer:
                     "text": c.text,
                     "score": c.score,
                     "page": c.page,
+                    "page_label": c.page_label,
+                    "page_image": c.page_image,
                     "regions": c.regions,
                 }
                 for c in self.citations
@@ -431,29 +450,45 @@ async def _attach_pages(
     change and cannot go stale: the page is derived from the body the passage
     was cut from, so it is right by construction.
     """
-    from packages.core import tree
+    from packages.core import pages, tree
     from packages.core.store import get_items_by_ids
 
-    wanted = [c for c in citations if c.page is None]
-    if not wanted:
+    if not citations:
         return
-    from packages.core import pages
-
+    # EVERY citation, not only the ones missing a page. A passage cut by the
+    # page index arrives with its page already set, and it needs the label and
+    # the picture URL just as much as one resolved here — otherwise the same
+    # document describes itself two ways depending on which retrieval mode
+    # answered, which is the exact inconsistency this function was written to
+    # remove.
+    wanted = citations
     items = await get_items_by_ids(session, scope, sorted({c.item_id for c in wanted}))
-    # Only documents whose pages can actually be RENDERED get a page number.
-    # A slide deck writes the same page markers a PDF does, so it looked like
-    # it had pages — and the citation offered a picture of slide 3 that nothing
-    # can produce, which the console rendered as a broken image. A promise the
-    # store cannot keep is worse than no promise.
-    bodies = {
-        item.id: item.body
-        for item in items
-        if pages.renderable("", item.source.locator or "")
-    }
+    # EVERY document with addressable parts gets its location, whether or not a
+    # picture of that part exists. This used to be restricted to documents that
+    # could be rendered, so a deck's citation came back with page: null — the
+    # slide was known, the marker was in the body, and the API said nothing.
+    #
+    # The original reason was sound and the remedy was aimed at the wrong
+    # layer: a citation promising a picture nothing could produce rendered as a
+    # broken image in our console. That is fixed here by SAYING whether the
+    # picture exists (`page_image`), instead of withholding the location to
+    # keep one consumer from asking for it. Applications built on this store
+    # can now cite "slide 34" and know, without probing, that there is no
+    # picture of it to fetch.
+    known = {item.id: item for item in items}
     for citation in wanted:
-        body = bodies.get(citation.item_id)
-        if body:
-            citation.page = tree.page_containing(body, citation.text)
+        item = known.get(citation.item_id)
+        if item is None:
+            continue
+        locator = item.source.locator or ""
+        # Keep a page the passage already carried; resolve one when it did not.
+        page = citation.page or tree.page_containing(item.body, citation.text)
+        if page is None:
+            continue
+        citation.page = page
+        citation.page_label = pages.label(page, locator)
+        if pages.renderable("", locator):
+            citation.page_image = f"/api/items/{citation.item_id}/pages/{page}"
 
 
 async def _write(
