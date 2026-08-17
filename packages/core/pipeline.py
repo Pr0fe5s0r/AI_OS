@@ -272,6 +272,33 @@ async def ingest_file(
             item_id = await record_failure(session, scope, ref, filename, str(exc))
             await session.commit()
         return {"item_id": item_id, "outcome": "failed", "reason": str(exc)}
+    except Exception as exc:  # noqa: BLE001 - see below; nothing may vanish here
+        # A parser can fail in ways it never anticipated: a truncated upload, a
+        # corrupt archive (zlib.error), malformed XML inside a valid zip. Those
+        # raised straight through this function, killed the job, and left NO
+        # ROW AT ALL — the file simply disappeared, and the console showed it
+        # stuck on "indexing…" forever with nothing to explain it. Found by
+        # uploading a damaged .docx through the UI.
+        #
+        # An unreadable file must land as a visible, re-runnable failure like
+        # any other. The exception type is kept in the reason because "corrupt
+        # or truncated" is a guess, and a caller reporting a bug needs to know
+        # what actually broke.
+        log.exception("could not parse %s", filename)
+        # QUALIFIED, because several standard-library exception classes are
+        # named just "error": zlib.error, csv.error, struct.error. A reason
+        # reading "could not be read (error)" tells a bug report nothing, which
+        # was the first version of this line.
+        kind = f"{type(exc).__module__}.{type(exc).__name__}".removeprefix("builtins.")
+        reason = (
+            f"{filename} could not be read ({kind}). The file may be corrupt or "
+            "incompletely uploaded — try uploading it again, or re-export it "
+            "from the application that produced it."
+        )
+        async with Session() as session:
+            item_id = await record_failure(session, scope, ref, filename, reason)
+            await session.commit()
+        return {"item_id": item_id, "outcome": "failed", "reason": reason}
 
     original = await _keep_original(scope, ref, filename, data)
     merged = {**(metadata or {}), "original": original} if original else metadata

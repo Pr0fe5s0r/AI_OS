@@ -163,7 +163,18 @@ export function Upload({
       return;
     }
     const chosen = Array.from(files);
-    setRows((r) => [...chosen.map((f) => ({ name: f.name, state: "sending" as const })), ...r]);
+    // One row per file name, so re-uploading REPLACES the previous attempt
+    // instead of stacking beside it. Retrying is the remedy a failure message
+    // tells you to try ("try uploading it again"), so it is a path people take
+    // deliberately — and it used to leave two identical rows sharing one React
+    // key, which React warns about and which made `mark` update both of them.
+    setRows((r) => {
+      const retried = new Set(chosen.map((f) => f.name));
+      return [
+        ...chosen.map((f) => ({ name: f.name, state: "sending" as const })),
+        ...r.filter((row) => !retried.has(row.name)),
+      ];
+    });
 
     for (const file of chosen) {
       try {

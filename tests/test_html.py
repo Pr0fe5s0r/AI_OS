@@ -230,3 +230,31 @@ def test_the_parser_does_not_need_a_third_party_library():
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported.add(node.module.split(".")[0])
     assert imported <= {"__future__", "re", "html", "packages"}, imported
+
+
+# ------------------- a file that breaks the parser, not the format -------------------
+
+
+def test_a_corrupt_archive_is_a_visible_failure_not_a_vanished_document():
+    """Found by uploading a damaged .docx through the console.
+
+    Only UnsupportedFormat and ScannedDocument were caught, so a corrupt zip
+    (zlib.error), truncated upload or malformed XML raised straight past the
+    handler, killed the job, and left NO ROW AT ALL. The file disappeared and
+    the UI showed it stuck on "indexing…" with nothing to explain it — the
+    silent skip R2.1 and R2.3 exist to forbid.
+    """
+    import inspect
+
+    from packages.core import pipeline
+
+    source = inspect.getsource(pipeline.ingest_file)
+    assert "except Exception" in source
+    # And it lands as a failure through the same path every other failure uses.
+    assert source.count("record_failure") >= 3
+    assert "incompletely uploaded" in source
+    # The type is kept, and QUALIFIED: zlib.error, csv.error and struct.error
+    # are all named just "error", so the first version of this reason read
+    # "could not be read (error)" — seen in the console, and useless in a bug
+    # report.
+    assert "type(exc).__module__" in source
