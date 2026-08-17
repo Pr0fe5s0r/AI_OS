@@ -97,6 +97,20 @@ def unit(locator: str = "", content_type: str = "") -> str:
     return "page"
 
 
+def has_picture(locator: str, metadata: dict[str, Any] | None = None) -> bool:
+    """Whether a picture of a page of this document can be fetched.
+
+    Two ways to be true: the document is already something we can draw (a PDF,
+    an image), or LibreOffice converted it at ingest and said so on the item.
+    Read from the item rather than by asking the object store, because a blob
+    HEAD per citation is a network round trip to answer a question the ingest
+    already knew the answer to.
+    """
+    if renderable("", locator):
+        return True
+    return bool((metadata or {}).get("render"))
+
+
 def label(page: int | None, locator: str = "", content_type: str = "") -> str | None:
     """`slide 34` / `page 12` — what a citation should say it came from."""
     if page is None:
@@ -207,6 +221,32 @@ async def count(workspace_id: str, item_id: str, locator: str = "") -> int:
         return 0
 
 
+async def source_bytes(workspace_id: str, item_id: str) -> tuple[bytes, str] | None:
+    """The file a page picture is drawn FROM.
+
+    The original when it is already a PDF or an image. Otherwise the PDF
+    LibreOffice made of it at ingest, which is what lets a slide be shown as a
+    slide rather than as the text scraped out of it. Everything downstream —
+    rendering, figure detection, cropping — then works on a PDF exactly as it
+    always has, and "page 34" means one thing whatever the document arrived as.
+    """
+    from packages.core import render
+
+    try:
+        data, content_type = await blobs.get(blobs.key_for(workspace_id, item_id))
+    except Exception:
+        data, content_type = b"", ""
+
+    if data and (renderable(content_type) or _looks_like_pdf(data)):
+        return data, content_type
+
+    try:
+        converted, _ = await blobs.get(render.key_for(workspace_id, item_id))
+    except Exception:
+        return (data, content_type) if data else None
+    return converted, "application/pdf"
+
+
 async def image(workspace_id: str, item_id: str, page: int) -> bytes | None:
     """The PNG of one page, rendered once and cached beside the original."""
     if not enabled():
@@ -217,8 +257,10 @@ async def image(workspace_id: str, item_id: str, page: int) -> bytes | None:
         return data
 
     try:
-        original, _ = await blobs.get(blobs.key_for(workspace_id, item_id))
-        png = await asyncio.to_thread(_render_sync, original, page)
+        found = await source_bytes(workspace_id, item_id)
+        if found is None:
+            return None
+        png = await asyncio.to_thread(_render_sync, found[0], page)
     except Exception:
         return None
 

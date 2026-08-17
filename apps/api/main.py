@@ -1186,7 +1186,7 @@ def _addressability(item: Any) -> dict[str, Any]:
     return {
         "pages": counted,
         "page_unit": pages.unit(locator) if counted else None,
-        "page_image": bool(counted) and pages.renderable("", locator),
+        "page_image": bool(counted) and pages.has_picture(locator, item.metadata),
     }
 
 

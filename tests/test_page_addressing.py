@@ -76,15 +76,15 @@ def test_the_location_is_no_longer_withheld_from_unrenderable_documents():
     source = inspect.getsource(answer._attach_pages)
     # Renderability may gate the PICTURE and nothing else, so the location is
     # already assigned by the time it is consulted.
-    assert source.index("citation.page = page") < source.index("pages.renderable")
-    assert source.index("citation.page_label") < source.index("pages.renderable")
+    assert source.index("citation.page = page") < source.index("pages.has_picture")
+    assert source.index("citation.page_label") < source.index("pages.has_picture")
     assert "citation.page_image" in source
 
 
 def test_the_picture_url_is_offered_only_when_there_is_a_picture():
     source = inspect.getsource(answer._attach_pages)
     picture = source.split("citation.page_label")[1]
-    assert "pages.renderable" in picture
+    assert "pages.has_picture" in picture
     assert "/pages/" in picture
 
 
@@ -127,12 +127,23 @@ def test_a_deck_declares_slides_but_no_pictures():
     from apps.api.main import _addressability
     from packages.shared.schema import SourceRef
 
-    class _Item:
+    class _NotYetConverted:
         body = DECK
+        metadata: dict = {}
         source = SourceRef(source="upload", locator="lecture.pptx")
 
-    declared = _addressability(_Item())
-    assert declared == {"pages": 79, "page_unit": "slide", "page_image": False}
+    assert _addressability(_NotYetConverted()) == {
+        "pages": 79, "page_unit": "slide", "page_image": False,
+    }
+
+    # And once LibreOffice has converted it, the same deck says it HAS one —
+    # without the caller probing an endpoint to find out either way.
+    class _Converted(_NotYetConverted):
+        metadata = {"render": {"format": "pdf", "engine": "libreoffice"}}
+
+    assert _addressability(_Converted()) == {
+        "pages": 79, "page_unit": "slide", "page_image": True,
+    }
 
 
 def test_a_pdf_declares_pages_and_pictures():
@@ -140,7 +151,8 @@ def test_a_pdf_declares_pages_and_pictures():
     from packages.shared.schema import SourceRef
 
     class _Item:
-        body = DECK.replace("page", "page")  # same markers, different origin
+        body = DECK  # same markers, different origin
+        metadata: dict = {}
         source = SourceRef(source="upload", locator="book.pdf")
 
     declared = _addressability(_Item())

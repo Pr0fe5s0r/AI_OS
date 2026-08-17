@@ -487,7 +487,7 @@ async def _attach_pages(
             continue
         citation.page = page
         citation.page_label = pages.label(page, locator)
-        if pages.renderable("", locator):
+        if pages.has_picture(locator, item.metadata):
             citation.page_image = f"/api/items/{citation.item_id}/pages/{page}"
 
 

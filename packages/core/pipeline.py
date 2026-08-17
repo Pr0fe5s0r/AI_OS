@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import mimetypes
 import os
@@ -9,6 +10,7 @@ from datetime import datetime
 from typing import Any
 
 from arq.connections import RedisSettings
+from sqlalchemy import text
 
 from packages.core import blobs, chunks, graph, pages
 from packages.core import chunk as chunk_module
@@ -214,6 +216,16 @@ async def _store(
         await redis.enqueue_job(
             "classify_new_item", scope.workspace_id, scope.collection_id, result.item.id, suggested
         )
+        # A deck or a Word document gets converted to PDF so its pages can be
+        # looked at. Queued rather than done here: it is tens of seconds of CPU
+        # for a long deck, and nothing about the document's searchability waits
+        # on it.
+        from packages.core import render
+
+        if render.convertible(source.locator or ""):
+            await redis.enqueue_job(
+                "render_item", scope.workspace_id, scope.collection_id, result.item.id
+            )
 
     return {
         "item_id": result.item.id,
@@ -324,6 +336,71 @@ async def ingest_text(
     ref = SourceRef(source=source, locator=locator, url=url, fetched_at=datetime.now())
     parsed = normalise_text(body, title=title, source_name=locator)
     return await _store(ctx, scope, ref, parsed, period_start, period_end, metadata, suggested)
+
+
+async def render_item(
+    ctx: dict[str, Any], workspace_id: str, collection_id: str | None, item_id: str
+) -> dict[str, Any]:
+    """Convert an Office document to PDF so its pages can be looked at.
+
+    A separate job for the same reason embedding is: converting a long deck is
+    tens of seconds of CPU, and the upload has already returned. The document
+    is indexed and answerable throughout — this only decides whether a citation
+    from it can also show the slide.
+
+    Records what it did ON THE ITEM, so every later reader (the item route, a
+    citation, the console) learns that a picture exists by reading the document
+    rather than by asking the object store. A blob HEAD per citation would be a
+    network round trip to answer a question the ingest already knew.
+    """
+    from packages.core import render
+
+    scope = _scope(workspace_id, collection_id)
+    async with Session() as session:
+        item = await get_item(session, scope, item_id)
+    if item is None:
+        return {"item_id": item_id, "outcome": "gone"}
+
+    filename = (item.source.locator if item.source else "") or ""
+    if not render.available() or not render.convertible(filename):
+        return {"item_id": item_id, "outcome": "skipped"}
+
+    original = (item.metadata or {}).get("original") or {}
+    if not original or not blobs.enabled():
+        # Nothing kept to convert FROM. The document is fine; it simply has no
+        # picture, which is what it already said.
+        return {"item_id": item_id, "outcome": "no_original"}
+
+    try:
+        data, _ = await blobs.get(blobs.key_for(scope.workspace_id, item_id))
+        pdf = await render.to_pdf(data, filename)
+    except Exception as exc:  # noqa: BLE001 - a picture is never worth the item
+        log.warning("render failed for %s: %s", item_id, exc)
+        return {"item_id": item_id, "outcome": "failed", "reason": type(exc).__name__}
+
+    if pdf is None:
+        return {"item_id": item_id, "outcome": "unconvertible"}
+
+    await blobs.put(render.key_for(scope.workspace_id, item_id), pdf, "application/pdf")
+    async with Session() as session:
+        await session.execute(
+            text(
+                """
+                UPDATE kb_items
+                SET metadata = metadata || jsonb_build_object(
+                        'render', CAST(:render AS jsonb))
+                WHERE workspace_id = :workspace AND item_id = :item
+                """
+            ),
+            {
+                "render": json.dumps({"format": "pdf", "engine": "libreoffice",
+                                      "bytes": len(pdf)}),
+                "workspace": scope.workspace_id,
+                "item": item_id,
+            },
+        )
+        await session.commit()
+    return {"item_id": item_id, "outcome": "rendered", "bytes": len(pdf)}
 
 
 async def embed_item(
@@ -491,7 +568,14 @@ async def summarize_item(
 class WorkerSettings:
     """arq worker entry point."""
 
-    functions = [ingest_file, ingest_text, embed_item, classify_new_item, summarize_item]
+    functions = [
+        ingest_file,
+        ingest_text,
+        embed_item,
+        render_item,
+        classify_new_item,
+        summarize_item,
+    ]
     redis_settings = redis_settings()
     max_tries = 3
     job_timeout = JOB_TIMEOUT_SECONDS

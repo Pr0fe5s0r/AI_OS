@@ -16,6 +16,7 @@ from packages.core.pipeline import (
     ingest_file,
     ingest_text,
     redis_settings,
+    render_item,
     summarize_item,
 )
 
@@ -93,7 +94,7 @@ def _schedule() -> list:
 
 class WorkerSettings:
     functions = [
-        ingest_file, ingest_text, embed_item, classify_new_item,
+        ingest_file, ingest_text, embed_item, render_item, classify_new_item,
         summarize_item, delete_company_job,
     ]
     cron_jobs = _schedule()
