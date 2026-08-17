@@ -439,10 +439,28 @@ class CsvParser:
         lines += ["| " + " | ".join(row) + " |" for row in body]
 
         return Normalised(
-            title=title_from("\n".join(lines), filename),
+            # The FILENAME, not the first line. A CSV's first line is its
+            # header row, so title_from produced documents called
+            # "| Ticket | Client | Hours | Status |" — seen in the format
+            # matrix, and it is what a person reads in every result list, every
+            # citation and every deletion dialog. A file of pure data has no
+            # title inside it; the name somebody gave the file is the best one
+            # available.
+            title=_title_from_filename(filename),
             body="\n".join(lines),
             metadata={"format": "csv", "rows": len(rows)},
         )
+
+
+def _title_from_filename(filename: str) -> str:
+    """`quarterly-spend_2026.csv` -> `Quarterly spend 2026`."""
+    stem = filename.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    for extension in (".csv", ".tsv"):
+        if stem.lower().endswith(extension):
+            stem = stem[: -len(extension)]
+            break
+    words = " ".join(stem.replace("_", " ").replace("-", " ").split())
+    return (words[:1].upper() + words[1:])[:200] or filename
 
 
 __all__ = ["CsvParser", "PptxParser", "XlsxParser"]

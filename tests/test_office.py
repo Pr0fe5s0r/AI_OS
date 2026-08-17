@@ -348,3 +348,13 @@ def test_the_real_project_workbook_reads_correctly():
     passed while this did not."""
     body = normalise(_real_world_xlsx(), "Project-Management-Sample-Data.xlsx").body
     assert "| Market Research | 2024-01-01 | 78% |" in body
+
+
+def test_a_csv_is_titled_by_its_filename_not_by_its_header_row():
+    """A CSV's first line is its header, so title_from produced documents
+    called "| Ticket | Client | Hours | Status |" — found in the format matrix,
+    and it is what a person reads in every result list, every citation and
+    every deletion dialog. A file of pure data has no title inside it."""
+    data = b"Ticket,Client,Hours\nT-1041,Gharsoaps,6.5\n"
+    assert normalise(data, "quarterly-spend_2026.csv").title == "Quarterly spend 2026"
+    assert "|" not in normalise(data, "tickets.csv").title

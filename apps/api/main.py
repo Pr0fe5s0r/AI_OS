@@ -66,6 +66,7 @@ from packages.core.erasure import (
     preview_item_deletion,
 )
 from packages.core.erasure import delete_item as delete_item_and_index
+from packages.core.formats import contract as format_contract
 from packages.core.graph import chunk_lineage as graph_lineage
 from packages.core.graph import chunk_neighbours as graph_neighbours
 from packages.core.keys import Escalation, create_key, list_keys, revoke_key
@@ -401,9 +402,15 @@ async def ingest_file_item(
 
 
 @app.get("/api/formats")
-async def formats() -> dict[str, list[str]]:
-    """Which file types can be ingested today."""
-    return {"supported": list(supported())}
+async def formats() -> dict[str, Any]:
+    """The format contract: what is parsed, what a passage looks like when it
+    is, what is dropped, and what to convert before uploading.
+
+    Versioned, because a platform building conversion logic on its own side
+    needs to know when this list changes. `supported` is still a flat list of
+    extensions for callers written against the older shape.
+    """
+    return format_contract()
 
 
 # ----------------------------- retrieval contract -----------------------------

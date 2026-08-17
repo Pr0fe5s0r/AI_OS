@@ -539,6 +539,7 @@ class ImageParser:
         raise PictureDocument(f"{filename} is an image; its content is in the pixels", page_count=1)
 
 
+from packages.core.html_page import HtmlParser  # noqa: E402
 from packages.core.office import CsvParser, PptxParser, XlsxParser  # noqa: E402
 
 _REGISTRY: list[Parser] = [
@@ -548,6 +549,7 @@ _REGISTRY: list[Parser] = [
     PptxParser(),
     XlsxParser(),
     CsvParser(),
+    HtmlParser(),
     ImageParser(),
 ]
 
