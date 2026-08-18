@@ -19,15 +19,22 @@ BASE = "http://localhost:8000"
 class FakeLLM:
     """An OpenAI-compatible stub that says whatever the test needs it to."""
 
-    def __init__(self, reply: str) -> None:
+    def __init__(self, reply: str, prose: str = "Owners review activation [P1].") -> None:
         self.reply = reply
+        self.prose = prose
+        self.systems: list[str] = []
         self.prompts: list[str] = []
         self.chat = self  # completions.create is reached as llm.chat.completions.create
         self.completions = self
 
     def create(self, *, model, messages, temperature=0.0):  # noqa: ARG002
         self.prompts.append(messages[-1]["content"])
-        message = type("M", (), {"content": self.reply})
+        self.systems.append(messages[0]["content"])
+        # The second call composes prose from the findings. A stub that
+        # returned JSON there would hide whether the split happened at all.
+        composing = "you write a short answer" in messages[0]["content"].lower()
+        content = self.prose if composing else self.reply
+        message = type("M", (), {"content": content})
         return type("R", (), {"choices": [type("C", (), {"message": message})]})
 
 
@@ -191,7 +198,9 @@ def test_a_pattern_has_nowhere_to_put_an_identifier():
     """Not stripped late — the type has no field for a document id, a
     workspace, or a quotation."""
     fields = set(Pattern.__dataclass_fields__)
-    assert fields == {"statement", "workspaces", "confidence"}
+    assert fields == {"statement", "workspaces", "confidence", "id"}
+    # `id` is "P1" — a label for the finding itself, which is what the answer
+    # cites. It is not a document id and there is nowhere to put one.
 
 
 def test_the_report_is_serialisable_without_leaking_structure():
@@ -204,12 +213,13 @@ def test_the_report_is_serialisable_without_leaking_structure():
     payload = report.as_dict()
     assert set(payload) == {
         "question",
+        "answer",
         "patterns",
         "workspaces_searched",
         "passages_considered",
         "withheld",
     }
-    assert set(payload["patterns"][0]) == {"statement", "workspaces", "confidence"}
+    assert set(payload["patterns"][0]) == {"id", "statement", "workspaces", "confidence"}
 
 
 def test_a_report_says_what_it_refused():
@@ -262,7 +272,7 @@ def test_a_collection_handle_names_its_workspace_only_when_asked():
 _LAST_LLM: FakeLLM
 
 
-def _two_workspace_run(reply: str) -> PatternReport:
+def _two_workspace_run(reply: str, prose: str = "Owners review activation [P1].") -> PatternReport:
     """Two tenants, one document each, saying much the same thing."""
     global _LAST_LLM
 
@@ -295,7 +305,7 @@ def _two_workspace_run(reply: str) -> PatternReport:
             },
         )
 
-    _LAST_LLM = FakeLLM(reply)
+    _LAST_LLM = FakeLLM(reply, prose)
     return extract(store(handler), "how is onboarding handled?", llm=_LAST_LLM, model="m")
 
 
@@ -439,3 +449,119 @@ def test_support_survives_paraphrase():
         "cases that test performance under specific concurrency and timing constraints."
     )
     assert supported_by(statement, groups) == 2
+
+
+# ------------- the answer, and what composes it -------------
+
+
+def test_the_caller_gets_an_answer_not_just_a_list():
+    """The reason any of this exists. The caller asked a question and may not
+    see the material, so an answer is the deliverable — a bare list of
+    statements makes them do the synthesis against data they cannot read."""
+    report = _two_workspace_run(
+        '{"patterns": [{"statement": "Activation is reviewed after two weeks", "groups": 2}]}'
+    )
+    assert report.answer
+    assert "[P1]" in report.answer
+
+
+def test_findings_are_labelled_for_citation():
+    report = _two_workspace_run(
+        '{"patterns": [{"statement": "Activation is reviewed after two weeks", "groups": 2},'
+        ' {"statement": "Reviews are run by a named owner of activation", "groups": 2}]}'
+    )
+    assert [p.id for p in report.patterns] == ["P1", "P2"]
+
+
+def test_the_composing_call_never_sees_a_passage():
+    """The structural half of the guarantee. One call reads the tenants'
+    material and may only emit sanitised findings; the other writes for the
+    caller and is shown nothing but those findings. It cannot leak a passage
+    because it never receives one.
+    """
+    _two_workspace_run(
+        '{"patterns": [{"statement": "Activation is reviewed after two weeks", "groups": 2}]}'
+    )
+    composing = [
+        prompt
+        for prompt, system in zip(_LAST_LLM.prompts, _LAST_LLM.systems)
+        if "you write a short answer" in system.lower()
+    ]
+    assert len(composing) == 1
+    for passage_text in ("14-day", "Acme", "Globex", "reviews activation after two weeks"):
+        assert passage_text not in composing[0], composing[0]
+
+
+def test_an_answer_that_leaks_is_withheld_whole():
+    """Belt and braces: the composer should be incapable of naming a tenant,
+    having never seen one — but that is reasoning, and this module does not
+    rely on reasoning anywhere else."""
+    report = _two_workspace_run(
+        '{"patterns": [{"statement": "Activation is reviewed after two weeks", "groups": 2}]}',
+        prose="Acme reviews activation after two weeks [P1].",
+    )
+    assert report.answer == ""
+    assert any("composed answer" in w for w in report.withheld)
+
+
+def test_no_findings_means_no_answer():
+    report = _two_workspace_run('{"patterns": []}')
+    assert report.patterns == []
+    assert report.answer == ""
+
+
+def test_a_sentence_beyond_the_findings_is_dropped():
+    """Measured on a real run: the composer answered faithfully in one
+    sentence, then added a second about what teams track after launch — which
+    no surviving finding said — and cited [P1] for it anyway. An unsupported
+    claim wearing a citation is worse than no answer.
+    """
+    report = _two_workspace_run(
+        '{"patterns": [{"statement": "Activation is reviewed after two weeks", "groups": 2}]}',
+        prose=(
+            "Activation is reviewed after two weeks [P1]. "
+            "Procurement rejects vendors lacking ISO certification and audits them yearly [P1]."
+        ),
+    )
+    assert report.answer == "Activation is reviewed after two weeks [P1]."
+    assert any("beyond the findings" in w for w in report.withheld)
+    # One finding, so one sentence. The extra sentence is where an invented
+    # claim appears, because there is no finding left for it to be about.
+
+
+def test_a_faithful_answer_is_left_alone():
+    report = _two_workspace_run(
+        '{"patterns": [{"statement": "Activation is reviewed after two weeks by a named owner", "groups": 2}]}',
+        prose="A named owner reviews activation after two weeks [P1].",
+    )
+    assert report.answer == "A named owner reviews activation after two weeks [P1]."
+    assert not any("beyond the findings" in w for w in report.withheld)
+
+
+# ------------- one client's own detail, not just its identity -------------
+
+
+def test_a_clients_regions_are_not_publishable():
+    """Measured on a real run: an otherwise clean answer read "revenue is
+    reported by region ... such as Iberia, Nordics, DACH and Benelux". Nobody
+    is called Iberia, so no identity check caught it — but which markets a
+    client trades in is its business, and the contract forbids client-specific
+    facts, not merely client names."""
+    from markvector.patterns import names_a_specific, specifics
+
+    known = specifics(["| region | revenue | Iberia 42.6 | Nordics 31.8 | Benelux 12.0 |"])
+    assert "Iberia" in known
+    assert names_a_specific(
+        "Revenue is reported by region, covering Iberia, Nordics and Benelux.", known
+    )
+
+
+def test_public_vocabulary_is_not_mistaken_for_client_detail():
+    """The counter-test. Acronyms are overwhelmingly public — OSI, GBP, HTTP —
+    and refusing them would cost real answers to protect nothing. A word that
+    merely opens a sentence is not a proper noun either."""
+    from markvector.patterns import names_a_specific, specifics
+
+    known = specifics(["The OSI model has seven layers. Figures in millions of GBP."])
+    assert names_a_specific("The OSI model separates network functions.", known) is None
+    assert names_a_specific("Revenue is reported in a tabular format.", known) is None

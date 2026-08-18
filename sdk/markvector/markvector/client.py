@@ -306,23 +306,40 @@ class Markvector:
         collection: str = "default",
         workspaces: _List[str] | None = None,
         per_workspace: int = 6,
-        min_workspaces: int = 2,
+        min_workspaces: int = 1,
     ) -> Any:
-        """What several tenants have in COMMON, said in a way that names none.
+        """Answer a question across several tenants without exposing any of them.
 
             report = mv.patterns(
                 "how do teams handle onboarding?",
                 llm=OpenAI(...), model="...",
             )
-            for pattern in report.patterns:
-                print(pattern)     # "activation is reviewed on a two-week cycle…"
+            print(report.answer)       # "Teams assign a named owner [P1]…"
+            for finding in report.patterns:
+                print(finding)         # "P1: activation is reviewed…"
 
-        Only for multi-workspace work, and deliberately not a search: it
-        returns generalisations with no client named, no document identified
-        and no passage quoted. A pattern is emitted only when at least
-        `min_workspaces` distinct workspaces support it — a fact true of one
-        client cannot survive that rule — and anything the model writes is
-        inspected for identifiers before it is returned.
+        This exists for DATA PROTECTION, not for pattern discovery. The caller
+        holds one credential over several clients' material and is not
+        permitted to see that material, so the raw passages never leave: what
+        comes back is prose answering the question, citing sanitised findings
+        as [P1], [P2]. The findings ARE the citations — there is no document to
+        point at, and pointing at one would defeat the purpose.
+
+        Three defences, in order: passages are redacted before the model
+        sees them; everything the model writes is inspected for identifiers
+        before it is returned; and support is counted across workspaces and
+        reported on every finding.
+
+        That count is REPORTED by default, not enforced — the question was
+        asked to be answered, and refusing to answer it does not protect
+        anybody. Measured: the same question, put twice, returned nothing
+        under a two-workspace gate and a correct answer without it, the
+        difference being only how the model happened to word a finding that
+        three workspaces supported either way. Pass `min_workspaces=2` where
+        corroboration must be a condition of speaking rather than a property
+        of the answer. The prose is composed by a second call that is
+        shown only the surviving findings, never a passage, so it cannot reveal
+        what it never received.
 
         Single-workspace work is untouched: search() and answer() behave
         exactly as they always have, with no redaction and no generalisation,

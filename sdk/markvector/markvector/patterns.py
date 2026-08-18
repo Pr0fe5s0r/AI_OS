@@ -73,6 +73,25 @@ MAX_EXCERPT_CHARS = 320
 # own number is advisory at most.
 SUPPORT_RATIO = 0.25
 
+# How much of a composed SENTENCE must already be present in the findings.
+# Higher than SUPPORT_RATIO because this is a different comparison: support
+# matches a short statement against long passages, whereas the answer is meant
+# to be a rewording of the findings and nothing else, so it should share most
+# of their vocabulary. Measured on a real run: a faithful sentence scored 1.00
+# against the finding it cited and a fabricated one — "after launch they track
+# performance metrics", which no surviving finding said, cited [P1] anyway —
+# scored 0.36.
+# A ratio alone punishes length: a longer, better-written statement needs
+# proportionally more matches to clear the same bar, and once the prompt asked
+# for answers rather than terse generalisations, true statements grew to twenty
+# stems and started failing. Measured on real runs — "a key driver for
+# launching a product is responding to competitive pricing", supported by two
+# workspaces whose material says "competitor pricing moved in January", shared
+# 4 stems of 18 and scored 0.22. An absolute floor of three distinctive stems
+# admits it while still refusing an invented statement, which shared at most
+# two anywhere.
+MIN_SHARED_STEMS = 3
+
 # Words too common to be evidence of anything. Deliberately short: this list
 # exists to stop "the", "with" and the vocabulary of the question itself from
 # making every group look like it supports every statement, not to do topic
@@ -129,7 +148,7 @@ def supported_by(statement: str, groups: list[list[str]]) -> int:
     count = 0
     for excerpts in groups:
         shared = words & _stems(" ".join(excerpts))
-        if len(shared) / len(words) >= SUPPORT_RATIO:
+        if len(shared) >= MIN_SHARED_STEMS or len(shared) / len(words) >= SUPPORT_RATIO:
             count += 1
     return count
 
@@ -148,9 +167,14 @@ class Pattern:
     # evidence, the identity is not.
     workspaces: int
     confidence: float = 0.0
+    # What the answer cites instead of a document: "P1", "P2". A citation has
+    # to point at something, and the only thing safe to point at is the
+    # sanitised finding itself — never the passage it came from.
+    id: str = ""
 
     def __str__(self) -> str:
-        return f"{self.statement}  (seen in {self.workspaces} workspaces)"
+        label = f"{self.id}: " if self.id else ""
+        return f"{label}{self.statement}  (seen in {self.workspaces} workspaces)"
 
 
 @dataclass(slots=True)
@@ -158,6 +182,11 @@ class PatternReport:
     """What a cross-workspace run produced, and what it refused to produce."""
 
     question: str
+    # The sanitised prose answering the question, citing [P1], [P2]. This is
+    # the point of the whole exercise: the caller asked something and gets an
+    # answer, rather than raw passages that would carry another client's data
+    # across the boundary.
+    answer: str = ""
     patterns: list[Pattern] = field(default_factory=list)
     workspaces_searched: int = 0
     passages_considered: int = 0
@@ -170,8 +199,14 @@ class PatternReport:
     def as_dict(self) -> dict[str, Any]:
         return {
             "question": self.question,
+            "answer": self.answer,
             "patterns": [
-                {"statement": p.statement, "workspaces": p.workspaces, "confidence": p.confidence}
+                {
+                    "id": p.id,
+                    "statement": p.statement,
+                    "workspaces": p.workspaces,
+                    "confidence": p.confidence,
+                }
                 for p in self.patterns
             ],
             "workspaces_searched": self.workspaces_searched,
@@ -348,26 +383,61 @@ def distinctive(
 
 # ------------------------------- the prompt -------------------------------
 
-_SYSTEM = """You find PATTERNS across the working practices of several
-different companies, and you report them in a way that identifies none of them.
+_SYSTEM = """You ANSWER A QUESTION using material from several different
+companies, and your answer must identify none of them.
+
+This is not a summarising exercise and not a search. The caller may not see
+the material itself — it belongs to other people — so your job is to say what
+it establishes, in your own words, with nothing in it that could point back at
+whose material it was.
 
 You will be given short, already-redacted excerpts. Each is labelled only with
 an anonymous group number. You never learn which company any group is.
 
-Write patterns that hold across TWO OR MORE groups. A pattern is a general
-practice, a recurring problem, or a shared shape of work — never an event, a
-number, a name, or anything that happened to one group.
+Write FINDINGS that answer the question. A finding is a statement of substance
+— a practice, a rule, a constraint, a recurring problem. Prefer what holds
+across more than one group, but a finding that genuinely answers the question
+is worth stating even when fewer groups show it: the caller asked something,
+and an empty answer to an answerable question helps nobody.
 
 Rules, all of them absolute:
   * Never name a company, product, person, place, or document.
-  * Never quote an excerpt. Say what they have in common, in your own words.
+  * Never name a region, market, site, team or system taken from the material.
+    Say "several regions" or "each region", never which ones. Naming them is
+    the single most common way one of these answers goes wrong: nobody is
+    called "Iberia", so it feels safe, but which markets a client trades in is
+    that client's business and not a practice worth reporting.
+  * Never quote an excerpt. Say what it establishes, in your own words.
   * Never mention group numbers, ids, dates, or amounts.
-  * Never say "one group" or "another group" — if only one shows it, leave it out.
-  * If nothing is shared across groups, return an empty list. An empty answer
-    is correct far more often than an invented pattern.
+  * Never say "one group" or "another group".
+  * If the material does not answer the question, return an empty list. An
+    empty answer is correct far more often than an invented one.
 
 Reply with JSON only:
 {"patterns": [{"statement": "...", "groups": 2, "confidence": 0.0-1.0}]}"""
+
+
+# The second call sees ONLY the findings that already survived redaction and
+# inspection — never a passage. That is what makes it structurally safe: it
+# cannot leak what it was never shown, so the worst it can do is phrase badly.
+_COMPOSE = """You write a short answer to a question, using ONLY the numbered
+findings you are given.
+
+Cite the findings you use as [P1], [P2] — those labels are the whole citation
+system here. There is no document to cite: the findings came from material the
+reader is not permitted to see, and naming its source would defeat the point.
+
+Rules:
+  * Use only what the findings say. Add no fact, number, name or example.
+  * Cite every claim you make, as [P1] or [P1][P2].
+  * Write ONE sentence per finding, in order, each citing its own label.
+    Do not add a summary sentence, a conclusion, or anything the findings do
+    not already say. Plain prose, no preamble, no bullet list.
+  * Never mention companies, groups, workspaces, documents or excerpts.
+  * Never name a region, market, site or system, even if a finding does. Write
+    "several regions" instead. If a finding cannot be stated without naming
+    one, leave that finding out.
+  * If the findings do not answer the question, say so in one sentence."""
 
 
 def _clean_json(raw: str) -> dict[str, Any]:
@@ -388,6 +458,28 @@ def _clean_json(raw: str) -> dict[str, Any]:
 # ------------------------------ the inspection ------------------------------
 
 _BANNED_SHAPES = (_EMAIL, _URL, _HEX_ID, _MONEY, _DATE, _LONG_NUMBER)
+
+
+def specifics(passages: list[str]) -> set[str]:
+    """Proper nouns lifted from the tenants' own material.
+
+    Not identities — nobody is called "Iberia" — but client-specific FACTS,
+    which the contract forbids just as firmly: which markets a client trades
+    in is its business, not a practice worth reporting. Measured, an otherwise
+    clean answer read "revenue is reported by region ... such as Iberia,
+    Nordics, DACH and Benelux", every one of them lifted from one client's
+    segment table.
+
+    Title-Case words only, and never ALL-CAPS. Acronyms are overwhelmingly
+    public vocabulary in this material — OSI, GBP, HTTP — and refusing them
+    would cost real answers to protect nothing.
+    """
+    found: set[str] = set()
+    for text in passages:
+        for word in re.findall(r"\b[A-Z][a-z]{3,}\b", text):
+            if word.lower() not in _TOO_COMMON:
+                found.add(word)
+    return found
 
 
 def leaks(statement: str, identifiers: set[str]) -> str | None:
@@ -411,6 +503,27 @@ def leaks(statement: str, identifiers: set[str]) -> str | None:
     if re.search(r"\bgroup\s*\d", lowered):
         return "refers to a group number"
     return None
+
+
+def names_a_specific(statement: str, known: set[str]) -> str | None:
+    """Whether a statement carries a proper noun taken from the material.
+
+    Sentence-opening words are skipped: "Revenue is reported…" must not be
+    refused because "Revenue" happens to be capitalised there.
+    """
+    for sentence in _SENTENCE.split(statement.strip()):
+        tokens = re.findall(r"\b[A-Z][a-z]{3,}\b", sentence)
+        if tokens and _opens_with_capital(sentence):
+            tokens = tokens[1:]
+        for token in tokens:
+            if token in known:
+                return f"names {token!r}, which is one client's own detail"
+    return None
+
+
+def _opens_with_capital(sentence: str) -> bool:
+    first = re.match(r"\s*([A-Za-z']+)", sentence)
+    return bool(first and first.group(1)[:1].isupper())
 
 
 # -------------------------------- the run --------------------------------
@@ -473,9 +586,15 @@ def extract(
         names |= _identifiers(workspace, hits.matches)
         weak = _filename_words(workspace, [h.source for h in hits.matches])
         weak |= _filename_words(workspace, hits.matches)
-        excerpts = [
-            (h.clean_excerpt or h.excerpt or "")[:MAX_EXCERPT_CHARS] for h in hits.matches
-        ]
+        # Every passage each document matched on, not only the winning one.
+        # Taking just the headline excerpt left a question that answer() had
+        # resolved from five passages arriving here as one, and the model was
+        # then asked to answer from a fifth of the evidence — which it
+        # correctly declined to do.
+        excerpts: list[str] = []
+        for hit in hits.matches:
+            texts = hit.passages or [hit.clean_excerpt or hit.excerpt or ""]
+            excerpts.extend(text[:MAX_EXCERPT_CHARS] for text in texts if text.strip())
         excerpts = [e for e in excerpts if e.strip()]
         if not excerpts:
             continue
@@ -502,6 +621,10 @@ def extract(
         candidates, [" ".join(e) for e in raw], filename_words
     )
     groups = [[redact(e, identifiers) for e in excerpts] for excerpts in raw]
+    # Proper nouns belonging to the material itself — regions, sites, product
+    # names. Not identities, but one client's own detail, which the contract
+    # forbids exposing just as firmly as its name.
+    own_detail = specifics([excerpt for group in groups for excerpt in group])
     prompt = "\n\n".join(
         f"GROUP {n}:\n" + "\n".join(f"- {e}" for e in excerpts)
         for n, excerpts in enumerate(groups, start=1)
@@ -535,7 +658,7 @@ def extract(
                 f"only {supported} workspace(s) supported: {statement[:60]}…"
             )
             continue
-        why = leaks(statement, identifiers)
+        why = leaks(statement, identifiers) or names_a_specific(statement, own_detail)
         if why:
             report.withheld.append(f"withheld ({why})")
             continue
@@ -547,9 +670,91 @@ def extract(
                 statement=statement,
                 workspaces=min(supported, report.workspaces_searched),
                 confidence=round(float(row.get("confidence") or 0.0), 2),
+                id=f"P{len(report.patterns) + 1}",
             )
         )
+
+    # SECOND CALL: the prose answer. It is composed from the surviving
+    # findings ALONE — every one of which has already been redacted and
+    # inspected — so this step cannot reveal a passage it never received.
+    # Splitting it in two is the point: one call reads the tenants' material
+    # and may only emit sanitised findings; the other writes for the caller and
+    # never sees the material at all.
+    if report.patterns:
+        report.answer = _compose(
+            question, report.patterns, llm, model, identifiers, own_detail, report
+        )
     return report
+
+
+def _compose(
+    question: str,
+    patterns: list[Pattern],
+    llm: Any,
+    model: str,
+    identifiers: set[str],
+    own_detail: set[str],
+    report: PatternReport,
+) -> str:
+    """Turn the surviving findings into an answer that cites them as [P1]."""
+    numbered = "\n".join(f"{p.id}: {p.statement}" for p in patterns)
+    try:
+        reply = llm.chat.completions.create(
+            model=model,
+            temperature=0.0,
+            messages=[
+                {"role": "system", "content": _COMPOSE},
+                {"role": "user", "content": f"QUESTION: {question}\n\nFINDINGS:\n{numbered}"},
+            ],
+        )
+        text = (reply.choices[0].message.content or "").strip()
+    except Exception as exc:  # noqa: BLE001 - the findings still stand without prose
+        report.withheld.append(f"the answer could not be composed: {type(exc).__name__}")
+        return ""
+
+    # Inspected like everything else. It should be incapable of leaking, having
+    # seen only sanitised text — but "should be incapable" is exactly the kind
+    # of reasoning this module refuses to rely on anywhere else.
+    why = leaks(text, identifiers) or names_a_specific(text, own_detail)
+    if why:
+        report.withheld.append(f"the composed answer was withheld ({why})")
+        return ""
+    return _faithful(text, patterns, report)
+
+
+_SENTENCE = re.compile(r"(?<=[.!?])\s+")
+
+
+def _faithful(text: str, patterns: list[Pattern], report: PatternReport) -> str:
+    """Keep the answer within the findings it was given, structurally.
+
+    An earlier version scored each sentence's word overlap against the
+    findings and dropped the low scorers. That is unsound, and measuring it
+    said so: two faithful sentences that paraphrased well ("labelled as
+    partial" written as "clearly marked as incomplete") scored 0.29 and 0.33,
+    while a sentence that invented a claim about post-launch tracking scored
+    0.36. Overlap separates rewording from invention not at all, and the cost
+    of guessing was an empty answer sitting above a perfectly good finding.
+
+    So the bound is structural instead: the composer is asked for one sentence
+    per finding, and gets no more than that. An extra sentence is where a
+    fabricated claim appears — there is no finding left for it to be about —
+    and dropping it costs nothing, because every finding has already been
+    stated by the time it arrives.
+
+    This is not a grounding check and does not pretend to be one. The privacy
+    guarantee does not rest on it: the composer only ever sees findings that
+    were already redacted and inspected, so the worst an over-reaching
+    sentence can do is be wrong, never disclose.
+    """
+    sentences = [s.strip() for s in _SENTENCE.split(text.strip()) if s.strip()]
+    if len(sentences) <= len(patterns):
+        return " ".join(sentences)
+    for extra in sentences[len(patterns):]:
+        report.withheld.append(
+            f"a sentence beyond the findings was dropped: {extra[:60]}…"
+        )
+    return " ".join(sentences[: len(patterns)])
 
 
 __all__ = [

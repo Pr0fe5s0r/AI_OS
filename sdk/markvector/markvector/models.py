@@ -298,6 +298,13 @@ class Match:
     # walk from this hit to what sits near it in meaning.
     chunk_id: str = ""
     categories: list[Category] = field(default_factory=list)
+    # EVERY passage this document matched on, best first — not just the one
+    # that won. `excerpt` is the headline; a document usually matches on
+    # several, and a caller reasoning over the result (rather than displaying
+    # it) wants all of them. Measured: a question answered from five passages
+    # by answer() reached the cross-workspace path as one, because only the
+    # winner survived this model.
+    passages: list[str] = field(default_factory=list)
 
     @property
     def matched_on(self) -> str:
@@ -328,6 +335,11 @@ class Match:
             keyword=float(d.get("keyword", 0) or 0),
             chunk_id=(passages[0].get("chunk_id", "") if passages else ""),
             categories=[Category.from_json(c) for c in d.get("classes") or []],
+            passages=[
+                text
+                for text in (str(p.get("text") or "").strip() for p in passages)
+                if text
+            ],
         )
 
 
