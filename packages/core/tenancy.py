@@ -82,6 +82,9 @@ async def resolve_caller(
             # makes to that one collection. Read by workspace_scope and
             # enforce_binding, never trusted from the request.
             "collection_id": holder.get("collection_id"),
+            # The workspaces this key was explicitly granted, or None for the
+            # ordinary kind. Never read from the request — only from the key.
+            "workspaces": holder.get("workspaces"),
             "rate_limits": holder.get("rate_limits") or {},
             "via": "api_key",
             "client": x_markvector_client,
@@ -177,6 +180,32 @@ def require_manage(principal: dict[str, Any]) -> None:
         )
 
 
+class CrossWorkspaceAttempt(HTTPException):
+    """A key asked for a workspace it was not granted.
+
+    Recorded like a cross-collection attempt and for the same reason: the
+    caller is usually a workflow that lost track of which tenant it is acting
+    for, and a barrier that blocks silently teaches nobody anything. This one
+    matters more, because the boundary it protects is between customers.
+    """
+
+    def __init__(
+        self,
+        key_id: str | None,
+        allowed: list[str],
+        requested: str,
+        home: str = "",
+    ) -> None:
+        super().__init__(
+            403,
+            f"This key is not authorised for workspace {requested!r}.",
+        )
+        self.key_id = key_id
+        self.allowed = allowed
+        self.requested = requested
+        self.workspace_id = home
+
+
 class CrossCollectionAttempt(HTTPException):
     """A bound key asked for a collection that is not its own.
 
@@ -225,9 +254,42 @@ async def company_scope(principal: dict[str, Any] = Depends(current_principal)) 
     return str(principal["company_id"])
 
 
+def authorised_workspace(principal: dict[str, Any], requested: str | None) -> str:
+    """Which workspace this request runs in, enforced against the key's grant.
+
+    Three cases, and only the middle one is new:
+
+      * An ordinary key or a signed-in person: the workspace comes from the
+        credential. Naming a DIFFERENT one is refused — a header must never be
+        able to widen a credential — and naming the same one is harmless.
+      * A multi-workspace key: any workspace on its list, chosen per request
+        with `X-Workspace`; its home workspace when the header is absent.
+      * Anything not on the list: refused, and recorded.
+
+    The list is read from the KEY, never from the request, so a caller can
+    only ever pick from what was granted at minting. That is the whole
+    guarantee: there is no request shape that adds a workspace.
+    """
+    home = str(principal["company_id"])
+    granted = principal.get("workspaces")
+    # `isinstance` rather than a truth test: called directly — from a test, or
+    # from any code that builds its own dependencies — an unfilled FastAPI
+    # Header default arrives here as a Header OBJECT, which is truthy and is
+    # not a workspace name. Read as one it refused a request that named
+    # nothing at all.
+    if not isinstance(requested, str) or not requested or requested == home:
+        return home
+    if granted and requested in granted:
+        return requested
+    raise CrossWorkspaceAttempt(
+        principal.get("key_id"), list(granted or [home]), requested, home
+    )
+
+
 async def workspace_scope(
     principal: dict[str, Any] = Depends(resolve_caller),
     x_collection: str | None = Header(default=None),
+    x_workspace: str | None = Header(default=None),
 ) -> Scope:
     """The scope every call runs inside: a workspace, and optionally one
     collection within it.
@@ -242,13 +304,17 @@ async def workspace_scope(
     Omitting the header scopes to the entire workspace, which is the right
     default for a console looking across collections.
 
+    `X-Workspace` selects among the workspaces a MULTI-workspace key was
+    granted; for every other credential it may only name the workspace the
+    credential already belongs to. See authorised_workspace.
+
     A collection-bound key overrides all of this: it is confined to its one
     collection whatever the header says. A missing header resolves to the bound
     collection rather than to the whole workspace; a header naming a different
     collection is refused. The binding is already known to exist (it was
     validated when the key was minted), so no second lookup is needed.
     """
-    workspace_id = str(principal["company_id"])
+    workspace_id = authorised_workspace(principal, x_workspace)
     bound = principal.get("collection_id")
     if bound is not None:
         if x_collection is not None and x_collection != bound:

@@ -80,6 +80,7 @@ from packages.core.snippets import build as build_snippets
 from packages.core.store import edit_item, get_item, get_items_by_ids, item_versions, list_items
 from packages.core.tenancy import (
     CrossCollectionAttempt,
+    CrossWorkspaceAttempt,
     enforce_binding,
     require_write,
     resolve_caller,
@@ -212,6 +213,40 @@ async def record_cross_collection_attempt(
             await session.commit()
     except Exception:  # noqa: BLE001 - telemetry must not change the answer
         log.exception("could not record a cross-collection attempt")
+
+    return JSONResponse(status_code=403, content={"detail": exc.detail})
+
+
+@app.exception_handler(CrossWorkspaceAttempt)
+async def record_cross_workspace_attempt(
+    request: Request, exc: CrossWorkspaceAttempt
+) -> Response:
+    """Refuse, and write down that it happened.
+
+    The same reasoning as a refused collection, and a stronger reason: the
+    boundary here is between customers. A key reaching for a workspace it was
+    never granted is either a workflow that lost track of its tenant or
+    something worse, and neither is discoverable from a silent 403.
+    """
+    try:
+        async with Session() as session:
+            await audit.record(
+                session,
+                exc.workspace_id or "unknown",
+                f"key:{exc.key_id or 'unknown'}",
+                "workspace.access_denied",
+                exc.requested,
+                {
+                    "authorised_workspaces": exc.allowed,
+                    "requested_workspace": exc.requested,
+                    "key_id": exc.key_id,
+                    "method": request.method,
+                    "path": request.url.path,
+                },
+            )
+            await session.commit()
+    except Exception:  # noqa: BLE001 - telemetry must not change the answer
+        log.exception("could not record a cross-workspace attempt")
 
     return JSONResponse(status_code=403, content={"detail": exc.detail})
 
@@ -1976,6 +2011,11 @@ async def drop_collection(
 class KeyIn(BaseModel):
     name: str = Field(min_length=1)
     scopes: str = "read,write"
+    # An explicit allow-list of OTHER workspaces this key may reach. Omitted,
+    # the key behaves like every key before it: its own workspace, nothing
+    # else. Every workspace named is verified to exist at minting, and every
+    # request the key later makes is checked against this list on the server.
+    workspaces: list[str] | None = None
     # None -> workspace-wide (the console default). A value binds the key to one
     # collection and is verified against the workspace before the key is minted.
     collection_id: str | None = None
@@ -2005,6 +2045,7 @@ async def add_key(
             created_by=str(principal.get("email") or ""),
             scopes=payload.scopes,
             collection_id=payload.collection_id,
+            workspaces=payload.workspaces,
             # A key may only issue keys no stronger than itself. Without this a
             # manage-only operator mints themselves a read key and the whole
             # separation is one API call deep. None for a signed-in person, who
@@ -2066,11 +2107,17 @@ async def code_snippets(
 @app.get("/api/whoami")
 async def whoami(principal: dict[str, Any] = Depends(resolve_caller)) -> dict[str, Any]:
     """What this credential is. Useful when wiring up an SDK or MCP client."""
+    granted = principal.get("workspaces")
     return {
         "workspace_id": principal["company_id"],
         "identified_as": principal.get("email"),
         "via": principal.get("via"),
         "scopes": principal.get("scopes", []),
+        # Every workspace this credential may reach, home included. One entry
+        # for an ordinary key — so a caller can treat both kinds the same way
+        # and never has to discover the boundary by being refused at it.
+        "workspaces": granted or [principal["company_id"]],
+        "multi_workspace": bool(granted),
     }
 
 

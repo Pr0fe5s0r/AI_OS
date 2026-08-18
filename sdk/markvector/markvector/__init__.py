@@ -55,6 +55,7 @@ from .models import (
     Structure,
     WriteResult,
 )
+from .patterns import Pattern, PatternReport
 
 __version__ = "0.3.0"
 
@@ -81,6 +82,8 @@ __all__ = [
     "MintedKey",
     "Neighbor",
     "NotFound",
+    "Pattern",
+    "PatternReport",
     "Original",
     "RateLimited",
     "Region",

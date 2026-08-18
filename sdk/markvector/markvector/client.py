@@ -284,9 +284,76 @@ class Markvector:
         result = self._request("DELETE", f"/api/collections/{collection_id}")
         return int((result or {}).get("items_removed", 0))
 
-    def collection(self, collection_id: str) -> Collection:
-        """A handle. Cheap — it does not call the server."""
-        return Collection(self, collection_id)
+    def workspaces(self) -> _List[str]:
+        """Every workspace this key may reach, home first.
+
+        One entry for an ordinary key, several for a key that was explicitly
+        granted more. Asked of the server rather than assumed, because the
+        grant lives on the key and the caller may not know what they were
+        given — and because discovering a boundary by being refused at it is a
+        poor way to learn where it is.
+        """
+        me = self.whoami()
+        found = me.get("workspaces") or [me.get("workspace_id")]
+        return [str(w) for w in found if w]
+
+    def patterns(
+        self,
+        question: str,
+        *,
+        llm: Any,
+        model: str,
+        collection: str = "default",
+        workspaces: _List[str] | None = None,
+        per_workspace: int = 6,
+        min_workspaces: int = 2,
+    ) -> Any:
+        """What several tenants have in COMMON, said in a way that names none.
+
+            report = mv.patterns(
+                "how do teams handle onboarding?",
+                llm=OpenAI(...), model="...",
+            )
+            for pattern in report.patterns:
+                print(pattern)     # "activation is reviewed on a two-week cycle…"
+
+        Only for multi-workspace work, and deliberately not a search: it
+        returns generalisations with no client named, no document identified
+        and no passage quoted. A pattern is emitted only when at least
+        `min_workspaces` distinct workspaces support it — a fact true of one
+        client cannot survive that rule — and anything the model writes is
+        inspected for identifiers before it is returned.
+
+        Single-workspace work is untouched: search() and answer() behave
+        exactly as they always have, with no redaction and no generalisation,
+        because there is no cross-tenant boundary to protect there.
+
+        `llm` is your own OpenAI-compatible client; the model call happens in
+        your process, as with the agent.
+        """
+        from .patterns import extract
+
+        return extract(
+            self,
+            question,
+            llm=llm,
+            model=model,
+            collection=collection,
+            workspaces=workspaces,
+            per_workspace=per_workspace,
+            min_workspaces=min_workspaces,
+        )
+
+    def collection(self, collection_id: str, workspace: str | None = None) -> Collection:
+        """A handle. Cheap — it does not call the server.
+
+        `workspace` selects among the workspaces a multi-workspace key was
+        granted; the server checks it against that grant on every request. An
+        ordinary key may name its own workspace or leave it out — anything
+        else is refused there, not here, because a client-side check is a
+        convenience and the server's is the boundary.
+        """
+        return Collection(self, collection_id, workspace)
 
     # NOTE: deleting a DOCUMENT lives on Collection.delete(), where the
     # collection it belongs to is already known. Deleting a COLLECTION is a
@@ -400,16 +467,26 @@ class Markvector:
 class Collection:
     """Read and write one collection."""
 
-    def __init__(self, mv: Markvector, collection_id: str) -> None:
+    def __init__(
+        self, mv: Markvector, collection_id: str, workspace: str | None = None
+    ) -> None:
         self._mv = mv
         self.id = collection_id
+        # None for the key's own workspace. A value is sent as X-Workspace and
+        # is checked by the SERVER against the key's grant — this handle is
+        # addressing, not authorisation.
+        self.workspace = workspace
 
     def __repr__(self) -> str:
-        return f"<Collection {self.id!r}>"
+        where = f" in {self.workspace!r}" if self.workspace else ""
+        return f"<Collection {self.id!r}{where}>"
 
     @property
     def _headers(self) -> dict[str, str]:
-        return {"X-Collection": self.id}
+        headers = {"X-Collection": self.id}
+        if self.workspace:
+            headers["X-Workspace"] = self.workspace
+        return headers
 
     # -------------------------------- write --------------------------------
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import secrets
 from typing import Any, cast
 
@@ -77,6 +78,54 @@ def mint(environment: str = "live") -> tuple[str, str, str]:
     return full, key_id, full[: len(PREFIX) + len(environment) + 9]
 
 
+async def _authorised_workspaces(
+    session: AsyncSession,
+    home: str,
+    requested: list[str] | None,
+    collection_id: str | None,
+) -> list[str] | None:
+    """The workspace allow-list to store on a key, or None for an ordinary one.
+
+    None is the default and the important case: the key reaches its own
+    workspace and nothing else, exactly as every key issued before this
+    existed. Nothing about the single-workspace path changes.
+
+    A list is an explicit grant, and three things are checked while there is
+    still somebody to tell:
+
+      * the home workspace is always included, because a key that cannot read
+        the workspace it belongs to is a confusing thing to hand somebody;
+      * every workspace named must EXIST — a typo silently granting nothing is
+        a key that works until the day it is pointed at the workspace whose
+        name was misspelled;
+      * a collection binding is refused, because a collection id means nothing
+        outside the workspace that owns it. "Bound to collection `default`"
+        across four workspaces names four different collections.
+    """
+    if requested is None:
+        return None
+
+    if collection_id is not None:
+        raise ValueError(
+            "A multi-workspace key cannot also be bound to a collection: a "
+            "collection id is only meaningful inside one workspace."
+        )
+
+    wanted = sorted({w.strip() for w in [*requested, home] if w and w.strip()})
+    known = set(
+        (
+            await session.execute(
+                text("SELECT id FROM companies WHERE id = ANY(:ids)"),
+                {"ids": wanted},
+            )
+        ).scalars()
+    )
+    missing = [w for w in wanted if w not in known]
+    if missing:
+        raise ValueError(f"No such workspace(s): {', '.join(missing)}")
+    return wanted
+
+
 async def create_key(
     session: AsyncSession,
     workspace_id: str,
@@ -86,6 +135,7 @@ async def create_key(
     collection_id: str | None = None,
     minter_scopes: set[str] | None = None,
     minter_collection: str | None = None,
+    workspaces: list[str] | None = None,
 ) -> dict[str, Any]:
     """Issue a key. The plaintext comes back exactly once, here.
 
@@ -100,6 +150,12 @@ async def create_key(
     if not wanted:
         raise ValueError(f"A key needs at least one scope of {', '.join(SCOPES)}.")
     check_subset(minter_scopes, wanted)
+
+    # A multi-workspace key is granted its list HERE, once, by somebody who
+    # already holds the authority to issue keys. Every request it later makes
+    # is checked against that list on the server (tenancy.workspace_scope), so
+    # the grant is the only moment where the set can be decided.
+    allowed = await _authorised_workspaces(session, workspace_id, workspaces, collection_id)
 
     # A bound key may only issue keys inside its own binding. Without this, the
     # binding is one API call deep: a key confined to collection A mints an
@@ -133,14 +189,16 @@ async def create_key(
             """
             INSERT INTO api_keys
                 (key_id, workspace_id, name, key_hash, prefix, scopes, created_by,
-                 collection_id)
-            VALUES (:kid, :ws, :name, :hash, :prefix, :scopes, :by, :cid)
+                 collection_id, workspaces)
+            VALUES (:kid, :ws, :name, :hash, :prefix, :scopes, :by, :cid,
+                    CAST(:workspaces AS jsonb))
             """
         ),
         {
             "kid": key_id, "ws": workspace_id, "name": name,
             "hash": _hash(full), "prefix": prefix, "scopes": scopes, "by": created_by,
             "cid": collection_id,
+            "workspaces": json.dumps(allowed) if allowed else None,
         },
     )
     return {
@@ -150,6 +208,7 @@ async def create_key(
         "prefix": prefix,
         "scopes": scopes.split(","),
         "collection_id": collection_id,
+        "workspaces": allowed,
     }
 
 
@@ -164,7 +223,7 @@ async def resolve_key(session: AsyncSession, presented: str) -> dict[str, Any] |
             text(
                 """
                 SELECT key_id, workspace_id, name, scopes, collection_id,
-                       rate_limits, revoked_at
+                       rate_limits, workspaces, revoked_at
                 FROM api_keys WHERE key_hash = :hash
                 """
             ),
@@ -190,6 +249,10 @@ async def resolve_key(session: AsyncSession, presented: str) -> dict[str, Any] |
         # somebody meant to be powerful into one that can do nothing.
         "scopes": sorted(parse_scopes(row.scopes)),
         "collection_id": row.collection_id,
+        # The workspaces this key was granted, or None for an ordinary key.
+        # Carried on the principal so the check that enforces it is a set
+        # membership test rather than a database round trip per request.
+        "workspaces": list(row.workspaces) if row.workspaces else None,
         # Carried on the principal so the rate limiter costs no second query.
         # Every request already resolves the key; asking the database again for
         # this key's limits would put a round trip in front of every call in
