@@ -11,7 +11,7 @@ from __future__ import annotations
 import httpx
 import pytest
 from markvector import Markvector, Pattern, PatternReport
-from markvector.patterns import _identifiers, extract, leaks, redact
+from markvector.patterns import _identifiers, distinctive, extract, leaks, redact
 
 BASE = "http://localhost:8000"
 
@@ -195,8 +195,11 @@ def test_a_pattern_has_nowhere_to_put_an_identifier():
 
 
 def test_the_report_is_serialisable_without_leaking_structure():
+    # The statement has to be one the fixture's passages actually support:
+    # corroboration is counted from the text now, so an unsupported statement
+    # is withheld and there would be nothing left to serialise.
     report = _two_workspace_run(
-        '{"patterns": [{"statement": "Credentials are the common blocker", "groups": 2}]}'
+        '{"patterns": [{"statement": "Activation is reviewed after two weeks", "groups": 2}]}'
     )
     payload = report.as_dict()
     assert set(payload) == {
@@ -299,3 +302,140 @@ def _two_workspace_run(reply: str) -> PatternReport:
 @pytest.fixture(autouse=True)
 def _reset():
     yield
+
+
+# ------------------- filename words are not tenant names -------------------
+
+
+def test_an_ordinary_word_in_a_filename_does_not_become_a_name():
+    """Measured against real data: a correct pattern about how revenue is
+    reported by region was withheld for "naming 'management'", because one
+    workspace held `Project-Management-Sample-Data (1).xlsx` and the locator
+    was split into words. An identifier that deletes true, general answers is
+    not protecting anybody.
+    """
+    from markvector.patterns import _filename_words
+
+    doc = type("D", (), {"title": "Project Management Data", "locator": "Project-Management-Sample-Data (1).xlsx"})
+    words = _filename_words("acme-9da3b8", [doc])
+    assert "management" in words, "it is still a candidate..."
+
+    # ...and the candidate is dropped, because nothing ties it to one tenant.
+    surviving = distinctive(
+        [{"management"}, {"other"}],
+        ["a table of regional revenue", "another table of regional revenue"],
+        [{"management"}, set()],
+    )
+    assert "management" not in surviving
+
+
+def test_a_tenant_name_still_survives_because_the_workspace_id_carries_it():
+    """The other half: relaxing filenames must not disarm the defence.
+
+    It does not, because tenant identity never depended on the filename.
+    MarkVector derives the workspace id from the company name, so the name is
+    in the strong set — vouched for by the server, not inferred.
+    """
+    surviving = distinctive(
+        [{"globex-4f2a1c", "globex"}, {"other-91bc"}],
+        ["reviews happen weekly", "activation is reviewed weekly"],
+        [{"report"}, set()],
+    )
+    assert "globex" in surviving
+
+
+def test_a_whole_title_or_locator_is_still_dropped():
+    """Relaxing the SEGMENTS does not relax the whole. A statement echoing a
+    document title or a path still names a document, which the contract
+    forbids just as firmly as naming a client."""
+    surviving = distinctive(
+        [{"Acme onboarding audit", "acme/onboarding.md"}, {"other-91bc"}],
+        ["a", "b"],
+        [{"onboarding"}, set()],
+    )
+    assert "acme onboarding audit" in surviving
+    assert "acme/onboarding.md" in surviving
+
+
+def test_a_name_carried_by_the_workspace_id_is_never_weakened():
+    """`acme` reached us from both the workspace id and a locator. Filename
+    judgement applies only to what the workspace id does NOT already vouch
+    for, or the strongest signal we have would be overridden by the weakest.
+    """
+    from markvector.patterns import _filename_words
+
+    doc = type("D", (), {"title": "Onboarding", "locator": "acme/onboarding.md"})
+    assert "acme" not in _filename_words("poc-acme", [doc])
+
+
+# ---------------- corroboration is counted, not taken on trust ----------------
+
+
+def test_support_is_measured_from_the_passages():
+    from markvector.patterns import supported_by
+
+    groups = [
+        ["activation is reviewed on a two-week cycle by a named owner"],
+        ["a named owner reviews activation every two weeks"],
+        ["the canteen menu rotates monthly"],
+    ]
+    assert supported_by("Activation is reviewed by a named owner", groups) == 2
+
+
+def test_a_model_cannot_inflate_its_way_past_corroboration():
+    """The hole this closes. Corroboration is described at the top of the
+    module as the defence that does not depend on the model behaving — but the
+    gate compared MIN_WORKSPACES against a number the model wrote. Measured
+    against real data, a statement true of two workspaces was reported as
+    three, and a statement true of ONE would have passed the same way.
+    """
+    report = _two_workspace_run(
+        '{"patterns": [{"statement": "Every team runs a mandatory zebra husbandry drill", '
+        '"groups": 2, "confidence": 0.99}]}'
+    )
+    assert report.patterns == [], "nothing in either workspace says this"
+    assert any("only 0 workspace" in w or "only 1 workspace" in w for w in report.withheld)
+
+
+def test_a_genuinely_shared_statement_still_passes():
+    """The counter-test, so the fix above cannot be satisfied by refusing
+    everything: both tenants really do describe a 14-day activation review."""
+    report = _two_workspace_run(
+        '{"patterns": [{"statement": "Activation is reviewed after two weeks", '
+        '"groups": 2, "confidence": 0.8}]}'
+    )
+    assert len(report.patterns) == 1
+    assert report.patterns[0].workspaces == 2
+
+
+def test_the_model_may_lower_the_count_but_never_raise_it():
+    report = _two_workspace_run(
+        '{"patterns": [{"statement": "Activation is reviewed after two weeks", "groups": 1}]}'
+    )
+    assert report.patterns == []
+
+
+def test_support_survives_paraphrase():
+    """Measured on real passages: a statement about "concurrency and timing
+    constraints" is supported by a passage reading "50 concurrent callers with
+    a budget of 840 milliseconds". Whole-word comparison scored that 0.23 and
+    withheld a true pattern; a generaliser punished for generalising is no
+    use."""
+    from markvector.patterns import supported_by
+
+    # Both groups as they actually arrived: several passages each, the
+    # reranking rule alongside the conformance case.
+    reranking = (
+        "and MUST NOT be cached as complete. This applies to every reranking "
+        "path without exception, including the degraded path in section 7.6."
+    )
+    conformance = (
+        "Conformance is demonstrated by acceptance case A-761, exercising the "
+        "boundary at 50 concurrent callers with a budget of 840 milliseconds."
+    )
+    groups = [[reranking, conformance], [conformance, reranking]]
+    statement = (
+        "Conformance to caching and reranking rules is verified through acceptance "
+        "cases that test performance under specific concurrency and timing constraints."
+    )
+    assert supported_by(statement, groups) == 2

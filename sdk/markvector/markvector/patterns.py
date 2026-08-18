@@ -26,9 +26,12 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 # property:
 #
 #   1. CORROBORATION. A pattern is emitted only if at least MIN_WORKSPACES
-#      distinct workspaces support it. This is the strongest of the three and
-#      the only one that does not depend on getting redaction right: a fact
-#      true of exactly one client cannot survive a rule that requires two.
+#      distinct workspaces support it, where support is COUNTED from their
+#      passages (see supported_by) rather than taken from the model's reply.
+#      This is the strongest of the three and the only one that does not
+#      depend on the model behaving: a fact true of exactly one client cannot
+#      survive a rule that requires two, and a model claiming otherwise does
+#      not get a vote.
 #
 #   2. REDACTION BEFORE THE MODEL. Passages are stripped of identifiers — the
 #      tenant's own name, document titles and locators, emails, URLs, money,
@@ -56,6 +59,79 @@ PER_WORKSPACE = 6
 # Trimmed hard: a long excerpt is a passage wearing a disguise, and the model
 # needs the shape of what is said, not its wording.
 MAX_EXCERPT_CHARS = 320
+
+# How much of a statement's substance must appear in a workspace's own passages
+# before that workspace counts as SUPPORTING it. Corroboration used to be taken
+# on trust: the model reported how many groups backed each statement and the
+# gate below compared that number against MIN_WORKSPACES. A model that writes
+# "groups": 2 for a fact true of one tenant therefore walked straight through
+# the defence described at the top of this file as the one that does not depend
+# on the model behaving. Measured against real data, a statement true of two
+# workspaces was reported as three.
+#
+# So support is now counted here, from the redacted passages, and the model's
+# own number is advisory at most.
+SUPPORT_RATIO = 0.25
+
+# Words too common to be evidence of anything. Deliberately short: this list
+# exists to stop "the", "with" and the vocabulary of the question itself from
+# making every group look like it supports every statement, not to do topic
+# modelling.
+_TOO_COMMON = frozenset(
+    """
+    about above across after against all also and any are because been before
+    being between both but can does each from had has have how into its more
+    most not now off only other out over own same should some such than that
+    the their them then there these they this those through under until upon
+    use used using very was were what when where which while who why will with
+    within without would you your
+    """.split()
+)
+
+
+def _content_words(text: str) -> set[str]:
+    """The words in a piece of text that could carry meaning."""
+    return {
+        word
+        for word in re.findall(r"[A-Za-z][A-Za-z'-]{2,}", text.lower())
+        if word not in _TOO_COMMON
+    }
+
+
+def _stems(text: str) -> set[str]:
+    """Content words cut to a common stem.
+
+    Comparing whole words punished exactly the behaviour we want: a good
+    generalisation paraphrases, so the passage says "50 concurrent callers"
+    and the statement says "concurrency", and the two shared nothing. Measured,
+    a statement genuinely supported by two workspaces scored 0.23 against a
+    0.25 threshold and was withheld. Six characters is enough to join
+    concurrent/concurrency, rerank/reranking, accept/acceptance.
+    """
+    return {word[:6] for word in _content_words(text)}
+
+
+def supported_by(statement: str, groups: list[list[str]]) -> int:
+    """How many workspaces' passages actually carry this statement's substance.
+
+    Counted, not asked. A group supports a statement when it shares at least
+    SUPPORT_RATIO of the statement's content words — enough that the statement
+    is plausibly about that group's material, rather than a generalisation the
+    model reached from one group and attributed to several.
+
+    This is deliberately a blunt overlap and not a semantic judgement: a
+    corroboration rule enforced by a second model call would be back to
+    trusting a model with the boundary.
+    """
+    words = _stems(statement)
+    if not words:
+        return 0
+    count = 0
+    for excerpts in groups:
+        shared = words & _stems(" ".join(excerpts))
+        if len(shared) / len(words) >= SUPPORT_RATIO:
+            count += 1
+    return count
 
 
 @dataclass(slots=True)
@@ -176,9 +252,38 @@ def _identifiers(workspace: str, documents: list[Any]) -> set[str]:
     return {n for n in names if n}
 
 
+def _filename_words(workspace: str, documents: list[Any]) -> set[str]:
+    """The bare words a LOCATOR was split into, minus anything the workspace id
+    already vouches for.
+
+    These are the weakest candidates we produce, and the only ones that can be
+    ordinary English. A tenant called Acme filing `acme/onboarding.md` gives up
+    "acme" — worth catching — but a spreadsheet called
+    `Project-Management-Sample-Data.xlsx` gives up "management", which names
+    nobody. Measured: a correct pattern about how revenue is reported was
+    withheld for "naming 'management'", because a filename happened to contain
+    the word.
+
+    A segment that also appears in the workspace id is NOT returned here: it is
+    a real name and is judged by the ordinary rules.
+    """
+    strong = {workspace.lower()}
+    strong.update(part.lower() for part in re.split(r"[-_]", workspace) if len(part) > 2)
+    words: set[str] = set()
+    for doc in documents:
+        locator = str(getattr(doc, "locator", "") or "")
+        if not locator:
+            continue
+        words.update(
+            w.lower() for w in re.split(r"[/\_\-.]+", locator) if len(w) > 2
+        )
+    return words - strong
+
+
 def distinctive(
     per_workspace_names: list[set[str]],
     per_workspace_text: list[str] | None = None,
+    per_workspace_filename_words: list[set[str]] | None = None,
 ) -> set[str]:
     """The candidate names that belong to exactly one tenant.
 
@@ -211,6 +316,30 @@ def distinctive(
         for name, count in seen.items()
         if count == 1 and shared_in_prose[name] < 2
     }
+    # A filename word is NOT a name. Splitting locators was meant to catch
+    # "acme" in `acme/onboarding.md`, but filenames are also where ordinary
+    # words live, and a bare word promoted to "tenant name" deletes every true
+    # pattern that happens to use it. Measured against real data: a correct,
+    # fully general statement about how revenue is reported by region was
+    # withheld for "naming 'management'", because one workspace held
+    # `Project-Management-Sample-Data (1).xlsx`.
+    #
+    # Tenant identity does not have to be guessed at. It arrives as trusted
+    # metadata — MarkVector derives every workspace id from the company name
+    # (`acme-7a3d9c`, `temprl-21a2b3`), so the tenant's name is already in the
+    # strong set, vouched for by the server rather than inferred from a
+    # filename. Anything a locator segment could add beyond that is a guess,
+    # and a guess that is wrong in the direction of silence.
+    #
+    # What is NOT relaxed: the workspace id and its parts, whole titles and
+    # whole locators all remain identifiers, so a statement echoing a document
+    # or a path is still dropped whole — and corroboration across two or more
+    # workspaces, the defence that does not depend on naming anything
+    # correctly, is untouched.
+    if per_workspace_filename_words is not None:
+        for words in per_workspace_filename_words:
+            unique -= words
+
     # A workspace id or a whole title identifies however common its parts are.
     for names in per_workspace_names:
         unique |= {n.lower() for n in names if " " in n or "/" in n or "-" in n}
@@ -323,6 +452,7 @@ def extract(
     # subject of the question.
     raw: list[list[str]] = []
     candidates: list[set[str]] = []
+    filename_words: list[set[str]] = []
 
     for workspace in reachable:
         docs = mv.collection(collection, workspace=workspace)
@@ -341,6 +471,8 @@ def extract(
 
         names = _identifiers(workspace, [h.source for h in hits.matches])
         names |= _identifiers(workspace, hits.matches)
+        weak = _filename_words(workspace, [h.source for h in hits.matches])
+        weak |= _filename_words(workspace, hits.matches)
         excerpts = [
             (h.clean_excerpt or h.excerpt or "")[:MAX_EXCERPT_CHARS] for h in hits.matches
         ]
@@ -349,6 +481,7 @@ def extract(
             continue
         raw.append(excerpts)
         candidates.append(names)
+        filename_words.append(weak)
         report.workspaces_searched += 1
         report.passages_considered += len(excerpts)
 
@@ -365,7 +498,9 @@ def extract(
     # PASS TWO: every tenant has now been seen, so the names that identify ONE
     # of them are known — and those are what gets removed, from the excerpts
     # here and from whatever the model writes later.
-    identifiers = distinctive(candidates, [" ".join(e) for e in raw])
+    identifiers = distinctive(
+        candidates, [" ".join(e) for e in raw], filename_words
+    )
     groups = [[redact(e, identifiers) for e in excerpts] for excerpts in raw]
     prompt = "\n\n".join(
         f"GROUP {n}:\n" + "\n".join(f"- {e}" for e in excerpts)
@@ -388,9 +523,17 @@ def extract(
         statement = str(row.get("statement") or "").strip()
         if not statement:
             continue
-        supported = int(row.get("groups") or 0)
+        # Counted from the passages, not taken from the model's reply. The
+        # model's own figure is kept only as a ceiling: it may claim fewer
+        # than the overlap suggests (it saw the text and we did not), but it
+        # can never talk a statement past the corroboration rule.
+        measured = supported_by(statement, groups)
+        claimed = int(row.get("groups") or 0)
+        supported = min(measured, claimed) if claimed else measured
         if supported < min_workspaces:
-            report.withheld.append(f"only {supported} workspace(s) supported: {statement[:60]}…")
+            report.withheld.append(
+                f"only {supported} workspace(s) supported: {statement[:60]}…"
+            )
             continue
         why = leaks(statement, identifiers)
         if why:
