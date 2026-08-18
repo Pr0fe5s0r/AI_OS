@@ -14,20 +14,43 @@ type Section = "overview" | "upload" | "query" | "keys" | "sdk" | "playground" |
  *  like activity. */
 export function Overview({
   collections,
+  active,
   go,
 }: {
   collections: Collection[];
+  active: string | null;
   go: (s: Section) => void;
 }) {
   const [stats, setStats] = useState<api.TraceStats | null>(null);
   const [recent, setRecent] = useState<Trace[]>([]);
 
-  useEffect(() => {
-    api.traceStats().then(setStats).catch(() => setStats(null));
-    api.traces(undefined, { limit: 6 }).then(setRecent).catch(() => setRecent([]));
-  }, []);
+  // Every number on this screen belongs to the collection the sidebar has
+  // selected. It used to belong to the workspace: the document count summed
+  // every collection, and both trace calls went out with no X-Collection at
+  // all, so switching from one collection to another changed the label above
+  // the numbers and nothing else. A count that does not move when you change
+  // what it is counting is worse than no count.
+  const collectionId = active ?? undefined;
 
-  const documents = collections.reduce((sum, c) => sum + c.items, 0);
+  useEffect(() => {
+    let live = true;
+    setStats(null);
+    setRecent([]);
+    api.traceStats(collectionId).then((s) => live && setStats(s)).catch(() => live && setStats(null));
+    api
+      .traces(collectionId, { limit: 6 })
+      .then((t) => live && setRecent(t))
+      .catch(() => live && setRecent([]));
+    // Reloads on every switch, and a slow reply from the previous collection
+    // cannot land after a faster one from the next.
+    return () => {
+      live = false;
+    };
+  }, [collectionId]);
+
+  const documents = active
+    ? collections.find((c) => c.id === active)?.items ?? 0
+    : collections.reduce((sum, c) => sum + c.items, 0);
 
   return (
     <div className="mx-auto max-w-[1600px] px-6 py-6">
@@ -39,8 +62,12 @@ export function Overview({
               <span className="mr-1 h-1.5 w-1.5 rounded-full bg-success" />
               healthy
             </Chip>
+            {/* Named, because the numbers below mean nothing without it. */}
+            <Chip tone="border-accent/40 bg-accent/10 text-accentSoft">
+              {active ?? "all collections"}
+            </Chip>
             <span className="font-mono text-2xs text-subtle">
-              your knowledge base at a glance
+              {active ? "this collection at a glance" : "every collection at a glance"}
             </span>
           </div>
         </div>
@@ -85,8 +112,8 @@ export function Overview({
             {recent.length === 0 ? (
               <Card className="p-4">
                 <p className="text-2xs leading-relaxed text-subtle">
-                  Nothing queried yet. Every search writes down how it reached its answer,
-                  and they appear here.
+                  Nothing queried in {active ? "this collection" : "this workspace"} yet.
+                  Every search writes down how it reached its answer, and they appear here.
                 </p>
               </Card>
             ) : (

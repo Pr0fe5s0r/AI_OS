@@ -294,7 +294,9 @@ export default function Page() {
             </div>
           ) : (
             <>
-              {section === "overview" && <Overview collections={collections} go={setSection} />}
+              {section === "overview" && (
+                <Overview collections={collections} active={active} go={setSection} />
+              )}
               {section === "upload" && (
                 <Upload
                   collections={collections}
@@ -307,7 +309,9 @@ export default function Page() {
                 <IndexGraph active={active} onUpload={() => setSection("upload")} />
               )}
               {section === "query" && <Query active={active} />}
-              {section === "keys" && <Keys collections={collections} toast={toast} />}
+              {section === "keys" && (
+                <Keys collections={collections} active={active} toast={toast} />
+              )}
               {section === "sdk" && <Sdk collections={collections} active={active} />}
               {section === "playground" && <Playground active={active} />}
               {section === "traces" && <Traces active={active} />}

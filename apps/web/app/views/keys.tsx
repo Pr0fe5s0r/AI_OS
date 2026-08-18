@@ -13,9 +13,11 @@ import { Button, Card, Chip, Copy, Empty, Label, Mono } from "../ui/kit";
  *  it. That single fact shapes the whole screen. */
 export function Keys({
   collections,
+  active,
   toast,
 }: {
   collections: Collection[];
+  active: string | null;
   toast: (m: string) => void;
 }) {
   const [keys, setKeys] = useState<ApiKey[] | null>(null);
@@ -23,13 +25,30 @@ export function Keys({
   const [name, setName] = useState("");
   const [scopes, setScopes] = useState("read,write");
   // "" means workspace-wide; otherwise the key is locked to this collection.
-  const [collectionId, setCollectionId] = useState("");
+  // Defaults to whichever collection the sidebar is in, so the obvious act —
+  // "create a key while looking at this collection" — produces a key for this
+  // collection rather than one that quietly reaches all of them.
+  const [collectionId, setCollectionId] = useState(active ?? "");
+  useEffect(() => setCollectionId(active ?? ""), [active]);
   const [creating, setCreating] = useState(false);
   const [busy, setBusy] = useState(false);
 
   async function load() {
     setKeys(await api.keys());
   }
+
+  // Which keys belong on screen while one collection is selected.
+  //
+  // A key bound to ANOTHER collection does not: it cannot reach this one, and
+  // listing it here was the bug — standing in "test-hard" and reading a key
+  // labelled "book". A key with no binding is a different matter and stays
+  // visible everywhere, because it genuinely does reach this collection. That
+  // is the honest cut: hiding it would leave real access to this collection
+  // invisible on the one screen meant to show it.
+  const shown = (keys || []).filter(
+    (k) => !active || !k.collectionId || k.collectionId === active
+  );
+  const elsewhere = (keys || []).length - shown.length;
 
   useEffect(() => {
     load();
@@ -41,7 +60,7 @@ export function Keys({
     try {
       setMinted(await api.createKey(name.trim(), scopes, collectionId || null));
       setName("");
-      setCollectionId("");
+      setCollectionId(active ?? "");
       setCreating(false);
       await load();
     } catch (e) {
@@ -68,6 +87,20 @@ export function Keys({
             <Mono className="text-accentSoft">Authorization: Bearer</Mono>. A key carries the
             workspace, so nothing you write with it has to name one.
           </p>
+          {active && (
+            <p className="mt-1.5 max-w-xl text-2xs leading-relaxed text-subtle">
+              Showing keys that can reach{" "}
+              <Mono className="text-accentSoft">{active}</Mono> — those bound to it, and
+              unbound ones, which reach every collection.
+              {elsewhere > 0 && (
+                <>
+                  {" "}
+                  {elsewhere} {elsewhere === 1 ? "key is" : "keys are"} bound to another
+                  collection and {elsewhere === 1 ? "is" : "are"} hidden here.
+                </>
+              )}
+            </p>
+          )}
         </div>
         <Button variant="primary" onClick={() => setCreating(true)}>
           + Create key
@@ -151,13 +184,17 @@ export function Keys({
 
       {keys === null ? (
         <div className="font-mono text-xs text-subtle">Loading keys…</div>
-      ) : keys.length === 0 ? (
+      ) : shown.length === 0 ? (
         <Empty
-          title="No keys yet"
-          hint="A key is how the SDK, an MCP client or a CI job reaches this workspace. The console itself uses your session instead."
+          title={active ? `No keys reach ${active}` : "No keys yet"}
+          hint={
+            elsewhere
+              ? `A key is how the SDK, an MCP client or a CI job reaches this collection. ${elsewhere} ${elsewhere === 1 ? "key is" : "keys are"} bound to other collections and cannot reach this one.`
+              : "A key is how the SDK, an MCP client or a CI job reaches this workspace. The console itself uses your session instead."
+          }
           action={
             <Button variant="primary" onClick={() => setCreating(true)}>
-              Create your first key
+              {active ? `Create a key for ${active}` : "Create your first key"}
             </Button>
           }
         />
@@ -174,7 +211,7 @@ export function Keys({
               </tr>
             </thead>
             <tbody>
-              {keys.map((k) => (
+              {shown.map((k) => (
                 <tr
                   key={k.id}
                   className={cx(
