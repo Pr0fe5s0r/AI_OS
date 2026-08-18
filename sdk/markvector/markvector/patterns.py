@@ -402,11 +402,14 @@ and an empty answer to an answerable question helps nobody.
 
 Rules, all of them absolute:
   * Never name a company, product, person, place, or document.
-  * Never name a region, market, site, team or system taken from the material.
-    Say "several regions" or "each region", never which ones. Naming them is
-    the single most common way one of these answers goes wrong: nobody is
+  * Never name a region, market, site, customer or team taken from the
+    material. Say "several regions" or "each region", never which ones. This
+    is the single most common way one of these answers goes wrong: nobody is
     called "Iberia", so it feels safe, but which markets a client trades in is
     that client's business and not a practice worth reporting.
+    A public standard, protocol or unit is NOT one of these — naming the OSI
+    model, HTTP or GBP discloses nothing about anybody, and refusing to name
+    them would cost real answers to protect nothing.
   * Never quote an excerpt. Say what it establishes, in your own words.
   * Never mention group numbers, ids, dates, or amounts.
   * Never say "one group" or "another group".
@@ -434,9 +437,10 @@ Rules:
     Do not add a summary sentence, a conclusion, or anything the findings do
     not already say. Plain prose, no preamble, no bullet list.
   * Never mention companies, groups, workspaces, documents or excerpts.
-  * Never name a region, market, site or system, even if a finding does. Write
-    "several regions" instead. If a finding cannot be stated without naming
-    one, leave that finding out.
+  * Never name a region, market, site, customer or team, even if a finding
+    does. Write "several regions" instead. If a finding cannot be stated
+    without naming one, leave that finding out. Public standards, protocols
+    and units are fine to name.
   * If the findings do not answer the question, say so in one sentence."""
 
 
