@@ -52,6 +52,13 @@ export interface Document {
   metadata: Raw;
   /** Present when this document came from an uploaded file. */
   original: Original | null;
+  /** How this document can be addressed, declared by the server so nothing has
+   *  to be discovered by trial: how many parts it has, what they are called,
+   *  and whether a picture of one can be fetched. A deck answers 79 / "slide" /
+   *  true; a spreadsheet answers 0 / null / false. */
+  pages: number;
+  pageUnit: string | null;
+  pageImage: boolean;
 }
 
 export function toDocument(d: Raw): Document {
@@ -68,6 +75,38 @@ export function toDocument(d: Raw): Document {
     categories: (d.classes ?? []).map(toCategory),
     metadata: d.metadata ?? {},
     original: o ? { filename: o.filename, contentType: o.content_type, size: Number(o.size ?? 0) } : null,
+    pages: Number(d.pages ?? 0) || 0,
+    pageUnit: d.page_unit ?? null,
+    pageImage: Boolean(d.page_image),
+  };
+}
+
+/** What deleting one document would destroy, or did.
+ *
+ *  Returned by `collection.delete(id)` — which destroys nothing — so a person
+ *  can be shown the real numbers before they agree. "Delete this document?" is
+ *  a question nobody can answer well; "delete COMPUTER NETWORKS, 2 versions,
+ *  3,915 passages, permanently" is. */
+export interface Deletion {
+  itemId: string;
+  title: string;
+  versions: number;
+  passages: number;
+  deleted: boolean;
+}
+
+export function toDeletion(d: Raw, deleted = false): Deletion {
+  // Two shapes, one meaning. The PREVIEW counts what would go (`versions`,
+  // `passages`); the confirmed delete reports what did, by table (`kb_items`,
+  // `kb_chunks`). Reading only the first made a real deletion announce
+  // "0 versions, 0 passages" — exactly the sort of wrong number that makes a
+  // caller doubt whether anything happened.
+  return {
+    itemId: d.item_id ?? "",
+    title: d.title ?? "",
+    versions: Number(d.versions ?? d.kb_items ?? 0) || 0,
+    passages: Number(d.passages ?? d.kb_chunks ?? 0) || 0,
+    deleted,
   };
 }
 
@@ -286,6 +325,17 @@ export interface Citation {
    *  table checkable instead of merely plausible. `null` means the passage came
    *  from text, where there is no single page to point at. */
   page: number | null;
+  /** The same location in the document's own words — "slide 34", "page 12".
+   *  Show THIS rather than composing the phrase yourself: a deck has slides,
+   *  and working the noun out from a file extension is exactly the per-format
+   *  special case the API exists to absorb. */
+  pageLabel: string | null;
+  /** Where to fetch the picture of that page, or `null` when this document has
+   *  none — a spreadsheet, a pasted note, a deck whose conversion has not run.
+   *  Stated, so nothing has to request a URL and read a 404 to find out.
+   *  Relative to the client's base URL; `collection.pageImage(citation)`
+   *  fetches the bytes. */
+  pageImage: string | null;
   /** Where on that page. Without these a reader is told "page 14" and left to
    *  search it; with them the highlight lands on the row that was actually
    *  read. Empty whenever the passage came from text. */
@@ -302,6 +352,8 @@ export function toCitation(d: Raw): Citation {
     text: d.text ?? "",
     score: Number(d.score ?? 0) || 0,
     page: d.page === null || d.page === undefined ? null : Number(d.page),
+    pageLabel: d.page_label ?? null,
+    pageImage: d.page_image ?? null,
     regions: (d.regions ?? []).map(toRegion),
   };
 }

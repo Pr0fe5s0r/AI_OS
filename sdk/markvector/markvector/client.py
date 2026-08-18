@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -16,13 +18,16 @@ from .errors import (
     InvalidRequest,
     MarkvectorError,
     NotFound,
+    RateLimited,
     Unavailable,
 )
 from .models import (
     Answer,
     ApiKey,
     Chunk,
+    Citation,
     CollectionInfo,
+    Deletion,
     Document,
     IndexSummary,
     Match,
@@ -30,16 +35,80 @@ from .models import (
     Neighbor,
     Results,
     Structure,
+    Thinking,
+    ToolCall,
+    ToolResult,
     WriteResult,
 )
 
-DEFAULT_URL = "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me"
+# What `answer_stream` yields: each step as it happens, then the finished
+# answer as the final item.
+StreamEvent = Thinking | ToolCall | ToolResult | Answer
+
+# No default host. A client that forgets `base_url` should fail loudly rather
+# than send its documents somewhere — this used to point at our own demo
+# deployment, so an omitted argument silently shipped a customer's content to a
+# server they had never heard of. Data residency is not a default worth having.
+DEFAULT_URL = os.getenv("MARKVECTOR_URL", "")
 _RETRYABLE = {429, 500, 502, 503, 504}
+# What a key may be minted with. Kept here so an unknown scope is refused by the
+# client instead of being dropped by the server's parser, which would hand back
+# a key that looks fine and can do nothing.
+SCOPES = frozenset({"read", "write", "manage"})
 __version__ = "0.1.0"
 
 # Inside Collection the list() method shadows the builtin, so annotations that
 # follow it reference this alias to still mean the container type.
 _List = list
+
+# What a metadata filter may be given for one key: one value, or several to
+# match any of. Numbers and booleans are accepted because metadata written as
+# JSON keeps its type, and making the caller stringify it here would be busywork
+# with a trap in it — see _meta_params for how each is rendered.
+Filterable = str | int | float | bool
+Where = dict[str, "Filterable | _List[Filterable]"]
+
+
+def _meta_value(value: Filterable) -> str:
+    """One filter value as the server compares it: text.
+
+    Booleans are lowercased because that is how JSON — and therefore the stored
+    metadata — spells them. Python's str(True) is "True", which would match
+    nothing and look like a filter that simply found no documents.
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _meta_params(where: Where | None) -> _List[str]:
+    """A `where` mapping as the repeated key:value pairs the API takes.
+
+        {"client": "acme", "kind": ["policy", "notice"]}
+        -> ["client:acme", "kind:policy", "kind:notice"]
+
+    Different keys must all match; the same key repeated matches any of its
+    values. A key containing a colon cannot be expressed — the server splits on
+    the first one — so it is refused here, with the reason, rather than sent to
+    be misread as a shorter key with a longer value.
+    """
+    if not where:
+        return []
+    pairs: _List[str] = []
+    for key, value in where.items():
+        if not key or ":" in key:
+            raise ValueError(
+                f"metadata key {key!r} cannot be used as a filter: keys must be "
+                "non-empty and cannot contain a colon."
+            )
+        values = value if isinstance(value, list | tuple) else [value]
+        if not values:
+            raise ValueError(
+                f"metadata filter {key!r} has no values; omit the key instead of "
+                "passing an empty list, which would match nothing."
+            )
+        pairs.extend(f"{key}:{_meta_value(v)}" for v in values)
+    return pairs
 
 
 class Markvector:
@@ -74,9 +143,18 @@ class Markvector:
                 "Create one in the console under Developer → API keys."
             )
         self._key = key
-        self.base_url = (
+        url = (
             base_url or os.getenv("MARKVECTOR_URL") or os.getenv("KB_URL") or DEFAULT_URL
         ).rstrip("/")
+        if not url:
+            raise InvalidRequest(
+                "No base_url. Pass base_url= or set MARKVECTOR_URL — for example "
+                "http://localhost:8000 for a local stack, or your own deployment. "
+                "There is deliberately no default: a client that silently sent "
+                "documents to somebody else's server would be a data-residency "
+                "incident, not a convenience."
+            )
+        self.base_url = url
         self._max_retries = max_retries
         self._http = httpx.Client(
             base_url=self.base_url,
@@ -99,7 +177,13 @@ class Markvector:
 
     def _send(self, method: str, path: str, **kw: Any) -> httpx.Response:
         """Retries only idempotent failures — a timeout on a write could mean
-        the write landed, and repeating it would be worse than reporting it."""
+        the write landed, and repeating it would be worse than reporting it.
+
+        A 429 is waited out for the time the SERVER asked for, not for a
+        backoff of our own invention. Guessing shorter hammers a store that has
+        just said it is busy; guessing longer wastes the caller's time. The
+        header is the only party that knows.
+        """
         last: Exception | None = None
         for attempt in range(self._max_retries + 1):
             try:
@@ -110,11 +194,40 @@ class Markvector:
                     raise last from exc
             else:
                 if response.status_code in _RETRYABLE and attempt < self._max_retries:
-                    time.sleep(0.4 * (2**attempt))
+                    time.sleep(_backoff(response, attempt))
                     continue
                 return response
             time.sleep(0.4 * (2**attempt))
         raise last or Unavailable("Request failed.")
+
+    def _stream_events(
+        self, path: str, *, params: dict[str, Any], headers: dict[str, str]
+    ) -> Iterator[StreamEvent]:
+        """Server-Sent Events, as typed steps.
+
+        The server sends one `data:` line per step and a terminal `done`
+        carrying the same payload the blocking route returns — so the last item
+        yielded here is the finished Answer, and a caller that stops early
+        simply closes the connection.
+
+        Unknown event types are SKIPPED rather than raised on: the server may
+        learn to report a new kind of step, and a client from last month should
+        keep working when it does.
+        """
+        with self._http.stream("GET", path, params=params, headers=headers) as response:
+            if not response.is_success:
+                response.read()
+                raise _error_for(response)
+            for line in response.iter_lines():
+                if not line.startswith("data:"):
+                    continue
+                try:
+                    event = json.loads(line[5:].strip())
+                except json.JSONDecodeError:
+                    continue
+                parsed = _stream_event(event)
+                if parsed is not None:
+                    yield parsed
 
     @staticmethod
     def _unwrap(response: httpx.Response) -> Any:
@@ -175,6 +288,10 @@ class Markvector:
         """A handle. Cheap — it does not call the server."""
         return Collection(self, collection_id)
 
+    # NOTE: deleting a DOCUMENT lives on Collection.delete(), where the
+    # collection it belongs to is already known. Deleting a COLLECTION is a
+    # workspace-level act and lives here.
+
     # -------------------------------- keys --------------------------------
 
     def keys(self) -> list[ApiKey]:
@@ -185,16 +302,45 @@ class Markvector:
     def create_key(
         self,
         name: str,
-        scopes: str = "read,write",
+        scopes: str | _List[str] = "read,write",
         collection_id: str | None = None,
     ) -> MintedKey:
         """Issue a key. The secret is in the return value and NOWHERE else,
-        ever — store it now. Pass `collection_id` to bind the key to one
-        collection; leave it None for a workspace-wide key."""
+        ever — store it now.
+
+        Three scopes, and the third is the one people miss:
+
+          read    see document contents — bodies, passages, answers, originals,
+                  page pictures, and traces, which carry queries and excerpts
+          write   ingest and edit those contents, and delete a document
+          manage  administer the CONTAINERS: create, rename and delete
+                  collections, mint and revoke keys. It reads NOTHING.
+
+        `manage` without `read` is what lets a platform operator set a tenant up
+        and wind them down without being able to open a single one of their
+        documents:
+
+            mv.create_key("ops", scopes=["manage"])
+
+        Pass `collection_id` to bind the key to one collection — every call it
+        makes is then confined there, whatever the caller asks for, and it may
+        only mint keys bound to the same collection. Leave it None for a
+        workspace-wide key.
+        """
+        wanted = ",".join(scopes) if isinstance(scopes, list) else scopes
+        unknown = sorted({s.strip() for s in wanted.split(",") if s.strip()} - SCOPES)
+        if unknown:
+            # Refused here rather than sent: an unrecognised scope is silently
+            # dropped by the parser, so a key asked for "admin" would come back
+            # looking successful and able to do nothing.
+            raise ValueError(
+                f"unknown scope(s) {', '.join(unknown)}; valid scopes are "
+                f"{', '.join(sorted(SCOPES))}."
+            )
         created = self._request(
             "POST",
             "/api/keys",
-            json={"name": name, "scopes": scopes, "collection_id": collection_id},
+            json={"name": name, "scopes": wanted, "collection_id": collection_id},
         )
         return MintedKey.from_json(created)
 
@@ -203,6 +349,39 @@ class Markvector:
         self._request("DELETE", f"/api/keys/{key_id}")
 
     # ------------------------------- traces -------------------------------
+
+    def traces(
+        self,
+        limit: int = 50,
+        only_empty: bool = False,
+        only_degraded: bool = False,
+    ) -> _List[dict[str, Any]]:
+        """Recent queries against this workspace, newest first.
+
+        One row per retrieval, whatever the outcome — an answer that found
+        nothing is recorded exactly like one that found plenty, which is the
+        point: the queries worth reading are usually the disappointing ones.
+
+            for t in mv.traces(only_empty=True):
+                print(t["query"])          # what people asked and got nothing for
+
+        `only_degraded` narrows to runs where something fell back — a provider
+        timeout, a missing index — and each row says which.
+        """
+        payload = self._request(
+            "GET",
+            "/api/traces",
+            params={
+                "limit": limit,
+                "only_empty": only_empty,
+                "only_degraded": only_degraded,
+            },
+        )
+        return list(payload.get("traces", []))
+
+    def trace_stats(self, hours: int = 24) -> dict[str, Any]:
+        """How retrieval has behaved over a window: volume, empties, timings."""
+        return self._request("GET", "/api/traces/stats", params={"hours": hours})
 
     def trace(self, trace_id: str) -> dict[str, Any]:
         """Why a search returned what it did: every candidate, score and timing."""
@@ -339,12 +518,22 @@ class Collection:
         period_from: str | None = None,
         period_to: str | None = None,
         include_superseded: bool = False,
+        where: Where | None = None,
     ) -> Results:
         """Search by meaning and exact wording together.
 
         Pass `files` to search only within specific documents — a list of
         document ids, or the `Document` objects returned by `list()` / `files()`.
         Omit it to search the whole collection.
+
+        `where` filters on the metadata a document was ingested with — the same
+        object you passed to `add()` / `add_file()`:
+
+            docs.search("renewal terms", where={"client": "acme"})
+            docs.search("renewal terms", where={"kind": ["policy", "notice"]})
+
+        Different keys must ALL match; the same key with several values matches
+        any of them. Values are compared as text.
 
         The result carries a `trace_id`; pass it to `mv.trace()` to see every
         candidate and score behind it.
@@ -363,6 +552,8 @@ class Collection:
             params["period_from"] = period_from
         if period_to:
             params["period_to"] = period_to
+        if meta := _meta_params(where):
+            params["meta"] = meta
         return Results.from_json(
             self._mv._request("GET", "/api/search", params=params, headers=self._headers)
         )
@@ -374,8 +565,15 @@ class Collection:
         limit: int = 8,
         sources: list[str] | None = None,
         documents: list[str | Document] | None = None,
+        where: Where | None = None,
     ) -> Answer:
         """Retrieval, then a written answer built only from what was retrieved.
+
+        `where` narrows the answer to documents whose metadata matches, before
+        anything is retrieved — so an agent working for one client can be held
+        to that client's documents:
+
+            docs.answer("what did we agree on pricing", where={"client": "acme"})
 
         `documents` restricts the answer to those documents and nothing else —
         pass ids or Document objects. Leave it off and the store decides which
@@ -405,8 +603,46 @@ class Collection:
             # from list(), files() or add() — and reaching into it for .id is
             # busywork the caller should not have to write.
             params["doc"] = [d.id if isinstance(d, Document) else d for d in documents]
+        if meta := _meta_params(where):
+            params["meta"] = meta
         return Answer.from_json(
             self._mv._request("GET", "/api/answer", params=params, headers=self._headers)
+        )
+
+    def answer_stream(
+        self,
+        question: str,
+        mode: str = "agentic",
+        limit: int = 8,
+        sources: _List[str] | None = None,
+        documents: _List[str | Document] | None = None,
+        where: Where | None = None,
+    ) -> Iterator[StreamEvent]:
+        """The same answer as `answer()`, yielded as it is produced.
+
+        Each step arrives as it happens — the agent's reasoning, every tool call
+        and its result — and the LAST item is always the finished `Answer`:
+
+            for event in docs.answer_stream("why did churn rise"):
+                match event:
+                    case Thinking(text):        print(text, end="", flush=True)
+                    case ToolCall(name, args):  print(f"
+[{name}]")
+                    case Answer() as final:     print(final.text)
+
+        The generator is lazy: nothing is requested until you iterate, and
+        abandoning it closes the connection. Use `answer()` when you only want
+        the result — this exists to show the work while it happens.
+        """
+        params: dict[str, Any] = {"q": question, "mode": mode, "limit": limit}
+        if sources:
+            params["sources"] = sources
+        if documents:
+            params["doc"] = [d.id if isinstance(d, Document) else d for d in documents]
+        if meta := _meta_params(where):
+            params["meta"] = meta
+        return self._mv._stream_events(
+            "/api/answer/stream", params=params, headers=self._headers
         )
 
     def list(
@@ -543,6 +779,88 @@ class Collection:
         out.write_bytes(data)
         return out
 
+    def delete(self, document: str | Document, confirm: bool = False) -> Deletion:
+        """Delete a document and everything indexed from it.
+
+        Two steps, deliberately. The first call destroys NOTHING and returns
+        what would go:
+
+            plan = docs.delete(doc)          # nothing is deleted
+            print(plan)                      # Would delete 'COMPUTER NETWORKS': 2 version(s), 3915 passage(s)
+            docs.delete(doc, confirm=True)   # now it is gone
+
+        There is no undo and no trash to restore from, so a caller that means it
+        says so. Everything derived goes too — passages, vectors, the stored
+        original, every rendered page — because a passage that outlived its
+        document would still carry an embedding, and so would still answer
+        questions.
+
+        Raises `NotFound` if there is no such document in this collection.
+        """
+        doc = document.id if isinstance(document, Document) else document
+        response = self._mv._send(
+            "DELETE",
+            f"/api/items/{doc}",
+            params={"confirm": "true"} if confirm else None,
+            headers=self._headers,
+        )
+        if confirm:
+            if not response.is_success:
+                raise _error_for(response)
+            body = response.json() or {}
+            return Deletion.from_json(body, deleted=True)
+
+        # The unconfirmed call is REFUSED by design: 409, carrying the summary.
+        # A 2xx here would mean the server deleted something we promised it
+        # would not, so it is treated as an error rather than parsed.
+        if response.status_code == 409:
+            detail = (response.json() or {}).get("detail") or {}
+            return Deletion.from_json(detail.get("would_delete") or {})
+        raise _error_for(response)
+
+    def page_image(
+        self,
+        page: int | Citation,
+        document_id: str | Document | None = None,
+        path: str | Path | None = None,
+    ) -> bytes | Path:
+        """The picture of one page — or slide — as a PNG.
+
+        Two ways to call it, and the first is the one you usually want:
+
+            image = docs.page_image(answer.citations[0])   # what was cited
+            image = docs.page_image(34, document_id=doc)   # a page you chose
+
+        Returns the bytes, or writes them to `path` and returns the Path.
+
+        A citation whose `page_image` is None has no picture — a spreadsheet, a
+        pasted note, a deck uploaded before conversion was available — and this
+        raises `InvalidRequest` rather than requesting a URL that cannot exist.
+        Check `citation.page_image` (or `document.page_image`) first if you want
+        to branch instead of catching.
+        """
+        if isinstance(page, Citation):
+            if not page.page_image:
+                raise InvalidRequest(
+                    f"{page.title!r} has no picture of "
+                    f"{page.page_label or 'that page'} — page_image is None."
+                )
+            url = page.page_image
+        else:
+            if document_id is None:
+                raise InvalidRequest("page_image(page) needs document_id=...")
+            doc = document_id.id if isinstance(document_id, Document) else document_id
+            url = f"/api/items/{doc}/pages/{int(page)}"
+
+        response = self._mv._send("GET", url, headers=self._headers)
+        if not response.is_success:
+            raise _error_for(response)
+        if path is None:
+            return response.content
+        out = Path(path)
+        out.write_bytes(response.content)
+        return out
+
     def info(self) -> CollectionInfo:
         """This collection's model, dimensions and live counts."""
         return CollectionInfo.from_json(
@@ -580,6 +898,59 @@ class Collection:
         )
 
 
+# The longest this client will sit inside one retry. A server is entitled to
+# ask for a minute; a library is not entitled to block a caller's thread for it
+# without saying so, and RateLimited carries the number for code that wants to
+# schedule the work properly instead.
+MAX_RETRY_WAIT_SECONDS = 10.0
+
+
+def _retry_after(response: httpx.Response) -> float | None:
+    """The server's own answer to "when should I come back?", in seconds."""
+    raw = response.headers.get("retry-after")
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        # The HTTP date form. Rare from an API, and not worth parsing badly:
+        # falling back to the caller's backoff is honest, and never wrong by
+        # more than a few seconds.
+        return None
+
+
+def _backoff(response: httpx.Response, attempt: int) -> float:
+    """How long to wait before retrying — the server's number when it gave one."""
+    asked = _retry_after(response)
+    if asked is not None:
+        return min(asked, MAX_RETRY_WAIT_SECONDS)
+    return 0.4 * (2**attempt)
+
+
+def _stream_event(event: dict[str, Any]) -> StreamEvent | None:
+    """One SSE payload as the same event types the local agent yields.
+
+    Deliberately the same vocabulary: whether the reasoning happens on the
+    server (`answer_stream`) or in your own process (`Agent.stream`), a caller
+    renders it with one piece of code.
+    """
+    kind = event.get("type")
+    if kind == "thinking":
+        return Thinking(str(event.get("text") or ""))
+    if kind == "token":
+        return Thinking(str(event.get("delta") or ""))
+    if kind == "tool_call":
+        return ToolCall(str(event.get("tool") or ""), dict(event.get("args") or {}))
+    if kind == "tool_result":
+        detail = event.get("detail") or event.get("count")
+        return ToolResult(str(event.get("tool") or ""), str(detail if detail is not None else "ok"))
+    if kind == "done":
+        return Answer.from_json(event.get("answer") or {})
+    if kind == "error":
+        raise Unavailable(str(event.get("message") or "the stream failed"))
+    return None
+
+
 def _doc_id(file: str | Document) -> str:
     """A document id, whether given the id itself or a Document from list()."""
     return file.id if isinstance(file, Document) else str(file)
@@ -596,9 +967,22 @@ def _error_for(response: httpx.Response) -> MarkvectorError:
         return AuthError(detail)
     if status == 404:
         return NotFound(detail)
+    if status == 429:
+        # Its own type: the caller can schedule around this one, and the server
+        # has told us exactly when. Reaching here means the automatic waits
+        # were already spent.
+        wait = _retry_after(response)
+        limit = response.headers.get("ratelimit-limit")
+        if isinstance(detail, dict):
+            detail = detail.get("message") or str(detail)
+        return RateLimited(
+            str(detail),
+            retry_after=int(wait) if wait is not None else 1,
+            limit=int(limit) if limit and limit.isdigit() else None,
+        )
     if 400 <= status < 500:
         return InvalidRequest(detail)
     return Unavailable(f"{status}: {detail}")
 
 
-__all__ = ["Collection", "Markvector"]
+__all__ = ["SCOPES", "Collection", "Markvector", "StreamEvent", "Where"]

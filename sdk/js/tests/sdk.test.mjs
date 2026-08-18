@@ -12,6 +12,10 @@ import {
   VERSION,
 } from "../dist/index.js";
 
+// Every client now needs an explicit base URL: the SDK no longer carries a
+// default host, so an omitted one cannot quietly ship documents elsewhere.
+const BASE = "http://localhost:8000";
+
 const document = {
   id: "item-1",
   title: "Q2 note",
@@ -75,7 +79,7 @@ test("missing API key is AuthError", () => {
 });
 
 test("search maps server JSON to typed camelCase results", async () => {
-  const docs = new Markvector({ apiKey: "test", fetch: mockFetch }).collection("sdk-demo");
+  const docs = new Markvector({ apiKey: "test", baseUrl: BASE, fetch: mockFetch }).collection("sdk-demo");
   const result = await docs.search("why did paid results fall");
   assert.equal(result.traceId, "trace-1");
   assert.equal(result.matches[0].matchedOn, "meaning+wording");
@@ -83,7 +87,7 @@ test("search maps server JSON to typed camelCase results", async () => {
 });
 
 test("trace lookup works for the trace id returned by an SDK search", async () => {
-  const mv = new Markvector({ apiKey: "test", fetch: mockFetch });
+  const mv = new Markvector({ apiKey: "test", baseUrl: BASE, fetch: mockFetch });
   const result = await mv.collection("sdk-demo").search("why did paid results fall");
   const trace = await mv.trace(result.traceId);
   assert.equal(trace.trace_id, result.traceId);
@@ -110,7 +114,7 @@ class FakeLLM {
 }
 
 test("agent streams thoughts, reassembled tools, results, then answer", async () => {
-  const docs = new Markvector({ apiKey: "test", fetch: mockFetch }).collection("sdk-demo");
+  const docs = new Markvector({ apiKey: "test", baseUrl: BASE, fetch: mockFetch }).collection("sdk-demo");
   const events = [];
   for await (const event of docs.agent({ client: new FakeLLM(), model: "fake" }).stream("How?")) {
     events.push(event);
@@ -123,7 +127,7 @@ test("agent streams thoughts, reassembled tools, results, then answer", async ()
 });
 
 test("agent answer includes transcript and tool count", async () => {
-  const docs = new Markvector({ apiKey: "test", fetch: mockFetch }).collection("sdk-demo");
+  const docs = new Markvector({ apiKey: "test", baseUrl: BASE, fetch: mockFetch }).collection("sdk-demo");
   const result = await docs.agent({ client: new FakeLLM(), model: "fake" }).answer("How?");
   assert.equal(result.toolCalls, 1);
   assert.match(result.answer, /item-1/);
@@ -137,7 +141,7 @@ test("agent file selection is enforced on every search", async () => {
     if (url.pathname === "/api/search") searchedFiles = url.searchParams.getAll("item_ids");
     return mockFetch(input, init);
   };
-  const docs = new Markvector({ apiKey: "test", fetch: scopedFetch }).collection("sdk-demo");
+  const docs = new Markvector({ apiKey: "test", baseUrl: BASE, fetch: scopedFetch }).collection("sdk-demo");
   const result = await docs.agent({ client: new FakeLLM(), model: "fake" }).answer("How?", {
     files: ["item-1"],
   });
@@ -146,7 +150,7 @@ test("agent file selection is enforced on every search", async () => {
 });
 
 test("agent cannot open a document outside the selected file scope", async () => {
-  const docs = new Markvector({ apiKey: "test", fetch: mockFetch }).collection("sdk-demo");
+  const docs = new Markvector({ apiKey: "test", baseUrl: BASE, fetch: mockFetch }).collection("sdk-demo");
   const agent = docs.agent({ client: new FakeLLM(), model: "fake" });
   const result = await agent.runTool(
     "read_document",
@@ -158,7 +162,7 @@ test("agent cannot open a document outside the selected file scope", async () =>
 
 test("custom instructions are appended to the protected system prompt", async () => {
   const llm = new FakeLLM();
-  const docs = new Markvector({ apiKey: "test", fetch: mockFetch }).collection("sdk-demo");
+  const docs = new Markvector({ apiKey: "test", baseUrl: BASE, fetch: mockFetch }).collection("sdk-demo");
   await docs.agent({
     client: llm,
     model: "fake",

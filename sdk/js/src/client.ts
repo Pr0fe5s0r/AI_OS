@@ -1,9 +1,18 @@
-import { AuthError, MarkvectorError, Unavailable, IndexingTimeout, errorForStatus } from "./errors.js";
+import {
+  AuthError,
+  IndexingTimeout,
+  InvalidRequest,
+  MarkvectorError,
+  Unavailable,
+  errorForStatus,
+} from "./errors.js";
 import { Agent, type AgentOptions } from "./agent.js";
 import {
   type ApiKey,
   type Chunk,
+  type Citation,
   type CollectionInfo,
+  type Deletion,
   type Document,
   type IndexSummary,
   type Match,
@@ -16,6 +25,7 @@ import {
   toApiKey,
   toChunk,
   toCollectionInfo,
+  toDeletion,
   toDocument,
   toIndexSummary,
   toMintedKey,
@@ -26,10 +36,146 @@ import {
 } from "./models.js";
 import { SDK_CLIENT } from "./version.js";
 
-const DEFAULT_URL = "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me";
+// No default host. A client that forgets `baseUrl` should fail loudly rather
+// than send its documents somewhere — this used to point at our own demo
+// deployment, so an omitted option silently shipped a customer's content to a
+// server they had never heard of. Data residency is not a default worth having.
+const DEFAULT_URL = "";
+
+/** What a key may be minted with.
+ *
+ *    read    see document contents — bodies, passages, answers, originals,
+ *            page pictures, and traces, which carry queries and excerpts
+ *    write   ingest and edit those contents, and delete a document
+ *    manage  administer the CONTAINERS: create, rename and delete collections,
+ *            mint and revoke keys. It reads NOTHING — which is what lets an
+ *            operator set a tenant up and wind them down without being able to
+ *            open one of their documents.
+ */
+export const SCOPES = ["read", "write", "manage"] as const;
+export type Scope = (typeof SCOPES)[number];
+
+function normaliseScopes(scopes: string | string[]): string {
+  const wanted = (Array.isArray(scopes) ? scopes : scopes.split(","))
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const unknown = wanted.filter((s) => !(SCOPES as readonly string[]).includes(s));
+  if (unknown.length) {
+    // Refused here rather than sent: an unrecognised scope is silently dropped
+    // by the server's parser, so a key asked for "admin" would come back
+    // looking successful and able to do nothing.
+    throw new TypeError(
+      `unknown scope(s) ${unknown.join(", ")}; valid scopes are ${SCOPES.join(", ")}.`,
+    );
+  }
+  return wanted.join(",");
+}
 const RETRYABLE = new Set([429, 500, 502, 503, 504]);
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** The longest this client will sit inside one retry. A server is entitled to
+ *  ask for a minute; a library is not entitled to hold a caller's request open
+ *  for it without saying so — RateLimited carries the number for code that
+ *  wants to schedule the work properly instead. */
+const MAX_RETRY_WAIT_MS = 10_000;
+
+/** What `answerStream` yields: each step as it happens, then the finished
+ *  answer as the final value. Tagged by `kind` so a `switch` covers them. */
+export type StreamEvent =
+  | { kind: "thinking"; text: string }
+  | { kind: "tool_call"; name: string; arguments: Record<string, unknown> }
+  | { kind: "tool_result"; name: string; summary: string }
+  | { kind: "answer"; answer: Answer };
+
+/** One SSE block as a typed step, or null for anything this client does not
+ *  recognise — the server may learn to report a new kind of step, and a client
+ *  from last month should keep working when it does. */
+function parseSse(block: string): StreamEvent | null {
+  const line = block.split("\n").find((l) => l.startsWith("data:"));
+  if (!line) return null;
+  let event: Record<string, any>;
+  try {
+    event = JSON.parse(line.slice(5).trim());
+  } catch {
+    return null;
+  }
+  switch (event.type) {
+    case "thinking":
+      return { kind: "thinking", text: String(event.text ?? "") };
+    case "token":
+      return { kind: "thinking", text: String(event.delta ?? "") };
+    case "tool_call":
+      return {
+        kind: "tool_call",
+        name: String(event.tool ?? ""),
+        arguments: (event.args ?? {}) as Record<string, unknown>,
+      };
+    case "tool_result":
+      return {
+        kind: "tool_result",
+        name: String(event.tool ?? ""),
+        summary: String(event.detail ?? event.count ?? "ok"),
+      };
+    case "done":
+      return { kind: "answer", answer: toAnswer(event.answer ?? {}) };
+    case "error":
+      throw new Unavailable(String(event.message ?? "the stream failed"));
+    default:
+      return null;
+  }
+}
+
+function backoffMs(res: Response, attempt: number): number {
+  const raw = res.headers.get("retry-after");
+  const asked = raw === null ? NaN : Number(raw);
+  if (Number.isFinite(asked) && asked >= 0) {
+    return Math.min(asked * 1000, MAX_RETRY_WAIT_MS);
+  }
+  return 400 * 2 ** attempt;
+}
+
+/** What a metadata filter may be given for one key: one value, or several to
+ *  match any of. */
+export type Filterable = string | number | boolean;
+export type Where = Record<string, Filterable | Filterable[]>;
+
+/** One filter value as the server compares it: text.
+ *
+ *  Booleans are lowercased because that is how JSON — and therefore the stored
+ *  metadata — spells them. */
+function metaValue(value: Filterable): string {
+  return typeof value === "boolean" ? (value ? "true" : "false") : String(value);
+}
+
+/** A `where` object as the repeated key:value pairs the API takes.
+ *
+ *      { client: "acme", kind: ["policy", "notice"] }
+ *      -> client:acme, kind:policy, kind:notice
+ *
+ *  Different keys must all match; the same key repeated matches any of its
+ *  values. A key containing a colon cannot be expressed — the server splits on
+ *  the first one — so it is refused here rather than silently misread as a
+ *  shorter key with a longer value. */
+function metaParams(where: Where | undefined): [string, string][] {
+  if (!where) return [];
+  const out: [string, string][] = [];
+  for (const [key, value] of Object.entries(where)) {
+    if (!key || key.includes(":")) {
+      throw new TypeError(
+        `metadata key "${key}" cannot be used as a filter: keys must be non-empty and cannot contain a colon.`,
+      );
+    }
+    const values = Array.isArray(value) ? value : [value];
+    if (values.length === 0) {
+      throw new TypeError(
+        `metadata filter "${key}" has no values; omit the key instead of passing an empty array, which would match nothing.`,
+      );
+    }
+    for (const v of values) out.push(["meta", `${key}:${metaValue(v)}`]);
+  }
+  return out;
+}
 
 export interface MarkvectorOptions {
   apiKey?: string;
@@ -73,10 +219,22 @@ export class Markvector {
       );
     }
     this.key = key;
-    this.baseUrl = (options.baseUrl ?? envVar("MARKVECTOR_URL") ?? envVar("KB_URL") ?? DEFAULT_URL).replace(
-      /\/+$/,
-      "",
-    );
+    const url = (
+      options.baseUrl ??
+      envVar("MARKVECTOR_URL") ??
+      envVar("KB_URL") ??
+      DEFAULT_URL
+    ).replace(/\/+$/, "");
+    if (!url) {
+      throw new InvalidRequest(
+        "No baseUrl. Pass { baseUrl } or set MARKVECTOR_URL — for example " +
+          "http://localhost:8000 for a local stack, or your own deployment. " +
+          "There is deliberately no default: a client that silently sent documents " +
+          "to somebody else's server would be a data-residency incident, not a " +
+          "convenience.",
+      );
+    }
+    this.baseUrl = url;
     this.timeout = options.timeout ?? 30000;
     this.maxRetries = options.maxRetries ?? 2;
     this._fetch = options.fetch ?? fetch;
@@ -133,7 +291,10 @@ export class Markvector {
         continue;
       }
       if (method === "GET" && RETRYABLE.has(res.status) && attempt < this.maxRetries) {
-        await sleep(400 * 2 ** attempt);
+        // The server's own number when it gave one. Guessing shorter hammers a
+        // store that has just said it is busy; guessing longer wastes the
+        // caller's time. The header is the only party that knows.
+        await sleep(backoffMs(res, attempt));
         continue;
       }
       return res;
@@ -210,10 +371,14 @@ export class Markvector {
    *  it now. Pass `collectionId` to bind the key to one collection. */
   async createKey(
     name: string,
-    opts: { scopes?: string; collectionId?: string } = {},
+    opts: { scopes?: string | string[]; collectionId?: string } = {},
   ): Promise<MintedKey> {
     const created = await this.request("POST", "/api/keys", {
-      body: { name, scopes: opts.scopes ?? "read,write", collection_id: opts.collectionId ?? null },
+      body: {
+        name,
+        scopes: normaliseScopes(opts.scopes ?? "read,write"),
+        collection_id: opts.collectionId ?? null,
+      },
     });
     return toMintedKey(created as Record<string, unknown>);
   }
@@ -225,6 +390,37 @@ export class Markvector {
   /** Why a search returned what it did: every candidate, score and timing. */
   trace(traceId: string): Promise<Record<string, unknown>> {
     return this.request("GET", `/api/traces/${traceId}`);
+  }
+
+  /** Recent queries against this workspace, newest first.
+   *
+   *  One row per retrieval, whatever the outcome — an answer that found
+   *  nothing is recorded exactly like one that found plenty, which is the
+   *  point: the queries worth reading are usually the disappointing ones.
+   *  `onlyDegraded` narrows to runs where something fell back, and each row
+   *  says which. */
+  async traces(
+    opts: { limit?: number; onlyEmpty?: boolean; onlyDegraded?: boolean } = {},
+  ): Promise<Record<string, unknown>[]> {
+    const payload = await this.request<{ traces?: Record<string, unknown>[] }>(
+      "GET",
+      "/api/traces",
+      {
+        query: [
+          ["limit", String(opts.limit ?? 50)],
+          ["only_empty", String(opts.onlyEmpty ?? false)],
+          ["only_degraded", String(opts.onlyDegraded ?? false)],
+        ],
+      },
+    );
+    return payload.traces ?? [];
+  }
+
+  /** How retrieval has behaved over a window: volume, empties, timings. */
+  traceStats(opts: { hours?: number } = {}): Promise<Record<string, unknown>> {
+    return this.request("GET", "/api/traces/stats", {
+      query: [["hours", String(opts.hours ?? 24)]],
+    });
   }
 }
 
@@ -330,6 +526,12 @@ export class Collection {
       files?: (string | Document)[];
       sources?: string[];
       includeSuperseded?: boolean;
+      /** Filter on the metadata a document was ingested with — the same object
+       *  passed to `add()` / `addFile()`. Different keys must all match; an
+       *  array matches any of its values. */
+      where?: Where;
+      periodFrom?: string;
+      periodTo?: string;
     } = {},
   ): Promise<Results> {
     const q: [string, string][] = [
@@ -340,6 +542,9 @@ export class Collection {
     ];
     for (const f of opts.files ?? []) q.push(["item_ids", docId(f)]);
     for (const s of opts.sources ?? []) q.push(["sources", s]);
+    if (opts.periodFrom) q.push(["period_from", opts.periodFrom]);
+    if (opts.periodTo) q.push(["period_to", opts.periodTo]);
+    q.push(...metaParams(opts.where));
     return toResults(await this.mv.request("GET", "/api/search", { collection: this.id, query: q }));
   }
 
@@ -351,7 +556,15 @@ export class Collection {
    *  Check `answer.grounded`. */
   async answer(
     question: string,
-    opts: { mode?: "agentic" | "hybrid" | "vectorless"; limit?: number; sources?: string[] } = {},
+    opts: {
+      mode?: "agentic" | "hybrid" | "vectorless";
+      limit?: number;
+      sources?: string[];
+      /** Narrow the answer to documents whose metadata matches, BEFORE
+       *  anything is retrieved — so an agent working for one client can be
+       *  held to that client's documents. */
+      where?: Where;
+    } = {},
   ): Promise<Answer> {
     const q: [string, string][] = [
       ["q", question],
@@ -359,7 +572,73 @@ export class Collection {
       ["limit", String(opts.limit ?? 8)],
     ];
     for (const s of opts.sources ?? []) q.push(["sources", s]);
+    q.push(...metaParams(opts.where));
     return toAnswer(await this.mv.request("GET", "/api/answer", { collection: this.id, query: q }));
+  }
+
+  /** The same answer as `answer()`, yielded as it is produced.
+   *
+   *  Each step arrives as it happens — the model's reasoning, every tool call
+   *  and its result — and the LAST value is always the finished Answer:
+   *
+   *      for await (const event of docs.answerStream("why did churn rise")) {
+   *        if (event.kind === "thinking") process.stdout.write(event.text);
+   *        if (event.kind === "answer") console.log(event.answer.text);
+   *      }
+   *
+   *  Lazy: nothing is requested until you iterate, and breaking out of the
+   *  loop closes the connection. Use `answer()` when you only want the result
+   *  — this exists to show the work while it happens. */
+  async *answerStream(
+    question: string,
+    opts: {
+      mode?: "agentic" | "hybrid" | "vectorless";
+      limit?: number;
+      sources?: string[];
+      files?: (string | Document)[];
+      where?: Where;
+    } = {},
+  ): AsyncGenerator<StreamEvent> {
+    const q: [string, string][] = [
+      ["q", question],
+      ["mode", opts.mode ?? "agentic"],
+      ["limit", String(opts.limit ?? 8)],
+    ];
+    for (const s of opts.sources ?? []) q.push(["sources", s]);
+    for (const f of opts.files ?? []) q.push(["doc", docId(f)]);
+    q.push(...metaParams(opts.where));
+
+    const res = await this.mv.send("GET", "/api/answer/stream", {
+      collection: this.id,
+      query: q,
+    });
+    if (!res.ok || !res.body) throw await errorFrom(res);
+
+    // Server-Sent Events, decoded a chunk at a time. Split on the blank line
+    // that ends an event rather than on every newline: a `data:` payload may
+    // itself contain newlines, and splitting naively truncates the answer at
+    // the first paragraph break.
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let split: number;
+        while ((split = buffer.indexOf("\n\n")) !== -1) {
+          const block = buffer.slice(0, split);
+          buffer = buffer.slice(split + 2);
+          const event = parseSse(block);
+          if (event) yield event;
+        }
+      }
+    } finally {
+      // Reached on `break` as well as on completion, so abandoning the loop
+      // does not leave the connection open.
+      await reader.cancel().catch(() => {});
+    }
   }
 
   /** What this collection holds. */
@@ -479,6 +758,74 @@ export class Collection {
     });
   }
 
+  /** Delete a document and everything indexed from it.
+   *
+   *  Two steps, deliberately. The first call destroys NOTHING and returns what
+   *  would go:
+   *
+   *      const plan = await docs.delete(doc);              // nothing deleted
+   *      await docs.delete(doc, { confirm: true });        // now it is gone
+   *
+   *  There is no undo and no trash to restore from, so a caller that means it
+   *  says so. Everything derived goes too — passages, vectors, the stored
+   *  original, every rendered page — because a passage that outlived its
+   *  document would still carry an embedding, and so would still answer
+   *  questions. */
+  async delete(
+    document: string | Document,
+    opts: { confirm?: boolean } = {},
+  ): Promise<Deletion> {
+    const path = `/api/items/${docId(document)}`;
+    const res = await this.mv.send("DELETE", path, {
+      collection: this.id,
+      query: opts.confirm ? [["confirm", "true"]] : [],
+    });
+    if (opts.confirm) {
+      if (!res.ok) throw await errorFrom(res);
+      return toDeletion((await res.json()) ?? {}, true);
+    }
+    // The unconfirmed call is REFUSED by design: 409, carrying the summary. A
+    // 2xx here would mean the server deleted something we promised it would
+    // not, so it is treated as an error rather than parsed.
+    if (res.status === 409) {
+      const body = (await res.json()) ?? {};
+      return toDeletion(body.detail?.would_delete ?? {});
+    }
+    throw await errorFrom(res);
+  }
+
+  /** The picture of one page — or slide — as PNG bytes.
+   *
+   *  Two ways to call it, and the first is the one you usually want:
+   *
+   *      const png = await docs.pageImage(answer.citations[0]);
+   *      const png = await docs.pageImage(34, { documentId: doc });
+   *
+   *  A citation whose `pageImage` is null has no picture — a spreadsheet, a
+   *  pasted note, a deck whose conversion has not run — and this throws rather
+   *  than requesting a URL that cannot exist. Check `citation.pageImage` first
+   *  if you would rather branch than catch. */
+  async pageImage(
+    page: number | Citation,
+    opts: { documentId?: string | Document } = {},
+  ): Promise<Uint8Array> {
+    let path: string;
+    if (typeof page === "number") {
+      if (!opts.documentId) throw new TypeError("pageImage(page) needs { documentId }");
+      path = `/api/items/${docId(opts.documentId)}/pages/${page}`;
+    } else {
+      if (!page.pageImage) {
+        throw new TypeError(
+          `"${page.title}" has no picture of ${page.pageLabel ?? "that page"} — pageImage is null.`,
+        );
+      }
+      path = page.pageImage;
+    }
+    const res = await this.mv.send("GET", path, { collection: this.id });
+    if (!res.ok) throw await errorFrom(res);
+    return new Uint8Array(await res.arrayBuffer());
+  }
+
   /** This collection's model, dimensions and live counts. */
   async info(): Promise<CollectionInfo> {
     return toCollectionInfo(await this.mv.request("GET", `/api/collections/${this.id}`));
@@ -507,12 +854,16 @@ function envVar(name: string): string | undefined {
 async function errorFrom(res: Response): Promise<MarkvectorError> {
   let detail = res.statusText;
   try {
-    const body = (await res.json()) as { detail?: string };
-    if (body?.detail) detail = body.detail;
+    const body = (await res.json()) as { detail?: string | { message?: string } };
+    // A refusal may carry structure rather than a sentence — the rate limiter
+    // reports the class and the limit alongside its message. Take the message
+    // when there is one, so the error still reads like an error.
+    if (typeof body?.detail === "string") detail = body.detail;
+    else if (body?.detail?.message) detail = body.detail.message;
   } catch {
     /* not a JSON error body */
   }
-  return errorForStatus(res.status, detail);
+  return errorForStatus(res.status, detail, res.headers);
 }
 
 async function readFileInput(file: FileInput): Promise<{ data: Uint8Array | Blob; name: string }> {

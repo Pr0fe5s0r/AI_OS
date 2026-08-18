@@ -1,5 +1,5 @@
 import { MarkvectorError } from "./errors.js";
-import { type Collection } from "./client.js";
+import { type Collection, type Where } from "./client.js";
 import { type Document, walkSections } from "./models.js";
 
 const DEFAULT_MODEL = "gpt-4o-mini";
@@ -70,6 +70,21 @@ export interface AgentOptions {
   system?: string;
   maxSteps?: number;
   temperature?: number;
+  /** Confine every search this agent makes to documents whose metadata
+   *  matches — set by the CALLER, and deliberately not offered to the model as
+   *  a tool parameter.
+   *
+   *  That asymmetry is the point. A filter the model could set is a filter the
+   *  model could widen: it would decide for itself which client's documents it
+   *  may read, from a question a user typed. Pinned here, the run is confined
+   *  by the program that started it and the model reasons freely inside that
+   *  confinement.
+   *
+   *  Honest limit: the API accepts metadata filters on search and answer, so
+   *  `overview` and `list_files` still describe the whole collection the key
+   *  can reach. Bind the key to a collection when the catalogue itself must
+   *  not be visible. */
+  where?: Where;
 }
 
 /** Scope one question to selected documents. Omit `files` to use the entire collection. */
@@ -214,12 +229,16 @@ export class Agent {
   readonly system: string;
   readonly maxSteps: number;
   readonly temperature: number;
+  /** The caller's metadata confinement, applied to every search this agent
+   *  makes. Readable so a caller can assert what a run was scoped to. */
+  readonly where: Where | undefined;
   private readonly client: Promise<AgentClient>;
 
   constructor(
     private readonly collection: Collection,
     options: AgentOptions = {},
   ) {
+    this.where = options.where;
     this.model = options.model ?? DEFAULT_MODEL;
     this.system = withInstructions(options.system ?? DEFAULT_SYSTEM, options.instructions);
     this.maxSteps = options.maxSteps ?? 8;
@@ -377,7 +396,11 @@ export class Agent {
         // An empty item_ids query means "no filter" to the HTTP API, so stop
         // here rather than accidentally widening an empty selection to all.
         if (selectedFiles !== undefined && (files?.length ?? 0) === 0) return [];
-        const results = await this.collection.search(String(args.query ?? ""), { limit, files });
+        const results = await this.collection.search(String(args.query ?? ""), {
+          limit,
+          files,
+          where: this.where,
+        });
         return results.matches.map((hit) => ({
           item_id: hit.id,
           // The winning passage's id, so the model can hop from a hit to its

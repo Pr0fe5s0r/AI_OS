@@ -92,7 +92,7 @@ def _search_handler(request: httpx.Request) -> httpx.Response:
 
 
 def _agent():
-    mv = Markvector(api_key="test", transport=httpx.MockTransport(_search_handler))
+    mv = Markvector(api_key="test", base_url="http://localhost:8000", transport=httpx.MockTransport(_search_handler))
     return mv.collection("default").agent(client=_FakeLLM(), model="fake")
 
 
@@ -130,7 +130,7 @@ def test_answer_returns_final_plus_transcript():
 def test_tool_error_is_data_not_an_exception():
     # A structure() call against a missing document 404s; the agent must turn
     # that into a tool result the model can read, not raise out of the loop.
-    mv = Markvector(api_key="test", transport=httpx.MockTransport(_search_handler))
+    mv = Markvector(api_key="test", base_url="http://localhost:8000", transport=httpx.MockTransport(_search_handler))
     agent = mv.collection("default").agent(client=_FakeLLM(), model="fake")
     out = agent._run_tool("structure", {"item_id": "missing"})
     assert "error" in out
@@ -144,7 +144,7 @@ def test_agent_file_selection_is_enforced_on_every_search():
             seen["files"] = request.url.params.get_list("item_ids")
         return _search_handler(request)
 
-    mv = Markvector(api_key="test", transport=httpx.MockTransport(handler))
+    mv = Markvector(api_key="test", base_url="http://localhost:8000", transport=httpx.MockTransport(handler))
     agent = mv.collection("default").agent(client=_FakeLLM(), model="fake")
     result = agent.answer("How does voice input work?", files=["item-1"])
 
@@ -162,7 +162,7 @@ def test_agent_cannot_open_a_document_outside_the_selected_file_scope():
 
 def test_custom_instructions_are_appended_to_the_protected_system_prompt():
     llm = _FakeLLM()
-    mv = Markvector(api_key="test", transport=httpx.MockTransport(_search_handler))
+    mv = Markvector(api_key="test", base_url="http://localhost:8000", transport=httpx.MockTransport(_search_handler))
     agent = mv.collection("default").agent(
         client=llm,
         model="fake",
@@ -189,7 +189,7 @@ def test_config_without_openai_is_a_clear_error(monkeypatch):
         return real_import(name, *a, **k)
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
-    mv = Markvector(api_key="test", transport=httpx.MockTransport(_search_handler))
+    mv = Markvector(api_key="test", base_url="http://localhost:8000", transport=httpx.MockTransport(_search_handler))
     try:
         mv.collection("default").agent(api_key="sk-x")
         raised = False

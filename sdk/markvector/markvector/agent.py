@@ -6,7 +6,9 @@ from collections.abc import Generator, Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from .client import Where, _meta_params
 from .errors import MarkvectorError
+from .models import AgentAnswer, Thinking, ToolCall, ToolResult
 
 if TYPE_CHECKING:
     from .client import Collection
@@ -74,39 +76,6 @@ contain the answer, say so rather than guessing; if it answers only part, give \
 that part and name the gap; if the sources conflict, report the conflict as the \
 finding. A hedged paragraph that hides which of these happened is worse than a \
 short answer that names it."""
-
-
-# --------------------------------- events ---------------------------------
-
-
-@dataclass(slots=True)
-class Thinking:
-    """A delta of the model's visible reasoning as it streams."""
-
-    text: str
-
-
-@dataclass(slots=True)
-class ToolCall:
-    """The agent is about to run a tool."""
-
-    name: str
-    arguments: dict[str, Any]
-
-
-@dataclass(slots=True)
-class ToolResult:
-    """A tool has returned — a compact summary of what it produced."""
-
-    name: str
-    summary: str
-
-
-@dataclass(slots=True)
-class AgentAnswer:
-    """The final answer. Emitted once, at the end of a run."""
-
-    text: str
 
 
 # Thinking | ToolCall | ToolResult | AgentAnswer
@@ -251,6 +220,7 @@ class Agent:
         instructions: str | None = None,
         max_steps: int = 8,
         temperature: float = 0.0,
+        where: Where | None = None,
     ) -> None:
         self._c = collection
         self._client = client or _build_client(api_key, base_url)
@@ -258,6 +228,21 @@ class Agent:
         self.system = _with_instructions(system or SYSTEM, instructions)
         self.max_steps = max_steps
         self.temperature = temperature
+        # Set by the CALLER, applied to every search the agent makes, and not
+        # offered to the model as a tool parameter.
+        #
+        # That asymmetry is the point. A filter the model could set is a filter
+        # the model could widen — it would decide for itself which client's
+        # documents it may read, from a question a user typed. Pinning it here
+        # means the run is confined by the program that started it, and the
+        # model reasons freely INSIDE that confinement.
+        #
+        # Honest limit: the API accepts metadata filters on search and answer,
+        # so `overview` and `list_files` still describe the whole collection a
+        # key can reach. Bind the key to a collection when the catalogue itself
+        # must not be visible.
+        self.where = where
+        _meta_params(where)  # fail now, on a bad filter, not mid-run
 
     # ------------------------------ the loop ------------------------------
 
@@ -455,6 +440,7 @@ class Agent:
                     str(args.get("query", "")),
                     limit=int(args.get("limit", 8) or 8),
                     files=files or None,
+                    where=self.where,
                 )
                 return [
                     {

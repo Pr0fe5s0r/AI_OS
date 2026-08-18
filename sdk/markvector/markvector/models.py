@@ -81,6 +81,13 @@ class Document:
     period_end: datetime | None = None
     categories: list[Category] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    # How this document can be addressed, declared by the server so nothing has
+    # to be discovered by trial: how many parts it has, what they are called,
+    # and whether a picture of one can be fetched. A deck answers 79 / "slide" /
+    # True; a spreadsheet answers 0 / None / False.
+    pages: int = 0
+    page_unit: str | None = None
+    page_image: bool = False
 
     @property
     def original(self) -> Original | None:
@@ -104,6 +111,91 @@ class Document:
             period_end=_dt(d.get("period_end")),
             categories=[Category.from_json(c) for c in d.get("classes") or []],
             metadata=d.get("metadata") or {},
+            pages=int(d.get("pages") or 0),
+            page_unit=d.get("page_unit") or None,
+            page_image=bool(d.get("page_image")),
+        )
+
+
+# --------------------------------- events ---------------------------------
+#
+# The vocabulary for watching work happen, wherever the work is done. The same
+# four types describe a run whether the reasoning happens on the server
+# (`collection.answer_stream`) or in your own process (`Agent.stream`), so a
+# caller renders both with one piece of code.
+#
+# They live here, with the other shared types, rather than in agent.py: the
+# client streams them too, and a type imported in both directions is how a
+# circular import starts.
+
+
+@dataclass(slots=True)
+class Thinking:
+    """A delta of the model's visible reasoning as it streams."""
+
+    text: str
+
+
+@dataclass(slots=True)
+class ToolCall:
+    """A tool is about to run."""
+
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass(slots=True)
+class ToolResult:
+    """A tool has returned — a compact summary of what it produced."""
+
+    name: str
+    summary: str
+
+
+@dataclass(slots=True)
+class AgentAnswer:
+    """The final answer of a local agent run. Emitted once, at the end."""
+
+    text: str
+
+
+@dataclass(slots=True)
+class Deletion:
+    """What deleting one document would destroy, or did.
+
+    Returned by `collection.delete(id, confirm=False)` — which destroys nothing
+    — so a person can be shown the real numbers before they agree. "Delete this
+    document?" is a question nobody can answer well; "delete COMPUTER NETWORKS,
+    2 versions, 3,915 passages, permanently" is.
+    """
+
+    item_id: str
+    title: str
+    versions: int
+    passages: int
+    deleted: bool = False
+
+    @classmethod
+    def from_json(cls, d: dict[str, Any], *, deleted: bool = False) -> Deletion:
+        # Two shapes, one meaning. The PREVIEW counts what would go
+        # (`versions`, `passages`); the confirmed delete reports what did, by
+        # table (`kb_items`, `kb_chunks`). Reading only the first made a real
+        # deletion announce "0 version(s), 0 passage(s)" — seen against the
+        # live server, and exactly the sort of wrong number that makes a caller
+        # doubt whether anything happened.
+        return cls(
+            item_id=d.get("item_id", ""),
+            title=d.get("title", ""),
+            versions=int(d.get("versions", d.get("kb_items", 0)) or 0),
+            passages=int(d.get("passages", d.get("kb_chunks", 0)) or 0),
+            deleted=deleted,
+        )
+
+    def __str__(self) -> str:
+        what = "Deleted" if self.deleted else "Would delete"
+        return (
+            f"{what} {self.title!r}: {self.versions} version(s), "
+            f"{self.passages} passage(s)"
         )
 
 
@@ -387,6 +479,17 @@ class Citation:
     # table checkable instead of merely plausible. None means it came from text,
     # where there is no single page to point at.
     page: int | None = None
+    # The same location in the document's own words — "slide 34", "page 12".
+    # Show THIS rather than building the phrase yourself: a deck has slides, and
+    # working out which noun a document uses from its file extension is exactly
+    # the per-format special case the API exists to absorb.
+    page_label: str | None = None
+    # Where to fetch the picture of that page, or None when this document has
+    # none — a spreadsheet, a pasted note, a deck whose conversion has not run.
+    # STATED, so nothing has to request the URL and read a 404 to find out.
+    # Relative to the client's base_url; use `mv.page_image(citation)` to get
+    # the bytes.
+    page_image: str | None = None
     # And where on that page. Without these a reader is told "page 14" and left
     # to search it; with them the highlight lands on the row that was actually
     # read. Empty whenever the passage came from text.
@@ -404,6 +507,8 @@ class Citation:
             text=d.get("text", ""),
             score=float(d.get("score", 0) or 0),
             page=int(page) if page is not None else None,
+            page_label=d.get("page_label") or None,
+            page_image=d.get("page_image") or None,
             regions=[Region.from_json(r) for r in d.get("regions") or []],
         )
 

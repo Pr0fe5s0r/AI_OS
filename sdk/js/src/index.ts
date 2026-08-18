@@ -1,13 +1,21 @@
 export { Agent, AgentAnswer, AgentResult, Thinking, ToolCall, ToolResult } from "./agent.js";
 export type { AgentClient, AgentEvent, AgentOptions, AgentQueryOptions } from "./agent.js";
-export { Collection, Markvector } from "./client.js";
-export type { FileInput, MarkvectorOptions } from "./client.js";
+export { Collection, Markvector, SCOPES } from "./client.js";
+export type {
+  Filterable,
+  FileInput,
+  MarkvectorOptions,
+  Scope,
+  StreamEvent,
+  Where,
+} from "./client.js";
 export {
   AuthError,
   IndexingTimeout,
   InvalidRequest,
   MarkvectorError,
   NotFound,
+  RateLimited,
   Unavailable,
 } from "./errors.js";
 export type {
@@ -17,6 +25,7 @@ export type {
   Chunk,
   Citation,
   CollectionInfo,
+  Deletion,
   Document,
   IndexSummary,
   Match,

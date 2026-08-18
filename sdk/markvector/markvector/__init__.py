@@ -24,13 +24,14 @@ from .agent import (
     ToolCall,
     ToolResult,
 )
-from .client import Collection, Markvector
+from .client import SCOPES, Collection, Markvector, Where
 from .errors import (
     AuthError,
     IndexingTimeout,
     InvalidRequest,
     MarkvectorError,
     NotFound,
+    RateLimited,
     Unavailable,
 )
 from .models import (
@@ -40,6 +41,7 @@ from .models import (
     Chunk,
     Citation,
     CollectionInfo,
+    Deletion,
     Document,
     IndexSummary,
     Match,
@@ -68,6 +70,7 @@ __all__ = [
     "Citation",
     "Collection",
     "CollectionInfo",
+    "Deletion",
     "Document",
     "IndexSummary",
     "IndexingTimeout",
@@ -79,8 +82,10 @@ __all__ = [
     "Neighbor",
     "NotFound",
     "Original",
+    "RateLimited",
     "Region",
     "Results",
+    "SCOPES",
     "Section",
     "Source",
     "Structure",
@@ -88,6 +93,7 @@ __all__ = [
     "ToolCall",
     "ToolResult",
     "Unavailable",
+    "Where",
     "WriteResult",
     "__version__",
 ]

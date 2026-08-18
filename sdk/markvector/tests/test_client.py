@@ -9,6 +9,7 @@ from markvector import (
     AuthError,
     Chunk,
     Document,
+    InvalidRequest,
     Markvector,
     NotFound,
     Results,
@@ -169,7 +170,7 @@ def handler(request: httpx.Request) -> httpx.Response:
 
 
 def make() -> Markvector:
-    return Markvector(api_key="test", transport=httpx.MockTransport(handler))
+    return Markvector(api_key="test", base_url="http://localhost:8000", transport=httpx.MockTransport(handler))
 
 
 def test_missing_key_is_an_auth_error(monkeypatch):
@@ -181,8 +182,23 @@ def test_missing_key_is_an_auth_error(monkeypatch):
 
 def test_whoami_and_key_from_env(monkeypatch):
     monkeypatch.setenv("MARKVECTOR_API_KEY", "from-env")
+    monkeypatch.setenv("MARKVECTOR_URL", "http://localhost:8000")
     mv = Markvector(transport=httpx.MockTransport(handler))
     assert mv.whoami()["workspace_id"] == "ws"
+
+
+def test_a_client_with_nowhere_to_point_refuses_to_be_built(monkeypatch):
+    """There is deliberately no default host.
+
+    This used to be our own demo deployment, so a caller who forgot base_url
+    shipped their documents to a server they had never heard of — and nothing
+    said so. Failing here costs one line of configuration; the alternative
+    costs a data-residency incident.
+    """
+    for name in ("MARKVECTOR_URL", "KB_URL"):
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(InvalidRequest, match="No base_url"):
+        Markvector(api_key="test")
 
 
 def test_write_then_wait_returns_the_document():
@@ -235,7 +251,7 @@ def test_search_within_selected_files():
             )
         return httpx.Response(404, json={"detail": "x"})
 
-    mv = Markvector(api_key="test", transport=httpx.MockTransport(h))
+    mv = Markvector(api_key="test", base_url="http://localhost:8000", transport=httpx.MockTransport(h))
     docs = mv.collection("sdk-demo")
     # Accepts both raw ids and Document objects.
     doc = Document.from_json(DOC)
@@ -276,7 +292,7 @@ def test_files_returns_only_uploads():
             return httpx.Response(200, json={"count": 2, "items": [DOC, text_doc]})
         return httpx.Response(404, json={"detail": "x"})
 
-    docs = Markvector(api_key="test", transport=httpx.MockTransport(h)).collection("sdk-demo")
+    docs = Markvector(api_key="test", base_url="http://localhost:8000", transport=httpx.MockTransport(h)).collection("sdk-demo")
     assert len(docs.list()) == 2
     files = docs.files()
     assert [d.id for d in files] == ["item-1"]
