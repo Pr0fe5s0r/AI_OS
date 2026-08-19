@@ -490,12 +490,39 @@ _NOT_ON_PAGE = "NOT_ON_THIS_PAGE"
 # Both are conclusions of absence, and a conclusion of absence drawn from two
 # sections that a search picked is worth almost nothing. This is what triggers
 # one push to search before such an answer is accepted.
+# The nouns a model uses for the STORE when it is telling you the store has
+# nothing — as opposed to the subject a real answer is about.
+_CORPUS = r"(?:store|collection|documents?|text|passages?|sections?|context|information)"
+
 _READS_AS_ABSENT = re.compile(
     r"\b(?:is|are|was|were)\s+not\s+(?:named|given|provided|specified|mentioned|stated)\b"
     r"|\bdoes\s+not\s+(?:say|name|give|provide|specify|mention|state)\b"
     r"|\bno\s+(?:mention|name|reference)\s+of\b"
     r"|\bnot\s+(?:provided|specified|named)\s+in\s+the\b"
-    r"|\bcannot\s+be\s+determined\b",
+    r"|\bcannot\s+be\s+determined\b"
+    # The phrasings refusals actually arrive in, which the list above missed:
+    # "the store does not CONTAIN a description of the OSI reference model
+    # diagram" and "the question cannot be ANSWERED" both came back marked
+    # grounded, carrying citations, because neither says "mention" or "state".
+    #
+    # The last two rules are anchored to the CORPUS lacking something, not to
+    # any subject lacking it, and that anchoring is the whole point. Unanchored
+    # they also catch "the policy does not contain exclusions for pre-existing
+    # conditions, so cover applies" and "none of the regions grew faster than
+    # Nordics" — real answers, which would then be thrown away as ungrounded.
+    # The 40-character gap is for a subject the model names in passing: the
+    # document "COMPUTER NETWORKS" does not contain…
+    #
+    # Two rules rather than one because a model carries the negation either
+    # way: "the documents do not contain X", and "none of the documents
+    # contain X". The second escaped a first attempt at this and reached the
+    # screen as a refusal displayed under two citations.
+    r"|\bcannot\s+be\s+answered\b"
+    r"|\bno\s+information\s+(?:about|on|regarding)\b"
+    r"|\bnot\s+found\s+in\s+the\b"
+    r"|\b" + _CORPUS + r"\b[^.]{0,40}?"
+    r"\bdo(?:es)?\s+not\s+(?:contain|include|cover|discuss|reference|mention)\b"
+    r"|\bnone\s+of\s+the\b[^.]{0,40}?\b" + _CORPUS + r"\b",
     re.I,
 )
 
@@ -534,6 +561,31 @@ _SEARCH_FIRST = (
     "If the search also finds nothing, say so and cite what you read — a "
     "considered 'not in these documents' is a fine answer. A guess after two "
     "sections is not."
+)
+
+# Sent when the model writes its answer as prose instead of calling
+# submit_answer.
+#
+# submit_answer carries `found`, and prose does not. Without it there is no
+# signal for whether the answer is an answer or a refusal, and the only thing
+# left is to read the model's words and guess — which is what
+# _READS_AS_ABSENT does, and which kept missing: it knew "does not mention"
+# but not "does not contain"; then it knew that but not "none of the documents
+# contain". Each miss reached the screen as a refusal displayed above the
+# citations and page images of everything that had been read.
+#
+# So ask instead of guessing. The model knows whether it found the thing; the
+# only reason we were inferring it is that it forgot to say. Asked once, and
+# once only — a nudge repeated is a deadlock, and the prose is still accepted
+# if it declines.
+_SUBMIT_PROPERLY = (
+    "Send that through submit_answer rather than as a message, so the answer "
+    "is recorded with whether you actually found what was asked for.\n"
+    "Set found=true only if the passages you read answer the question. If they "
+    "do not — if the documents simply do not cover it — set found=false and "
+    "say so in the answer. Both are proper outcomes; a considered 'not in "
+    "these documents' is as useful as a find, and recording it as a find is "
+    "the one thing that is not."
 )
 
 _TOOLS = [
@@ -2081,6 +2133,9 @@ async def navigate(
     # back once for concluding something is absent without it.
     searched = False
     pressed_to_search = False
+    # And whether it has been sent back once for answering in prose instead of
+    # through submit_answer, which is where `found` comes from.
+    pressed_to_submit = False
 
     mark = time.perf_counter()
     for round_number in range(1, max_rounds + 1):
@@ -2249,9 +2304,41 @@ async def navigate(
                     messages.append({"role": "user", "content": _SEARCH_FIRST})
                     record(Step(round_number, "sent back", "concluded absent without searching"))
                     continue
+
+                # Ask for `found` rather than inferring it from the prose. The
+                # model has it and merely skipped the tool that carries it;
+                # everything below this point is guesswork by comparison.
+                #
+                # Once, and only with TWO rounds of headroom. Compliance is not
+                # guaranteed — the model sometimes writes prose again — so the
+                # press needs a round to be obeyed in and another to fall back
+                # in. With a single round left it spent the one that would have
+                # produced the answer, and a question that had been answered
+                # with six citations came back "I read 6 sections without
+                # reaching an answer".
+                if not pressed_to_submit and round_number + 1 < max_rounds:
+                    pressed_to_submit = True
+                    messages.append({"role": "assistant", "content": reply.get("content") or ""})
+                    messages.append({"role": "user", "content": _SUBMIT_PROPERLY})
+                    record(Step(round_number, "sent back", "answered without submit_answer"))
+                    continue
+
                 outcome.answer = drafted
-                outcome.found = bool(read)
-                record(Step(round_number, "answered", "without submit_answer"))
+                # Only reached when the model was asked for `found` and wrote
+                # prose anyway. Reading its words is a guess and has been wrong
+                # twice — "does not contain", then "none of the documents
+                # contain" — each miss reaching the screen as a refusal above
+                # the citations of everything read. It stays because the
+                # alternative at this point is to assume every unasked-for
+                # paragraph is a find, which is how that started.
+                outcome.found = bool(read) and not _reads_as_absent(drafted)
+                record(
+                    Step(
+                        round_number,
+                        "answered",
+                        "without submit_answer" if outcome.found else "not found, in prose",
+                    )
+                )
             break
 
         messages.append(
@@ -3200,6 +3287,12 @@ async def navigate(
             "I read " + str(len(read)) + " section(s) without reaching an answer. "
             "The passages below are what was opened."
         )
+        # And it is NOT a find. This said so in words while leaving `found`
+        # at whatever the loop had left behind, so "I read 6 sections without
+        # reaching an answer" came back grounded, over six citations — the
+        # same contradiction as the prose path, one level further out. A
+        # sentence admitting there is no answer must not be stamped as one.
+        outcome.found = False
         record(Step(outcome.rounds, "gave up", "out of rounds"))
 
     # A catalogue-only answer over a collection too big to lay out saw part of
