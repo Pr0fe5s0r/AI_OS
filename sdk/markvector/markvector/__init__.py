@@ -24,7 +24,7 @@ from .agent import (
     ToolCall,
     ToolResult,
 )
-from .client import SCOPES, Collection, Markvector, Where
+from .client import SCOPES, Collection, Markvector, MultiCollection, Where
 from .errors import (
     AuthError,
     IndexingTimeout,
@@ -55,7 +55,6 @@ from .models import (
     Structure,
     WriteResult,
 )
-from .patterns import Pattern, PatternReport
 
 __version__ = "0.3.0"
 
@@ -77,13 +76,12 @@ __all__ = [
     "IndexingTimeout",
     "InvalidRequest",
     "Markvector",
+    "MultiCollection",
     "MarkvectorError",
     "Match",
     "MintedKey",
     "Neighbor",
     "NotFound",
-    "Pattern",
-    "PatternReport",
     "Original",
     "RateLimited",
     "Region",

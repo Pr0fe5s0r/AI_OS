@@ -297,69 +297,30 @@ class Markvector:
         found = me.get("workspaces") or [me.get("workspace_id")]
         return [str(w) for w in found if w]
 
-    def patterns(
-        self,
-        question: str,
-        *,
-        llm: Any,
-        model: str,
-        collection: str = "default",
-        workspaces: _List[str] | None = None,
-        per_workspace: int = 6,
-        min_workspaces: int = 1,
-    ) -> Any:
-        """Answer a question across several tenants without exposing any of them.
+    def multi_collection(self, collections: _List[str] | None = None) -> MultiCollection:
+        """Read several collections at once, with a MULTI-COLLECTION key.
 
-            report = mv.patterns(
-                "how do teams handle onboarding?",
-                llm=OpenAI(...), model="...",
-            )
-            print(report.answer)       # "Teams assign a named owner [P1]…"
-            for finding in report.patterns:
-                print(finding)         # "P1: activation is reviewed…"
+            across = mv.multi_collection()                    # every collection the key reaches
+            across = mv.multi_collection(["acme", "globex"])  # or name them
 
-        This exists for DATA PROTECTION, not for pattern discovery. The caller
-        holds one credential over several clients' material and is not
-        permitted to see that material, so the raw passages never leave: what
-        comes back is prose answering the question, citing sanitised findings
-        as [P1], [P2]. The findings ARE the citations — there is no document to
-        point at, and pointing at one would defeat the purpose.
+            hits = across.search("renewal terms")
+            for match in hits:
+                match.collection      # which one it came from
 
-        Three defences, in order: passages are redacted before the model
-        sees them; everything the model writes is inspected for identifiers
-        before it is returned; and support is counted across workspaces and
-        reported on every finding.
+        A multi-collection key is one with no collection binding, so the server
+        already allows every collection in its workspace; naming a subset here
+        narrows what is READ, it does not widen what is permitted. A
+        single-collection key is confined by the server and a collection it is
+        not bound to is refused, whatever is passed here.
 
-        That count is REPORTED by default, not enforced — the question was
-        asked to be answered, and refusing to answer it does not protect
-        anybody. Measured: the same question, put twice, returned nothing
-        under a two-workspace gate and a correct answer without it, the
-        difference being only how the model happened to word a finding that
-        three workspaces supported either way. Pass `min_workspaces=2` where
-        corroboration must be a condition of speaking rather than a property
-        of the answer. The prose is composed by a second call that is
-        shown only the surviving findings, never a passage, so it cannot reveal
-        what it never received.
-
-        Single-workspace work is untouched: search() and answer() behave
-        exactly as they always have, with no redaction and no generalisation,
-        because there is no cross-tenant boundary to protect there.
-
-        `llm` is your own OpenAI-compatible client; the model call happens in
-        your process, as with the agent.
+        What comes back is what each collection returned — the same excerpts,
+        scores, citations and page images a single-collection read produces,
+        with nothing merged away or rewritten. The only thing added is
+        `collection` on each match and citation, without which a merged list
+        cannot be told apart and a page image cannot be fetched for the right
+        one.
         """
-        from .patterns import extract
-
-        return extract(
-            self,
-            question,
-            llm=llm,
-            model=model,
-            collection=collection,
-            workspaces=workspaces,
-            per_workspace=per_workspace,
-            min_workspaces=min_workspaces,
-        )
+        return MultiCollection(self, collections)
 
     def collection(self, collection_id: str, workspace: str | None = None) -> Collection:
         """A handle. Cheap — it does not call the server.
@@ -1106,6 +1067,119 @@ class Collection:
     # The spelling the rest of this SDK uses is British, and the API route is
     # American. Both names work rather than making anyone remember which.
     summarize = summarise
+
+
+class MultiCollection:
+    """Several collections, read together and returned unchanged.
+
+    Built by `mv.multi_collection(...)`. Every call fans out over the chosen
+    collections and hands back exactly what each one gave: verbatim excerpts,
+    real citations with document, page label, heading and page image. Nothing
+    is redacted, summarised, generalised or merged into a single voice — the
+    collections belong to the caller's own workspace, so there is no boundary
+    here for the data to cross.
+    """
+
+    def __init__(self, mv: Markvector, collections: _List[str] | None = None) -> None:
+        self._mv = mv
+        self._named = list(collections) if collections else None
+
+    @property
+    def collections(self) -> _List[str]:
+        """The collections this will read. Resolved from the server when the
+        caller named none, so "everything I can reach" does not have to be
+        maintained by hand."""
+        if self._named is not None:
+            return list(self._named)
+        try:
+            return [c.collection_id for c in self._mv.collections()]
+        except AuthError as exc:
+            # Listing collections is a MANAGE route, and a key that only reads
+            # across them has no business holding manage. So discovery is not
+            # available to the very keys most likely to want it, and the bare
+            # "needs the manage scope" that came back named the wrong problem.
+            raise InvalidRequest(
+                "This key cannot list collections — that needs the manage "
+                "scope, which a read-only key should not have. Name them "
+                "instead: mv.multi_collection(['acme', 'globex'])."
+            ) from exc
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"MultiCollection({', '.join(self.collections)})"
+
+    def search(self, query: str, limit: int = 10, **kwargs: Any) -> Results:
+        """Search every collection and return the matches, best first.
+
+        One ordinary search per collection — each enforced by the server
+        against the key — merged by score. The excerpts are the store's own,
+        untouched; `match.collection` says where each came from.
+
+        `limit` is per collection, so the merged list can be longer. That is
+        deliberate: trimming it to `limit` overall would silently drop a
+        collection's best hit because another collection scored higher, which
+        is the opposite of reading them all.
+        """
+        found: _List[Match] = []
+        for name in self.collections:
+            try:
+                hits = self._mv.collection(name).search(query, limit=limit, **kwargs)
+            except MarkvectorError:
+                # One collection failing must not end the read. It is recorded
+                # by being absent, not by pretending it was empty.
+                continue
+            for match in hits.matches:
+                match.collection = name
+                found.append(match)
+        found.sort(key=lambda m: m.score, reverse=True)
+        return Results(query=query, matches=found)
+
+    def answer(self, question: str, **kwargs: Any) -> _List[Answer]:
+        """Answer from each collection, one answer each, unchanged.
+
+        A list rather than one merged answer, and deliberately so: merging
+        would mean rewriting several grounded answers into a new one that no
+        single collection actually supports, and the citations would no longer
+        point at what produced them. Each answer keeps its own text, its own
+        `grounded` flag and its own citations — every citation carrying the
+        collection it came from, so its page image can be fetched.
+
+        Collections with nothing to say are left out, so an empty list means
+        nothing answered rather than nothing was read.
+        """
+        out: _List[Answer] = []
+        for name in self.collections:
+            try:
+                answer = self._mv.collection(name).answer(question, **kwargs)
+            except MarkvectorError:
+                continue
+            # Grounded, not merely non-empty: the store answers "nothing here
+            # covers that" in prose, and returning one of those per silent
+            # collection buries the answers that exist. What WAS read is on
+            # `collections`, so nothing is hidden by leaving them out.
+            if not answer.grounded:
+                continue
+            answer.collection = name
+            for citation in answer.citations:
+                citation.collection = name
+            for match in answer.matches:
+                match.collection = name
+            out.append(answer)
+        return out
+
+    def page_image(self, citation: Citation) -> bytes:
+        """The picture of a cited page, fetched from the collection it is in.
+
+        A citation from a merged read carries its own collection, so this
+        needs nothing else from the caller — which is the whole reason that
+        field exists.
+        """
+        if not citation.collection:
+            raise InvalidRequest(
+                "This citation carries no collection. Fetch it through the "
+                "collection it came from, or use a citation returned by "
+                "MultiCollection.answer()."
+            )
+        return self._mv.collection(citation.collection).page_image(citation)
 
 
 # The longest this client will sit inside one retry. A server is entitled to

@@ -298,6 +298,12 @@ class Match:
     # walk from this hit to what sits near it in meaning.
     chunk_id: str = ""
     categories: list[Category] = field(default_factory=list)
+    # Which collection this came out of. Empty when a single collection was
+    # asked, where the caller already knows; set when several were read at
+    # once, because otherwise a merged list cannot be told apart and a
+    # citation cannot be resolved back to a page image. Provenance, not a
+    # change to the result: the excerpt, scores and passages are untouched.
+    collection: str = ""
     # EVERY passage this document matched on, best first — not just the one
     # that won. `excerpt` is the headline; a document usually matches on
     # several, and a caller reasoning over the result (rather than displaying
@@ -502,6 +508,10 @@ class Citation:
     # Relative to the client's base_url; use `mv.page_image(citation)` to get
     # the bytes.
     page_image: str | None = None
+    # The collection this passage belongs to. Empty for a single-collection
+    # answer; set when several were read, so `page_image` can be fetched for
+    # the right one.
+    collection: str = ""
     # And where on that page. Without these a reader is told "page 14" and left
     # to search it; with them the highlight lands on the row that was actually
     # read. Empty whenever the passage came from text.
@@ -539,6 +549,11 @@ class Answer:
     grounded: bool
     citations: list[Citation]
     matches: list[Match]
+    # Which collection wrote this. Empty for a single-collection read; set when
+    # several were read at once. It lives here as well as on the citations
+    # because an answer that cites nothing still came from somewhere, and
+    # deriving it from citations[0] loses exactly that case.
+    collection: str = ""
     mode: str = ""
     trace_id: str = ""
     took_ms: int = 0
