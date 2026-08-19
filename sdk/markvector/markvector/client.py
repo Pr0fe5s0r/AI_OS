@@ -651,6 +651,7 @@ class Collection:
         sources: list[str] | None = None,
         documents: list[str | Document] | None = None,
         where: Where | None = None,
+        vision: bool = True,
     ) -> Answer:
         """Retrieval, then a written answer built only from what was retrieved.
 
@@ -679,8 +680,20 @@ class Collection:
         ("vectorless" is still accepted for backward compatibility — catalogue
         reasoning only — but agentic does the same and also reaches the rest of
         a large collection, so prefer it.)
+
+        `vision` lets the agent READ A PAGE AS A PICTURE when the text layer
+        cannot answer — a figure, a scanned table, a slide whose content is
+        drawn rather than written. On by default, because a question about a
+        diagram otherwise gets answered from its caption. Turn it off for
+        speed: it is the single most expensive step in a walk, and with it off
+        a page-picture question fails honestly instead.
         """
-        params: dict[str, Any] = {"q": question, "mode": mode, "limit": limit}
+        params: dict[str, Any] = {
+            "q": question,
+            "mode": mode,
+            "limit": limit,
+            "vision": vision,
+        }
         if sources:
             params["sources"] = sources
         if documents:
@@ -702,6 +715,7 @@ class Collection:
         sources: _List[str] | None = None,
         documents: _List[str | Document] | None = None,
         where: Where | None = None,
+        vision: bool = True,
     ) -> Iterator[StreamEvent]:
         """The same answer as `answer()`, yielded as it is produced.
 
@@ -719,7 +733,12 @@ class Collection:
         abandoning it closes the connection. Use `answer()` when you only want
         the result — this exists to show the work while it happens.
         """
-        params: dict[str, Any] = {"q": question, "mode": mode, "limit": limit}
+        params: dict[str, Any] = {
+            "q": question,
+            "mode": mode,
+            "limit": limit,
+            "vision": vision,
+        }
         if sources:
             params["sources"] = sources
         if documents:
@@ -1083,6 +1102,15 @@ class MultiCollection:
     def __init__(self, mv: Markvector, collections: _List[str] | None = None) -> None:
         self._mv = mv
         self._named = list(collections) if collections else None
+        # document id -> the collection it was found in, learned as documents
+        # are listed or opened. An id carries no collection with it, and the
+        # agent hands back nothing but ids.
+        self._home: dict[str, str] = {}
+        # What went wrong on the last read, per collection. A collection that
+        # times out or errors is NOT one with nothing to say, and reporting
+        # them the same way turned an agentic run whose calls all timed out
+        # into a confident "0 answered".
+        self.failures: dict[str, str] = {}
 
     @property
     def collections(self) -> _List[str]:
@@ -1120,12 +1148,14 @@ class MultiCollection:
         is the opposite of reading them all.
         """
         found: _List[Match] = []
+        self.failures = {}
         for name in self.collections:
             try:
                 hits = self._mv.collection(name).search(query, limit=limit, **kwargs)
-            except MarkvectorError:
-                # One collection failing must not end the read. It is recorded
-                # by being absent, not by pretending it was empty.
+            except MarkvectorError as exc:
+                # One collection failing must not end the read — but it must
+                # not look like an empty one either. See `failures`.
+                self.failures[name] = f"{type(exc).__name__}: {exc}"
                 continue
             for match in hits.matches:
                 match.collection = name
@@ -1144,13 +1174,20 @@ class MultiCollection:
         collection it came from, so its page image can be fetched.
 
         Collections with nothing to say are left out, so an empty list means
-        nothing answered rather than nothing was read.
+        nothing answered rather than nothing was read — and `failures` says
+        which ones could not be read at all, which is a different thing again.
+
+        Agentic answers are slow: give the client a timeout that suits them
+        (`Markvector(..., timeout=180)`) or every call will time out and land
+        in `failures`.
         """
         out: _List[Answer] = []
+        self.failures = {}
         for name in self.collections:
             try:
                 answer = self._mv.collection(name).answer(question, **kwargs)
-            except MarkvectorError:
+            except MarkvectorError as exc:
+                self.failures[name] = f"{type(exc).__name__}: {exc}"
                 continue
             # Grounded, not merely non-empty: the store answers "nothing here
             # covers that" in prose, and returning one of those per silent
@@ -1165,6 +1202,104 @@ class MultiCollection:
                 match.collection = name
             out.append(answer)
         return out
+
+    # ---- the read surface an Agent needs, fanned out over every collection ----
+    #
+    # The agent calls list/summaries/structure/get/neighbors/search on whatever
+    # it was handed. Implementing them here is what lets one agent reason over
+    # several collections at once: it does not know it is doing so, and does
+    # not have to.
+
+    def list(self, limit: int = 50, **kwargs: Any) -> _List[Document]:
+        """Documents from every collection, each tagged with where it lives."""
+        out: _List[Document] = []
+        for name in self.collections:
+            try:
+                found = self._mv.collection(name).list(limit=limit, **kwargs)
+            except MarkvectorError:
+                continue
+            for doc in found:
+                self._remember(doc.id, name)
+                out.append(doc)
+        return out
+
+    def summaries(self, **kwargs: Any) -> _List[IndexSummary]:
+        """Every collection's index cards, concatenated."""
+        out: _List[IndexSummary] = []
+        for name in self.collections:
+            try:
+                cards = self._mv.collection(name).summaries(**kwargs)
+            except MarkvectorError:
+                continue
+            for card in cards:
+                self._remember(card.item_id, name)
+                out.append(card)
+        return out
+
+    def get(self, document: str | Document, **kwargs: Any) -> Document:
+        """One document, from whichever collection holds it."""
+        return self._where_it_lives(_doc_id(document)).get(document, **kwargs)
+
+    def structure(self, file: str | Document, **kwargs: Any) -> Structure:
+        """A document's heading tree, from whichever collection holds it."""
+        return self._where_it_lives(_doc_id(file)).structure(file, **kwargs)
+
+    def neighbors(self, chunk: str | Chunk | Match, **kwargs: Any) -> _List[Neighbor]:
+        """Hop the similarity graph. A passage sits in exactly one collection,
+        so the hop stays inside it — a graph walk must not become a way of
+        reaching a collection the search never returned."""
+        if isinstance(chunk, Match) and chunk.collection:
+            return self._mv.collection(chunk.collection).neighbors(chunk, **kwargs)
+        chunk_id = chunk if isinstance(chunk, str) else chunk.chunk_id
+        for name in self.collections:
+            try:
+                return self._mv.collection(name).neighbors(chunk_id, **kwargs)
+            except MarkvectorError:
+                continue
+        return []
+
+    def _remember(self, item_id: str, collection: str) -> None:
+        """Note which collection a document came from, so a later read of it
+        does not have to try them all."""
+        self._home.setdefault(item_id, collection)
+
+    def _where_it_lives(self, item_id: str) -> Collection:
+        """The collection holding a document — remembered if it was listed,
+        otherwise found by asking. Documents are addressed by id alone once
+        the agent has one, and an id carries no collection with it."""
+        known = self._home.get(item_id)
+        if known:
+            return self._mv.collection(known)
+        for name in self.collections:
+            try:
+                self._mv.collection(name).get(item_id)
+            except MarkvectorError:
+                continue
+            self._home[item_id] = name
+            return self._mv.collection(name)
+        raise NotFound(f"No document {item_id!r} in {', '.join(self.collections)}.")
+
+    def agent(self, **options: Any) -> Any:
+        """An agent that reasons across EVERY collection this reaches.
+
+            bot = mv.multi_collection(["acme", "globex"]).agent(
+                api_key="…", base_url="…", model="…",
+            )
+            print(bot.ask("how is onboarding handled?").text)
+
+        The same loop as `collection.agent()` — the model reads the catalogue,
+        searches, opens sections, hops the similarity graph — except every
+        tool reaches all the collections at once. Vision comes with it: the
+        agent can open a page as a picture when the text layer cannot answer,
+        which is how a question about a figure or a scanned table gets a real
+        answer rather than one built from a caption.
+
+        Nothing is redacted on the way back. The answers and citations are the
+        collections' own.
+        """
+        from .agent import Agent
+
+        return Agent(self, **options)  # type: ignore[arg-type]
 
     def page_image(self, citation: Citation) -> bytes:
         """The picture of a cited page, fetched from the collection it is in.
