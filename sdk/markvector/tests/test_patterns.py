@@ -123,9 +123,14 @@ def test_group_numbers_are_refused():
 # ------------------------- 3. corroboration, structural -------------------------
 
 
-def test_one_workspace_alone_produces_nothing():
-    """The defence that does not depend on getting redaction right: a fact true
-    of exactly one client cannot survive a rule that requires two."""
+def test_one_workspace_answers_by_default():
+    """A multi-workspace key is AUTHORISED for what it reads, so material from
+    a single workspace is answered rather than refused. Privacy here comes
+    from redaction, inspection and never quoting — all of which apply to one
+    workspace exactly as they do to four. Refusing instead returned "1
+    workspace had anything to say; 2 are needed" to someone asking an ordinary
+    question, which protected nobody.
+    """
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/whoami":
@@ -141,11 +146,19 @@ def test_one_workspace_alone_produces_nothing():
             },
         )
 
-    llm = FakeLLM('{"patterns": [{"statement": "Activation is reviewed", "groups": 1}]}')
-    report = extract(store(handler), "how is activation handled?", llm=llm, model="m")
-    assert report.patterns == []
-    assert report.withheld, "a run that refuses should say so"
-    assert llm.prompts == [], "the model should not even have been asked"
+    reply = '{"patterns": [{"statement": "Activation is reviewed", "groups": 1}]}'
+    report = extract(store(handler), "how is activation handled?", llm=FakeLLM(reply), model="m")
+    assert [p.id for p in report.patterns] == ["P1"]
+
+    # And the gate is still there for a caller who wants corroboration to be a
+    # condition of speaking rather than a property of the answer.
+    strict = FakeLLM(reply)
+    refused = extract(
+        store(handler), "how is activation handled?", llm=strict, model="m", min_workspaces=2
+    )
+    assert refused.patterns == []
+    assert refused.withheld, "a run that refuses should say so"
+    assert strict.prompts == [], "the model should not even have been asked"
 
 
 def test_a_pattern_needs_support_from_two_workspaces():
@@ -161,7 +174,8 @@ def test_a_pattern_needs_support_from_two_workspaces():
 
 def test_a_statement_the_model_claims_for_one_group_is_dropped():
     report = _two_workspace_run(
-        '{"patterns": [{"statement": "Someone runs a 14-day review", "groups": 1}]}'
+        '{"patterns": [{"statement": "Someone runs a 14-day review", "groups": 1}]}',
+        min_workspaces=2,
     )
     assert report.patterns == []
     assert any("only 1" in w for w in report.withheld)
@@ -272,7 +286,11 @@ def test_a_collection_handle_names_its_workspace_only_when_asked():
 _LAST_LLM: FakeLLM
 
 
-def _two_workspace_run(reply: str, prose: str = "Owners review activation [P1].") -> PatternReport:
+def _two_workspace_run(
+    reply: str,
+    prose: str = "Owners review activation [P1].",
+    min_workspaces: int = 1,
+) -> PatternReport:
     """Two tenants, one document each, saying much the same thing."""
     global _LAST_LLM
 
@@ -306,7 +324,13 @@ def _two_workspace_run(reply: str, prose: str = "Owners review activation [P1]."
         )
 
     _LAST_LLM = FakeLLM(reply, prose)
-    return extract(store(handler), "how is onboarding handled?", llm=_LAST_LLM, model="m")
+    return extract(
+        store(handler),
+        "how is onboarding handled?",
+        llm=_LAST_LLM,
+        model="m",
+        min_workspaces=min_workspaces,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -420,7 +444,8 @@ def test_a_genuinely_shared_statement_still_passes():
 
 def test_the_model_may_lower_the_count_but_never_raise_it():
     report = _two_workspace_run(
-        '{"patterns": [{"statement": "Activation is reviewed after two weeks", "groups": 1}]}'
+        '{"patterns": [{"statement": "Activation is reviewed after two weeks", "groups": 1}]}',
+        min_workspaces=2,
     )
     assert report.patterns == []
 
@@ -565,3 +590,66 @@ def test_public_vocabulary_is_not_mistaken_for_client_detail():
     known = specifics(["The OSI model has seven layers. Figures in millions of GBP."])
     assert names_a_specific("The OSI model separates network functions.", known) is None
     assert names_a_specific("Revenue is reported in a tabular format.", known) is None
+
+
+def test_a_word_the_question_named_is_not_a_secret():
+    """You cannot disclose to someone what they told you. Measured: "Harry
+    potter friends" returned nothing at all, refused three times for naming
+    Harry — a word the caller had just typed. Treating the question's own
+    vocabulary as client detail withholds the answer it asked for.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/whoami":
+            return httpx.Response(200, json={"workspace_id": "a", "workspaces": ["a"]})
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "id": "i",
+                        "title": "Book",
+                        "excerpt": "Harry counted Ron and Hermione among his friends.",
+                        "score": 1.0,
+                        "source": {"source": "s", "locator": "book.pdf"},
+                    }
+                ],
+                "trace_id": "t",
+            },
+        )
+
+    llm = FakeLLM(
+        '{"patterns": [{"statement": "Harry is described as having close friends", '
+        '"groups": 1}]}',
+        prose="Harry is described as having close friends [P1].",
+    )
+    report = extract(store(handler), "Harry potter friends", llm=llm, model="m")
+    assert [p.id for p in report.patterns] == ["P1"]
+
+
+def test_a_word_the_question_did_not_name_is_still_refused():
+    """The other half: the exemption is the caller's own words, not an amnesty
+    on proper nouns. Asking how revenue is reported must not surface which
+    regions a client trades in."""
+    from markvector.patterns import names_a_specific, specifics
+
+    known = specifics(["| region | revenue | Iberia 42.6 | Nordics 31.8 |"])
+    asked = {w.lower() for w in "How is revenue reported by region?".split()}
+    remaining = {n for n in known if n.lower() not in asked}
+    assert names_a_specific("Revenue is reported across Iberia and Nordics.", remaining)
+
+
+def test_a_copied_label_becomes_a_citation():
+    """The findings reach the composer as "P1: ...", and it sometimes answers
+    in the same shape. That reads as a list item rather than an answer, and
+    leaves no [P1] for the reader to follow — the citation being the only
+    provenance they get. Measured on a real run.
+    """
+    from markvector.patterns import _relabel
+
+    assert _relabel("P1: Characters express concern.") == "Characters express concern [P1]."
+    assert (
+        _relabel("Revenue is reported by region [P1]. P2: Launches follow competitors.")
+        == "Revenue is reported by region [P1]. Launches follow competitors [P2]."
+    )
+    # A properly cited answer is left exactly as it is.
+    assert _relabel("Already fine [P1].") == "Already fine [P1]."

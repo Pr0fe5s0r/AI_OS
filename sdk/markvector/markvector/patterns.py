@@ -47,10 +47,20 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 # a Pattern has room for a statement and a count, and nowhere to put them.
 # ---------------------------------------------------------------------------
 
-# How many distinct workspaces must show something before it is a pattern
-# rather than a client's business. Two is the minimum that means anything;
-# raise it for a stronger claim and fewer results.
-MIN_WORKSPACES = 2
+# How many distinct workspaces must carry a finding before it may be stated.
+#
+# One, because a multi-workspace key is AUTHORISED for its workspaces — the
+# server checked that before a single passage was read. Refusing to answer
+# from material the caller is entitled to protects nobody; it just returns
+# "1 workspace had anything to say; 2 are needed" to someone who asked a
+# perfectly ordinary question. Privacy here comes from redaction, inspection
+# and never quoting, all of which apply to one workspace exactly as they do to
+# four.
+#
+# The count is still measured and reported on every finding, and raising this
+# turns it back into a condition of speaking rather than a property of the
+# answer.
+MIN_WORKSPACES = 1
 
 # Passages read per workspace. Enough to see a repeated shape, small enough
 # that one tenant cannot dominate the sample.
@@ -426,9 +436,12 @@ Reply with JSON only:
 _COMPOSE = """You write a short answer to a question, using ONLY the numbered
 findings you are given.
 
-Cite the findings you use as [P1], [P2] — those labels are the whole citation
-system here. There is no document to cite: the findings came from material the
-reader is not permitted to see, and naming its source would defeat the point.
+Cite the findings you use as [P1], [P2], in square brackets at the END of the
+sentence that uses them. Never open a sentence with a bare label like "P1:" —
+that is the input format, not the answer format. Those labels are the whole
+citation system here. There is no document to cite: the findings came from
+material the reader is not permitted to see, and naming its source would defeat
+the point.
 
 Rules:
   * Use only what the findings say. Add no fact, number, name or example.
@@ -628,7 +641,19 @@ def extract(
     # Proper nouns belonging to the material itself — regions, sites, product
     # names. Not identities, but one client's own detail, which the contract
     # forbids exposing just as firmly as its name.
-    own_detail = specifics([excerpt for group in groups for excerpt in group])
+    #
+    # Except whatever the QUESTION already named. You cannot disclose to
+    # someone what they told you, and treating their own words as a secret
+    # withholds the answer they asked for: "Harry potter friends" returned
+    # nothing at all, refused three times for naming Harry. A word the caller
+    # typed is a word the caller has; a word they did not — Iberia, in a
+    # question about how revenue is reported — is still refused.
+    asked = {w.lower() for w in re.findall(r"[A-Za-z][A-Za-z\'-]{2,}", question)}
+    own_detail = {
+        name
+        for name in specifics([excerpt for group in groups for excerpt in group])
+        if name.lower() not in asked
+    }
     prompt = "\n\n".join(
         f"GROUP {n}:\n" + "\n".join(f"- {e}" for e in excerpts)
         for n, excerpts in enumerate(groups, start=1)
@@ -723,10 +748,39 @@ def _compose(
     if why:
         report.withheld.append(f"the composed answer was withheld ({why})")
         return ""
-    return _faithful(text, patterns, report)
+    return _faithful(_relabel(text), patterns, report)
 
 
 _SENTENCE = re.compile(r"(?<=[.!?])\s+")
+
+
+_LABEL_PREFIX = re.compile(r"^\s*\[?(P\d+)\]?\s*[:.\-]\s*")
+
+
+def _relabel(text: str) -> str:
+    """Move a copied label to where a citation belongs.
+
+    The findings reach the composer as "P1: ...", and it sometimes answers in
+    the same shape — "P1: Characters in the narrative..." — which reads as a
+    list item rather than an answer and leaves no [P1] for the reader to
+    follow. Measured on a real run. Repaired here rather than only asked for
+    in the prompt, because the citation is the only provenance the reader
+    gets and formatting it is not something to leave to chance.
+    """
+    out: list[str] = []
+    for sentence in _SENTENCE.split(text.strip()):
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        found = _LABEL_PREFIX.match(sentence)
+        if found:
+            label = found.group(1)
+            sentence = sentence[found.end():].strip()
+            if sentence and f"[{label}]" not in sentence:
+                sentence = sentence.rstrip(".") + f" [{label}]."
+        if sentence:
+            out.append(sentence)
+    return " ".join(out)
 
 
 def _faithful(text: str, patterns: list[Pattern], report: PatternReport) -> str:
