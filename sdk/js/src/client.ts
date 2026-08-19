@@ -855,6 +855,18 @@ export class Collection {
     return new Agent(this, options);
   }
 
+  /** The classes a document here can be filed into. Companion to
+   *  `categorise()`, which takes ids: without this a caller has to guess them.
+   *  Every ingest files a document against this list automatically. */
+  async classes(): Promise<Record<string, unknown>[]> {
+    const payload = await this.mv.request<{ classes: Record<string, unknown>[] }>(
+      "GET",
+      "/api/classes",
+      { collection: this.id },
+    );
+    return payload.classes ?? [];
+  }
+
   // ------------------------ what the store has learned ------------------------
 
   /** The collection as a neighbour graph over passages — what the index looks

@@ -59,7 +59,11 @@ NOT_IN_THE_KB = {
     ("GET", "/api/snippets"),
     ("GET", "/api/items/{item_id}/related"),
     ("GET", "/api/items/{item_id}/pages/{page}/figures"),
-    ("GET", "/api/classes"),
+    # Note: GET /api/classes is NOT excluded. Classification is live — every
+    # ingest files a document against the taxonomy and the result rides on
+    # document.categories — so a client calling categorise() needs to be able
+    # to read the ids. Only AUTHORING classes is absent: nothing in the KB
+    # creates or deletes them, and the eight that exist are platform-owned.
     ("POST", "/api/classes"),
     ("DELETE", "/api/classes/{class_id}"),
     ("GET", "/api/collections/{collection_id}/summaries/coverage"),

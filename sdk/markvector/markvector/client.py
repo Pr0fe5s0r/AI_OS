@@ -1056,7 +1056,15 @@ class Collection:
             headers=self._headers,
         )
 
-    # ------------------------------ what is in here ------------------------------
+    def classes(self) -> list[dict[str, Any]]:
+        """The classes a document here can be filed into.
+
+        Companion to `categorise()`, which takes ids: without this a caller
+        has to guess them. Every document ingested is filed automatically
+        against this list, and the result comes back on `document.categories`.
+        """
+        got = self._mv._request("GET", "/api/classes", headers=self._headers)
+        return got.get("classes", [])
 
     # --------------------------- what the store has learned ---------------------------
 
