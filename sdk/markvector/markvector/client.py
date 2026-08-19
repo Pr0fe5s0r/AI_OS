@@ -472,6 +472,35 @@ class Markvector:
         """Why a search returned what it did: every candidate, score and timing."""
         return self._request("GET", f"/api/traces/{trace_id}")
 
+    # ------------------------------ the store itself ------------------------------
+
+    def formats(self) -> dict[str, Any]:
+        """What this store can read, and what it will do to it.
+
+        The capability contract, versioned — `version` moves when the list
+        does, so software that converts files on its own side can tell when
+        the ground shifted. Each entry says what a passage looks like once the
+        format is parsed and what is dropped on the way, because "supported"
+        alone does not tell you whether your tables survive.
+
+            contract = mv.formats()
+            contract["version"]         # "1.0.0"
+            contract["supported"]       # ["csv", "docx", "html", ...]
+            contract["not_supported"]   # with a reason, and what to convert to
+        """
+        return self._request("GET", "/api/formats")
+
+    # -------------------------------- passages --------------------------------
+
+    def chunk(self, chunk_id: str) -> dict[str, Any]:
+        """One passage in full, with the document it belongs to.
+
+        Search returns excerpts; this returns the whole passage. Take the id
+        from `match.chunk_id` or `citation.chunk_id` — it is the unit that was
+        actually scored, so this is what the answer was really reading.
+        """
+        return self._request("GET", f"/api/chunks/{chunk_id}")
+
     def close(self) -> None:
         self._http.close()
 
@@ -874,6 +903,41 @@ class Collection:
         out.write_bytes(data)
         return out
 
+    def update(
+        self,
+        document: str | Document,
+        title: str | None = None,
+        text: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Document:
+        """Edit a document, keeping its version history.
+
+        The old version is superseded, not overwritten — `versions()` still
+        returns it, and anything that cited it can still resolve. Pass only
+        what changes; at least one of title, text or metadata is required.
+
+        Re-editing the text re-embeds it, so a search will reflect the change
+        once indexing catches up.
+        """
+        if title is None and text is None and metadata is None:
+            raise InvalidRequest(
+                "update() needs a title, text or metadata to change."
+            )
+        body: dict[str, Any] = {}
+        if title is not None:
+            body["title"] = title
+        if text is not None:
+            body["body"] = text
+        if metadata is not None:
+            body["metadata"] = metadata
+        got = self._mv._request(
+            "PATCH",
+            f"/api/items/{_doc_id(document)}",
+            json=body,
+            headers=self._headers,
+        )
+        return Document.from_json(got.get("item", got))
+
     def delete(self, document: str | Document, confirm: bool = False) -> Deletion:
         """Delete a document and everything indexed from it.
 
@@ -991,6 +1055,49 @@ class Collection:
             json={"class_ids": categories},
             headers=self._headers,
         )
+
+    # ------------------------------ what is in here ------------------------------
+
+    # --------------------------- what the store has learned ---------------------------
+
+    def graph(self, k: int = 3, limit: int = 200) -> dict[str, Any]:
+        """The collection as a neighbour graph over passages.
+
+        `k` is how many neighbours each passage keeps. What the index looks
+        like, rather than what any one query returned.
+        """
+        return self._mv._request(
+            "GET",
+            f"/api/collections/{self.id}/graph",
+            params={"k": k, "limit": limit},
+            headers=self._headers,
+        )
+
+    def mapping(self, limit: int = 20) -> dict[str, Any]:
+        """How far the semantic map has been built over this collection."""
+        return self._mv._request(
+            "GET",
+            f"/api/collections/{self.id}/mapping",
+            params={"limit": limit},
+            headers=self._headers,
+        )
+
+    def summarise(self, rebuild: bool = False) -> dict[str, Any]:
+        """Build the summary index for this collection.
+
+        `rebuild=True` discards what is there and starts again; the default
+        fills in only what is missing.
+        """
+        return self._mv._request(
+            "POST",
+            f"/api/collections/{self.id}/summarize",
+            params={"rebuild": rebuild},
+            headers=self._headers,
+        )
+
+    # The spelling the rest of this SDK uses is British, and the API route is
+    # American. Both names work rather than making anyone remember which.
+    summarize = summarise
 
 
 # The longest this client will sit inside one retry. A server is entitled to

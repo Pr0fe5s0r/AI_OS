@@ -422,6 +422,21 @@ export class Markvector {
       query: [["hours", String(opts.hours ?? 24)]],
     });
   }
+
+  /** What this store can read, and what it does to it — the capability
+   *  contract, versioned. `version` moves when the list does, so software that
+   *  converts files on its own side can tell when the ground shifted. */
+  formats(): Promise<Record<string, unknown>> {
+    return this.request("GET", "/api/formats");
+  }
+
+  /** One passage in full, with the document it belongs to. Search returns
+   *  excerpts; this returns the whole passage. Take the id from
+   *  `match.chunkId` or `citation.chunkId`. */
+  chunk(chunkId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/api/chunks/${chunkId}`);
+  }
+
 }
 
 /** Read and write one collection. */
@@ -838,6 +853,55 @@ export class Collection {
    *  See {@link Agent}. */
   agent(options: AgentOptions): Agent {
     return new Agent(this, options);
+  }
+
+  // ------------------------ what the store has learned ------------------------
+
+  /** The collection as a neighbour graph over passages — what the index looks
+   *  like, rather than what any one query returned. */
+  graph(opts: { k?: number; limit?: number } = {}): Promise<Record<string, unknown>> {
+    return this.mv.request("GET", `/api/collections/${this.id}/graph`, {
+      query: [
+        ["k", String(opts.k ?? 3)],
+        ["limit", String(opts.limit ?? 200)],
+      ],
+    });
+  }
+
+  /** How far the semantic map has been built over this collection. */
+  mapping(opts: { limit?: number } = {}): Promise<Record<string, unknown>> {
+    return this.mv.request("GET", `/api/collections/${this.id}/mapping`, {
+      query: [["limit", String(opts.limit ?? 20)]],
+    });
+  }
+
+  /** Build the summary index. `rebuild` discards what is there and starts
+   *  again; the default fills in only what is missing. */
+  summarise(opts: { rebuild?: boolean } = {}): Promise<Record<string, unknown>> {
+    return this.mv.request("POST", `/api/collections/${this.id}/summarize`, {
+      query: [["rebuild", String(opts.rebuild ?? false)]],
+    });
+  }
+
+  /** Edit a document, keeping its version history. The old version is
+   *  superseded, not overwritten, so anything that cited it still resolves.
+   *  Pass only what changes. */
+  async update(
+    document: string | Document,
+    changes: { title?: string; text?: string; metadata?: Record<string, unknown> },
+  ): Promise<Document> {
+    const body: Record<string, unknown> = {};
+    if (changes.title !== undefined) body.title = changes.title;
+    if (changes.text !== undefined) body.body = changes.text;
+    if (changes.metadata !== undefined) body.metadata = changes.metadata;
+    if (Object.keys(body).length === 0) {
+      throw new InvalidRequest("update() needs a title, text or metadata to change.");
+    }
+    const payload = await this.mv.request<any>("PATCH", `/api/items/${docId(document)}`, {
+      collection: this.id,
+      body,
+    });
+    return toDocument(payload.item ?? payload);
   }
 }
 
