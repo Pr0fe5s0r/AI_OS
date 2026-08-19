@@ -406,10 +406,11 @@ class Markvector:
 
             mv.create_key("ops", scopes=["manage"])
 
-        Pass `collection_id` to bind the key to one collection — every call it
+        Pass `collection_id` for a SINGLE-COLLECTION key — every call it
         makes is then confined there, whatever the caller asks for, and it may
         only mint keys bound to the same collection. Leave it None for a
-        workspace-wide key.
+        MULTI-COLLECTION key, which reaches every collection in the
+        workspace.
         """
         wanted = ",".join(scopes) if isinstance(scopes, list) else scopes
         unknown = sorted({s.strip() for s in wanted.split(",") if s.strip()} - SCOPES)

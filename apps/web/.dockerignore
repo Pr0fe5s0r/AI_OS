@@ -1,0 +1,14 @@
+# The image runs `npm ci` and then `COPY . .`. Without this file that COPY
+# puts the HOST's node_modules — built on Windows — straight over the Alpine
+# ones the install just produced, and ships ~670MB of context to do it. The
+# build was failing outright ("unexpected EOF") while sending it.
+node_modules
+
+# Rebuilt by `npm run build` inside the image; the host's copy is dead weight
+# and carries a routes-manifest with whatever API_URL the host last used.
+.next
+
+npm-debug.log*
+.env
+.env.local
+.DS_Store

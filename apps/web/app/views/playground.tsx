@@ -350,7 +350,7 @@ export function Playground({ active }: { active: string | null }) {
         <div className="flex items-center justify-between gap-3 px-6 pb-3 pt-5">
           <div className="flex items-center gap-2">
             <h1 className="text-base font-semibold text-ink">Playground</h1>
-            <Chip>{active ?? "workspace-wide"}</Chip>
+            <Chip>{active ?? "all collections"}</Chip>
           </div>
           <div className="flex items-center gap-2">
             <Chip active={showCode} onClick={() => setShowCode((s) => !s)} title="The request as curl">

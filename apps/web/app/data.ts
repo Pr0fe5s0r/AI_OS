@@ -54,7 +54,8 @@ export type ApiKey = {
    *  never retrievable — so there is no "reveal" to offer. */
   prefix: string;
   scopes: string[];
-  /** The collection this key is locked to, or null for a workspace-wide key. */
+  /** The collection a SINGLE-COLLECTION key is locked to; null for a
+   *  MULTI-COLLECTION key, which reaches every collection in the workspace. */
   collectionId: string | null;
   createdBy: string | null;
   createdAt: string;

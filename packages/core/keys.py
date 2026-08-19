@@ -139,9 +139,10 @@ async def create_key(
 ) -> dict[str, Any]:
     """Issue a key. The plaintext comes back exactly once, here.
 
-    A `collection_id` binds the key to one collection: the request layer forces
-    every call it makes into that collection and refuses any other. Left None,
-    the key is workspace-wide, which is the console's own default. A binding is
+    A `collection_id` makes it a SINGLE-COLLECTION key: the request layer
+    forces every call it makes into that collection and refuses any other.
+    Left None it is a MULTI-COLLECTION key, reaching every collection in the
+    workspace, which is the console's own default. A binding is
     validated against the workspace here, because a key that names a collection
     the workspace does not have is a mistake worth catching at creation rather
     than as a 404 on first use.

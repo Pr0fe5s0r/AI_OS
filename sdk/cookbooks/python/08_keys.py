@@ -27,7 +27,7 @@ def main() -> None:
         # List existing keys — prefixes and usage only, never the secrets.
         print("\nkeys in workspace:")
         for k in mv.keys():
-            scope = k.collection_id or "workspace-wide"
+            scope = k.collection_id or "all collections"
             state = "revoked" if k.revoked else "active"
             print(f"  {k.prefix}…  {k.name}  [{','.join(k.scopes)}]  {scope}  {state}")
 

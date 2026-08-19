@@ -24,7 +24,8 @@ export function Keys({
   const [minted, setMinted] = useState<MintedKey | null>(null);
   const [name, setName] = useState("");
   const [scopes, setScopes] = useState("read,write");
-  // "" means workspace-wide; otherwise the key is locked to this collection.
+  // "" is a MULTI-COLLECTION key (every collection in the workspace);
+  // otherwise it is a SINGLE-COLLECTION key locked to the one named.
   // Defaults to whichever collection the sidebar is in, so the obvious act —
   // "create a key while looking at this collection" — produces a key for this
   // collection rather than one that quietly reaches all of them.
@@ -85,18 +86,20 @@ export function Keys({
           <p className="mt-1 max-w-xl text-xs leading-relaxed text-subtle">
             Authenticate every request with{" "}
             <Mono className="text-accentSoft">Authorization: Bearer</Mono>. A key carries the
-            workspace, so nothing you write with it has to name one.
+            workspace, so nothing you write with it has to name one. It is{" "}
+            <span className="text-muted">single-collection</span> when bound to one, and{" "}
+            <span className="text-muted">multi-collection</span> when it is not.
           </p>
           {active && (
             <p className="mt-1.5 max-w-xl text-2xs leading-relaxed text-subtle">
               Showing keys that can reach{" "}
-              <Mono className="text-accentSoft">{active}</Mono> — those bound to it, and
-              unbound ones, which reach every collection.
+              <Mono className="text-accentSoft">{active}</Mono> — single-collection keys
+              bound to it, and multi-collection keys, which reach every collection.
               {elsewhere > 0 && (
                 <>
                   {" "}
-                  {elsewhere} {elsewhere === 1 ? "key is" : "keys are"} bound to another
-                  collection and {elsewhere === 1 ? "is" : "are"} hidden here.
+                  {elsewhere} single-collection {elsewhere === 1 ? "key is" : "keys are"} bound
+                  elsewhere and {elsewhere === 1 ? "is" : "are"} hidden here.
                 </>
               )}
             </p>
@@ -166,7 +169,7 @@ export function Keys({
                 onChange={(e) => setCollectionId(e.target.value)}
                 className="rounded-lg border border-edge bg-canvas px-3 py-2 font-mono text-xs text-ink outline-none focus:border-accent/60"
               >
-                <option value="">Whole workspace</option>
+                <option value="">All collections (multi-collection key)</option>
                 {collections.map((c) => (
                   <option key={c.id} value={c.id}>
                     {c.id}
@@ -189,7 +192,7 @@ export function Keys({
           title={active ? `No keys reach ${active}` : "No keys yet"}
           hint={
             elsewhere
-              ? `A key is how the SDK, an MCP client or a CI job reaches this collection. ${elsewhere} ${elsewhere === 1 ? "key is" : "keys are"} bound to other collections and cannot reach this one.`
+              ? `A key is how the SDK, an MCP client or a CI job reaches this collection. ${elsewhere} single-collection ${elsewhere === 1 ? "key is bound" : "keys are bound"} elsewhere and cannot reach this one.`
               : "A key is how the SDK, an MCP client or a CI job reaches this workspace. The console itself uses your session instead."
           }
           action={
@@ -224,14 +227,18 @@ export function Keys({
                       <Mono className="text-xs text-ink">{k.name}</Mono>
                       {k.collectionId ? (
                         <Chip
-                          title="This key can only reach one collection."
+                          title="Single-collection key: it can reach this collection and no other."
                           tone="text-heat-2 border-heat-2/30 bg-heat-2/10"
                         >
                           {k.collectionId}
                         </Chip>
                       ) : (
-                        <Chip title="This key can reach every collection in the workspace.">
-                          workspace
+                        // Named for its reach, not its container. The tooltip
+                        // always said "every collection in the workspace"
+                        // while the label read "workspace", which described
+                        // where the key lives rather than what it opens.
+                        <Chip title="Multi-collection key: it reaches every collection in this workspace.">
+                          all collections
                         </Chip>
                       )}
                     </div>

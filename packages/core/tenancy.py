@@ -78,8 +78,9 @@ async def resolve_caller(
             "email": f"key:{holder['name']}",
             "key_id": holder["key_id"],
             "scopes": holder["scopes"],
-            # None means the key is workspace-wide; a value locks every call it
-            # makes to that one collection. Read by workspace_scope and
+            # None means a MULTI-COLLECTION key (every collection in the
+            # workspace); a value makes it SINGLE-COLLECTION, locking every
+            # call it makes to that one. Read by workspace_scope and
             # enforce_binding, never trusted from the request.
             "collection_id": holder.get("collection_id"),
             # The workspaces this key was explicitly granted, or None for the
@@ -308,9 +309,9 @@ async def workspace_scope(
     granted; for every other credential it may only name the workspace the
     credential already belongs to. See authorised_workspace.
 
-    A collection-bound key overrides all of this: it is confined to its one
+    A single-collection key overrides all of this: it is confined to its one
     collection whatever the header says. A missing header resolves to the bound
-    collection rather than to the whole workspace; a header naming a different
+    collection rather than to every collection; a header naming a different
     collection is refused. The binding is already known to exist (it was
     validated when the key was minted), so no second lookup is needed.
     """
