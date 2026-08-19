@@ -83,7 +83,7 @@ export function Traces({ active }: { active: string | null }) {
   const pageRows = rows ? rows.slice(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE) : [];
 
   return (
-    <div className="px-6 py-6">
+    <div className="px-4 py-5 sm:px-6 sm:py-6">
       <div className="mb-5 flex flex-wrap items-start justify-between gap-4">
         <div>
           <h1 className="text-base font-semibold text-ink">Trace console</h1>
@@ -183,7 +183,9 @@ export function Traces({ active }: { active: string | null }) {
         />
       ) : (
         <Card className="overflow-hidden">
-          <table className="w-full text-left">
+          {/* Scrolls inside the card rather than widening the page. */}
+          <div className="overflow-x-auto">
+          <table className="w-full min-w-[40rem] text-left">
             <thead>
               <tr className="border-b border-edge">
                 <Th className="pl-4">Query</Th>
@@ -258,6 +260,7 @@ export function Traces({ active }: { active: string | null }) {
               })}
             </tbody>
           </table>
+          </div>
         </Card>
       )}
 

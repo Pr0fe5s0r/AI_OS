@@ -53,7 +53,7 @@ export function Overview({
     : collections.reduce((sum, c) => sum + c.items, 0);
 
   return (
-    <div className="mx-auto max-w-[1600px] px-6 py-6">
+    <div className="mx-auto max-w-[1600px] px-4 py-5 sm:px-6 sm:py-6">
       <div className="mb-5 flex flex-wrap items-start justify-between gap-4">
         <div>
           <h1 className="text-base font-semibold text-ink">Overview</h1>
@@ -99,7 +99,12 @@ export function Overview({
       </Card>
 
       <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_20rem]">
-        <div>
+        {/* min-w-0, or the column takes its width from the longest query in
+            the list: a grid child defaults to min-width:auto, so `truncate`
+            below never gets the chance to truncate anything and the page
+            scrolls sideways instead. Measured at 702px inside a 375px
+            viewport. */}
+        <div className="min-w-0">
             <div className="mb-2 flex items-center justify-between">
               <Label>recent queries</Label>
               <button
@@ -130,7 +135,7 @@ export function Overview({
             )}
         </div>
 
-        <div className="space-y-4">
+        <div className="min-w-0 space-y-4">
           <Card className="p-4">
             <Label className="mb-2 block">next step</Label>
             <p className="text-xs leading-relaxed text-muted">

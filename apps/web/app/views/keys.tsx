@@ -79,7 +79,7 @@ export function Keys({
   }
 
   return (
-    <div className="px-6 py-6">
+    <div className="px-4 py-5 sm:px-6 sm:py-6">
       <div className="mb-5 flex items-start justify-between gap-4">
         <div>
           <h1 className="text-base font-semibold text-ink">API keys</h1>
@@ -203,7 +203,11 @@ export function Keys({
         />
       ) : (
         <Card className="overflow-hidden">
-          <table className="w-full text-left">
+          {/* A table has a floor width. Let it scroll inside the card instead
+              of widening the page, which is what pushed the whole console
+              sideways on a phone. */}
+          <div className="overflow-x-auto">
+          <table className="w-full min-w-[34rem] text-left">
             <thead>
               <tr className="border-b border-edge">
                 <Th className="pl-4">Label</Th>
@@ -279,6 +283,7 @@ export function Keys({
               ))}
             </tbody>
           </table>
+          </div>
         </Card>
       )}
     </div>

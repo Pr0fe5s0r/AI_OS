@@ -247,7 +247,7 @@ export function Upload({
 
   return (
     <div
-      className="px-6 py-6"
+      className="px-4 py-5 sm:px-6 sm:py-6"
       onDragOver={(e) => {
         e.preventDefault();
         setDragging(true);

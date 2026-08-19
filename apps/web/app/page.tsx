@@ -40,8 +40,14 @@ export default function Page() {
   // explicitly "All collections"; a string = one collection.
   const [selected, setSelected] = useState<string | null | undefined>(undefined);
   const [collOpen, setCollOpen] = useState(false);
+  // The sidebar is a permanent column on a wide screen and a drawer on a
+  // narrow one. At 375px it was neither: 245px of the 375 went to navigation
+  // and the numbers behind it overlapped each other.
+  const [navOpen, setNavOpen] = useState(false);
   const [creating, setCreating] = useState(false);
   const [newName, setNewName] = useState("");
+  const [renaming, setRenaming] = useState(false);
+  const [renameTo, setRenameTo] = useState("");
   const { toast, node } = useToast();
 
   // Every workspace starts with one collection so there is always somewhere to
@@ -100,6 +106,25 @@ export default function Page() {
   const active = selected === undefined ? fallback : selected;
   const activeLabel = active ?? "All collections";
 
+  // A collection's NAME is what people call it; its id is what keys bind to
+  // and what X-Collection carries. Renaming moves the first and never the
+  // second — a rename that moved the id would quietly break every key bound
+  // to it — which is also why the list below shows the name with the id
+  // beneath it. Showing only the id made renaming look like it did nothing.
+  async function renameCollection() {
+    const name = renameTo.trim();
+    if (!name || !active) return;
+    try {
+      await api.renameCollection(active, name);
+      setRenaming(false);
+      setCollOpen(false);
+      await load();
+      toast("Collection renamed");
+    } catch (e) {
+      toast((e as Error).message);
+    }
+  }
+
   async function createCollection() {
     const name = newName.trim();
     if (!name) return;
@@ -118,7 +143,21 @@ export default function Page() {
 
   return (
     <main className="flex h-screen overflow-hidden bg-canvas text-ink">
-      <aside className="flex w-56 shrink-0 flex-col border-r border-edge bg-panel">
+      {navOpen && (
+        <div
+          className="fixed inset-0 z-30 bg-black/60 lg:hidden"
+          onClick={() => setNavOpen(false)}
+          aria-hidden
+        />
+      )}
+
+      <aside
+        className={cx(
+          "fixed inset-y-0 left-0 z-40 flex w-64 shrink-0 flex-col border-r border-edge bg-panel",
+          "transition-transform duration-200 lg:static lg:z-auto lg:w-56 lg:translate-x-0",
+          navOpen ? "translate-x-0" : "-translate-x-full"
+        )}
+      >
         <div className="flex h-14 items-center border-b border-edge px-4">
           <Logo />
         </div>
@@ -132,7 +171,9 @@ export default function Page() {
             className="mt-1.5 flex w-full items-center gap-2 rounded-lg border border-edge bg-elevated px-2.5 py-2 transition hover:border-edgeStrong"
           >
             <span className={cx("h-2 w-2 shrink-0 rounded-full", active ? "bg-accent" : "bg-subtle")} />
-            <Mono className="min-w-0 flex-1 truncate text-left text-xs text-ink">{activeLabel}</Mono>
+            <Mono className="min-w-0 flex-1 truncate text-left text-xs text-ink">
+              {collections.find((c) => c.id === active)?.name || activeLabel}
+            </Mono>
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-subtle">
               <path d="M6 9l6 6 6-6" />
             </svg>
@@ -148,27 +189,79 @@ export default function Page() {
                 }}
               />
               <div className="card-in absolute inset-x-3 top-full z-30 mt-1 max-h-80 overflow-y-auto rounded-xl border border-edgeStrong bg-raised p-1.5 shadow-2xl shadow-black/50">
-                {[null, ...collections.map((c) => c.id)].map((id) => (
-                  <button
-                    key={id ?? "__all__"}
-                    onClick={() => {
-                      setSelected(id);
-                      setCollOpen(false);
-                    }}
-                    className={cx(
-                      "flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left transition",
-                      id === active ? "bg-accent/10" : "hover:bg-elevated"
-                    )}
-                  >
-                    <span className={cx("h-2 w-2 shrink-0 rounded-full", id ? "bg-accent" : "bg-subtle")} />
-                    <Mono className="min-w-0 flex-1 truncate text-xs text-ink">
-                      {id || "All collections"}
-                    </Mono>
-                    {id === active && <span className="h-1.5 w-1.5 rounded-full bg-accent" />}
-                  </button>
-                ))}
+                {[null, ...collections.map((c) => c.id)].map((id) => {
+                  const meta = collections.find((c) => c.id === id);
+                  const shows = meta?.name || id || "All collections";
+                  return (
+                    <button
+                      key={id ?? "__all__"}
+                      onClick={() => {
+                        setSelected(id);
+                        setCollOpen(false);
+                      }}
+                      className={cx(
+                        "flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left transition",
+                        id === active ? "bg-accent/10" : "hover:bg-elevated"
+                      )}
+                    >
+                      <span className={cx("h-2 w-2 shrink-0 rounded-full", id ? "bg-accent" : "bg-subtle")} />
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate font-mono text-xs text-ink">{shows}</span>
+                        {/* The id, whenever it is not simply the name again:
+                            it is what a key binds to, so it has to stay
+                            visible even once the name has moved away. */}
+                        {id && meta?.name && meta.name !== id && (
+                          <span className="block truncate font-mono text-2xs text-subtle">{id}</span>
+                        )}
+                      </span>
+                      {id === active && <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-accent" />}
+                    </button>
+                  );
+                })}
 
                 <div className="my-1 border-t border-edge" />
+
+                {/* Rename applies to the collection currently selected, which
+                    is why it is absent under "All collections" — there is no
+                    one collection for it to mean. */}
+                {active &&
+                  (renaming ? (
+                    <div className="flex items-center gap-1.5 px-1.5 py-1">
+                      <input
+                        autoFocus
+                        value={renameTo}
+                        onChange={(e) => setRenameTo(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") renameCollection();
+                          if (e.key === "Escape") setRenaming(false);
+                        }}
+                        placeholder="New name"
+                        className="min-w-0 flex-1 rounded-md border border-edge bg-canvas px-2 py-1 font-mono text-2xs text-ink outline-none focus:border-accent/60"
+                      />
+                      <button
+                        onClick={renameCollection}
+                        disabled={!renameTo.trim()}
+                        className="rounded-md border border-accent bg-accent px-2 py-1 font-mono text-2xs font-semibold text-canvas transition hover:bg-accentSoft disabled:opacity-40"
+                      >
+                        save
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      onClick={() => {
+                        setRenameTo(collections.find((c) => c.id === active)?.name || active);
+                        setRenaming(true);
+                        setCreating(false);
+                      }}
+                      className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-muted transition hover:bg-elevated hover:text-ink"
+                    >
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M12 20h9M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4z" />
+                      </svg>
+                      <span className="font-mono text-xs">Rename {active}</span>
+                    </button>
+                  ))}
+
                 {creating ? (
                   <div className="flex items-center gap-1.5 px-1.5 py-1">
                     <input
@@ -212,7 +305,10 @@ export default function Page() {
                 {NAV.filter((n) => n.group === g).map((n) => (
                   <button
                     key={n.id}
-                    onClick={() => setSection(n.id)}
+                    onClick={() => {
+                      setSection(n.id);
+                      setNavOpen(false);
+                    }}
                     className={cx(
                       "flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-xs font-medium transition",
                       section === n.id
@@ -270,13 +366,25 @@ export default function Page() {
       </aside>
 
       <div className="flex min-w-0 flex-1 flex-col">
-        <header className="relative flex h-14 shrink-0 items-center gap-3 border-b border-edge px-5">
-          <div className="flex items-center gap-2">
-            <span className="h-2 w-2 rounded-full bg-success" />
-            <Mono className="text-xs font-medium text-ink">{me.workspace_id}</Mono>
+        <header className="relative flex h-14 shrink-0 items-center gap-3 border-b border-edge px-4 sm:px-5">
+          <button
+            onClick={() => setNavOpen(true)}
+            aria-label="Open navigation"
+            className="-ml-1 rounded-lg p-1.5 text-muted transition hover:bg-elevated hover:text-ink lg:hidden"
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+              <path d="M4 6h16M4 12h16M4 18h16" />
+            </svg>
+          </button>
+
+          <div className="flex min-w-0 items-center gap-2">
+            <span className="h-2 w-2 shrink-0 rounded-full bg-success" />
+            <Mono className="truncate text-xs font-medium text-ink">{me.workspace_id}</Mono>
           </div>
 
-          <div className="ml-auto flex items-center gap-2">
+          {/* The API host is reference information, not something to read on a
+              phone — it is the first thing worth dropping when width is short. */}
+          <div className="ml-auto hidden items-center gap-2 sm:flex">
             <Chip tone="text-muted border-edgeStrong bg-elevated">
               <span className="mr-1 h-1.5 w-1.5 rounded-full bg-heat-2" />
               {api.API.replace(/^https?:\/\//, "")}

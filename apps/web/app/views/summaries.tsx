@@ -121,7 +121,7 @@ export function Summaries({ active, toast }: Props) {
             : 0;
 
     return (
-        <div className="mx-auto max-w-[1600px] px-6 py-6">
+        <div className="mx-auto max-w-[1600px] px-4 py-5 sm:px-6 sm:py-6">
             {/* Header */}
             <div className="mb-5 flex flex-wrap items-start justify-between gap-4">
                 <div>
