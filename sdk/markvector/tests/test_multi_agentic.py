@@ -212,3 +212,46 @@ def test_failures_do_not_leak_from_one_read_into_the_next():
     broken["yes"] = False
     across.answer("second")
     assert across.failures == {}
+
+
+# ---------- the agent knows which collection a document came from ----------
+
+
+def test_documents_carry_the_collection_they_came_from():
+    across = store(_tools_handler([])).multi_collection(NAMES)
+    assert {d.collection for d in across.list()} == {"acme", "globex"}
+
+
+def test_a_document_opened_by_id_carries_it_too():
+    """The agent opens documents by id, long after the listing that found
+    them. Without this the answer can name the document and not the store."""
+    across = store(_tools_handler([])).multi_collection(NAMES)
+    assert across.get("doc-globex").collection == "globex"
+
+
+def test_every_tool_the_agent_reads_names_the_collection():
+    """Stamping the models is only half of it: the agent hands the MODEL a
+    dict, and a field that never reaches that dict cannot be cited."""
+    import inspect
+
+    from markvector.agent import Agent
+
+    source = inspect.getsource(Agent._run_tool)
+    for tool in ("overview", "search", "list_files", "read_document"):
+        chunk = source[source.index(f'name == "{tool}"') :]
+        nxt = chunk.find('if name == "', 10)
+        assert '"collection":' in chunk[: nxt if nxt > 0 else len(chunk)], tool
+
+
+def test_the_model_is_told_to_name_the_collection():
+    """A field it is not asked to use is a field it ignores."""
+    from markvector.agent import SYSTEM
+
+    assert "NAME IT" in SYSTEM
+    assert "which collection" in SYSTEM
+
+
+def test_a_single_collection_read_leaves_the_field_empty():
+    """Nothing to distinguish, and an id repeated on every row is noise."""
+    docs = store(_tools_handler([])).collection("acme").list()
+    assert [d.collection for d in docs] == [""]

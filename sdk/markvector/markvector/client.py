@@ -1220,6 +1220,10 @@ class MultiCollection:
                 continue
             for doc in found:
                 self._remember(doc.id, name)
+                # Stamped, not merely remembered. The agent reads these rows
+                # and has to be able to SAY which collection a document came
+                # out of; a lookup table it cannot see does not help it cite.
+                doc.collection = name
                 out.append(doc)
         return out
 
@@ -1233,12 +1237,16 @@ class MultiCollection:
                 continue
             for card in cards:
                 self._remember(card.item_id, name)
+                card.collection = name
                 out.append(card)
         return out
 
     def get(self, document: str | Document, **kwargs: Any) -> Document:
         """One document, from whichever collection holds it."""
-        return self._where_it_lives(_doc_id(document)).get(document, **kwargs)
+        home = self._where_it_lives(_doc_id(document))
+        found = home.get(document, **kwargs)
+        found.collection = home.id
+        return found
 
     def structure(self, file: str | Document, **kwargs: Any) -> Structure:
         """A document's heading tree, from whichever collection holds it."""

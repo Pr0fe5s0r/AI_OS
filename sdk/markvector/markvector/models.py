@@ -81,6 +81,11 @@ class Document:
     period_end: datetime | None = None
     categories: list[Category] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Which collection this document lives in. Empty when one collection was
+    # asked, where the caller already knows; set when several were read at
+    # once, so a document can be told apart from a same-named one elsewhere —
+    # and so an answer can say which collection it came out of.
+    collection: str = ""
     # How this document can be addressed, declared by the server so nothing has
     # to be discovered by trial: how many parts it has, what they are called,
     # and whether a picture of one can be fetched. A deck answers 79 / "slide" /
@@ -440,6 +445,8 @@ class IndexSummary:
     covers: int
     generated_by: str | None = None
     probe_question: str | None = None
+    # The collection this card describes, when several were read at once.
+    collection: str = ""
 
     @classmethod
     def from_json(cls, d: dict[str, Any]) -> IndexSummary:

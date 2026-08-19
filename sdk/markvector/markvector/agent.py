@@ -71,6 +71,14 @@ Ground every claim in what the tools returned — do not use outside knowledge. 
 The overview is a MAP, not evidence: never cite it; cite the real document \
 (item_id / filename) a claim came from.
 
+Every result carries a `collection` — the store the document lives in. NAME IT \
+when you cite: say which collection a fact came out of, not only which \
+document. Two collections can hold documents of the same title with different \
+contents, so "the onboarding guide says X" is ambiguous where "the onboarding \
+guide in acme says X" is not. When an answer draws on more than one \
+collection, make clear which part came from which. Where the field is empty, \
+one collection was read and there is nothing to distinguish.
+
 Say plainly what you could not establish. If the knowledge base does not \
 contain the answer, say so rather than guessing; if it answers only part, give \
 that part and name the gap; if the sources conflict, report the conflict as the \
@@ -404,6 +412,7 @@ class Agent:
                 out: list[Any] = [
                     {
                         "item_id": s.item_id,
+                        "collection": s.collection,
                         "kind": s.node_type,
                         "heading": s.heading,
                         "about": (s.text or "")[:240],
@@ -445,6 +454,7 @@ class Agent:
                 return [
                     {
                         "item_id": h.id,
+                        "collection": h.collection,
                         # The winning passage's id, so the model can hop from a
                         # hit to its neighbours instead of only reading its file.
                         "chunk_id": h.chunk_id,
@@ -460,6 +470,7 @@ class Agent:
                 return [
                     {
                         "item_id": d.id,
+                        "collection": d.collection,
                         "filename": d.original.filename if d.original else d.source.locator,
                         "title": d.title,
                         "source": d.source.source,
@@ -487,7 +498,12 @@ class Agent:
                     return {"error": f"document {item_id!r} is outside the selected file scope"}
                 doc = self._c.get(item_id)
                 body = doc.body[:_READ_BUDGET]
-                out: dict[str, Any] = {"item_id": doc.id, "title": doc.title, "text": body}
+                out: dict[str, Any] = {
+                    "item_id": doc.id,
+                    "collection": doc.collection,
+                    "title": doc.title,
+                    "text": body,
+                }
                 if len(doc.body) > _READ_BUDGET:
                     out["truncated"] = True
                 return out
