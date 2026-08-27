@@ -1,0 +1,217 @@
+from __future__ import annotations
+
+from typing import Any
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from packages.core import graph
+from packages.core.classify import classes_for
+from packages.core.projection import project
+from packages.shared.schema import Scope
+
+# ---------------------------------------------------------------------------
+# THE NEIGHBOUR GRAPH — what the store looks like from the inside.
+#
+# A collection is a cloud of vectors, and the only structure in it that means
+# anything is which points are near which. So the graph is built from the
+# embeddings themselves: every item is joined to its k nearest neighbours by
+# cosine similarity, and the edge carries that similarity.
+#
+# Two kinds of edge, kept distinct on purpose:
+#   similarity — computed here, from the vectors
+#   declared   — recorded by the store (a version superseding another)
+# One is an observation and the other is a fact, and a view that blurred them
+# would be showing something that is not true of the data.
+# ---------------------------------------------------------------------------
+
+MAX_NODES = 400  # passages, not documents — a single file is now many nodes
+DEFAULT_K = 3
+
+# How much weaker than the typical nearest-neighbour an edge may be before it
+# is dropped. A FIXED cosine floor was wrong here: different embedding models
+# occupy different parts of the range, and the one in use puts plainly related
+# documents around 0.6-0.7, so a 0.45 constant borrowed from another model's
+# distribution left two thirds of a collection with no edges at all. Taking the
+# floor from the data keeps the graph meaningful whatever model a collection
+# was built with.
+RELATIVE_FLOOR = 0.72
+# A last guard against a collection of unrelated documents being wired into a
+# mesh: nothing below this is a neighbour under any model.
+ABSOLUTE_FLOOR = 0.2
+
+
+def knn_edges(
+    points: list[dict[str, Any]], k: int = DEFAULT_K
+) -> tuple[list[dict[str, Any]], float]:
+    """Join every point to its k nearest neighbours.
+
+    Returns the edges and the floor that was applied, because a graph drawn
+    with a threshold nobody can see is a graph nobody can argue with.
+
+    Edges are deduplicated by unordered pair: if A lists B and B lists A, that
+    is one relationship drawn once, keeping the stronger score.
+
+    Every pair is compared, which is the honest way to find nearest neighbours
+    and also quadratic. Written as an explicit Python loop it took **7.4
+    seconds** for 200 passages — 19,900 pairs over 1,536 dimensions is 30
+    million multiply-adds, and the index graph page paid all of it on every
+    load. The arithmetic is identical here; it is one matrix product instead of
+    a loop, because the interpreter was the cost and not the mathematics.
+    """
+    import numpy as np
+
+    usable = [p for p in points if p.get("embedding")]
+    if len(usable) < 2:
+        return [], 0.0
+
+    ids = [p["id"] for p in usable]
+    # float64, not float32. Half the memory and a little more speed were on
+    # offer, and they moved the reported similarity in the fourth decimal —
+    # enough to flip an edge on a near-tie. At 400 nodes the whole product is
+    # hundredths of a second either way, so there is nothing to buy with it.
+    matrix = np.asarray([p["embedding"] for p in usable], dtype=np.float64)
+
+    # A zero-length vector has no direction, so it is similar to nothing. The
+    # divisor is faked to 1 to keep the row finite, and the row is then zeroed —
+    # the alternative is a NaN that propagates into every comparison silently.
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    empty = norms[:, 0] == 0
+    unit = matrix / np.where(norms == 0, 1, norms)
+    similarity = unit @ unit.T
+    if empty.any():
+        similarity[empty, :] = 0.0
+        similarity[:, empty] = 0.0
+
+    # A point is not its own neighbour. -inf rather than 0 so it can never be
+    # selected by the top-k below, whatever the real similarities look like.
+    np.fill_diagonal(similarity, -np.inf)
+
+    # The floor comes from the data, not a constant: each point's BEST match,
+    # then the median of those.
+    typical = float(np.median(similarity.max(axis=1)))
+    floor = max(ABSOLUTE_FLOOR, typical * RELATIVE_FLOOR)
+
+    width = min(k, len(usable) - 1)
+    # argpartition finds the k best per row without sorting the other 196.
+    nearest = np.argpartition(-similarity, width - 1, axis=1)[:, :width]
+
+    best: dict[tuple[str, str], float] = {}
+    for row, neighbours in enumerate(nearest):
+        id_a = ids[row]
+        for column in neighbours:
+            score = float(similarity[row, column])
+            if score < floor:
+                continue
+            id_b = ids[column]
+            pair = (id_a, id_b) if id_a < id_b else (id_b, id_a)
+            if score > best.get(pair, 0.0):
+                best[pair] = score
+
+    edges = [
+        {"src": a, "dst": b, "similarity": round(s, 4), "kind": "similarity"}
+        for (a, b), s in sorted(best.items(), key=lambda kv: kv[1], reverse=True)
+    ]
+    return edges, round(floor, 4)
+
+
+async def collection_graph(
+    session: AsyncSession, scope: Scope, k: int = DEFAULT_K, limit: int = MAX_NODES
+) -> dict[str, Any]:
+    """The collection as nodes and edges, ready to draw.
+
+    A node is a PASSAGE, not a document. One node per file showed a collection
+    of a dozen documents as a dozen unconnected dots — nothing to look at, and
+    nothing true either, since a document is not one idea. Passages are what
+    was embedded, so they are what the graph can honestly draw.
+
+    Node degree is returned with the node because the view sizes points by how
+    connected they are, and computing that in the browser would mean shipping
+    the edge list twice.
+    """
+    points = await graph.collection_chunk_vectors(scope, limit=limit, live_only=True)
+    if not points:
+        return {
+            "nodes": [], "edges": [], "truncated": False, "k": k, "floor": 0.0,
+            "documents": 0,
+            "projection": {"method": "none", "explained_variance": 0.0},
+        }
+
+    edges, floor = knn_edges(points, k=k)
+
+    # Passages of the same document are joined explicitly. Without it a long
+    # document reads as scattered unrelated points; with it the document is
+    # visible as a shape, and a passage sitting far from its own siblings is
+    # worth noticing — it usually means the file covers two subjects.
+    by_item: dict[str, list[dict[str, Any]]] = {}
+    for p in points:
+        by_item.setdefault(p["item_id"], []).append(p)
+    for siblings in by_item.values():
+        ordered = sorted(siblings, key=lambda s: s["ordinal"])
+        edges += [
+            {"src": a["id"], "dst": b["id"], "similarity": 1.0, "kind": "same_document"}
+            for a, b in zip(ordered, ordered[1:], strict=False)
+        ]
+
+    # The same vectors, flattened to two dimensions. Done here rather than in
+    # its own endpoint so a collection's 1536-float embeddings are read once.
+    flattened = project(points)
+
+    # Documents give the cloud its colour, so the passages of one file share a
+    # hue and the graph shows how they scatter.
+    item_ids = list(by_item)
+    tagged = await classes_for(session, scope, item_ids)
+
+    degree: dict[str, int] = {}
+    for e in edges:
+        degree[e["src"]] = degree.get(e["src"], 0) + 1
+        degree[e["dst"]] = degree.get(e["dst"], 0) + 1
+
+    nodes = [
+        {
+            "id": p["id"],
+            "itemId": p["item_id"],
+            "ordinal": p["ordinal"],
+            # fact | summary, and 1..4 for how far consolidation has carried
+            # it. A summary is text a model wrote, so the view has to be able
+            # to say so rather than drawing it like any other passage.
+            "nodeType": p.get("node_type", "fact"),
+            "stage": p.get("stage", 1),
+            # What the passage is: its heading path, falling back to the
+            # document title for a passage above the first heading.
+            "title": p["heading"] or p["title"] or "",
+            "document": p["title"] or "",
+            "source": "",
+            "degree": degree.get(p["id"], 0),
+            "category": (tagged.get(p["item_id"]) or [{}])[0].get("class_id"),
+            "categoryName": (tagged.get(p["item_id"]) or [{}])[0].get("name"),
+            # Position in embedding space, 0..1. Distinct from the force
+            # layout: these coordinates mean something.
+            "px": flattened["coords"].get(p["id"], {}).get("x"),
+            "py": flattened["coords"].get(p["id"], {}).get("y"),
+        }
+        for p in points
+    ]
+
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "truncated": len(points) >= limit,
+        "k": k,
+        "documents": len(by_item),
+        # Shown in the view: a threshold nobody can see is one nobody can argue with.
+        "floor": floor,
+        "projection": {
+            "method": flattened["method"],
+            "explained_variance": flattened["explained_variance"],
+        },
+    }
+
+
+__all__ = [
+    "ABSOLUTE_FLOOR",
+    "DEFAULT_K",
+    "MAX_NODES",
+    "RELATIVE_FLOOR",
+    "collection_graph",
+    "knn_edges",
+]

@@ -13,12 +13,12 @@ up:
 
 ## Pull real events from every connected source onto the arq pipeline.
 ingest:
-	$(COMPOSE) exec -T api python -m verticals.software.ingest
-	$(COMPOSE) exec -T postgres psql -U aios -d aios -c "SELECT (SELECT count(*) FROM events) AS events, (SELECT count(*) FROM event_embeddings) AS embeddings, (SELECT count(*) FROM nodes) AS nodes, (SELECT count(*) FROM edges) AS edges;"
+	curl -s -X POST "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me/api/ingest?company_id=default"
+	$(COMPOSE) exec -T postgres psql -U aios -d aios -c "SELECT company_id, count(*) AS events FROM events GROUP BY 1;"
 
 ## Learn norms -> detect situations -> assemble briefs -> deliver.
 analyze:
-	curl -s -X POST "http://localhost:8000/api/analyze?company_id=default"
+	curl -s -X POST "http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me/api/analyze?company_id=default"
 
 ## Import-boundary guardrail (fails if core imports a vertical).
 boundary:
@@ -29,7 +29,7 @@ test:
 
 lint:
 	$(COMPOSE) exec -T api ruff check .
-	$(COMPOSE) exec -T api mypy packages apps verticals
+	$(COMPOSE) exec -T api mypy packages apps
 
 down:
 	$(COMPOSE) down -v

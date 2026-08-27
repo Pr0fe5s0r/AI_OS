@@ -8,8 +8,20 @@ openai==1.59.6
 httpx==0.28.1
 arq==0.26.1
 cryptography==44.0.0
+neo4j==5.28.1
 pytest==8.3.4
 pytest-asyncio==0.25.2
 python-dotenv==1.0.1
 ruff==0.8.6
 mypy==1.14.1
+bcrypt==4.2.1
+pypdf==5.1.0
+# Renders a PDF page back into the picture it was laid out as, for the
+# citations that were read with vision. PDFium under a permissive licence
+# rather than PyMuPDF, which is AGPL and would follow this into every
+# deployment that ships.
+pypdfium2==4.30.0
+pillow==11.1.0
+python-multipart==0.0.20
+numpy==2.3.3
+boto3==1.35.99

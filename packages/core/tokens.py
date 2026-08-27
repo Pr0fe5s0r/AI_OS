@@ -27,9 +27,14 @@ async def issue_token(
     purpose: str,
     payload: dict[str, Any],
     ttl_days: int = 7,
+    ttl_minutes: int | None = None,
 ) -> str:
+    """``ttl_minutes`` overrides ``ttl_days`` for short-lived capabilities —
+    an OAuth `state` should be valid for minutes, not the week an emailed
+    approval link reasonably needs."""
     jti = uuid.uuid4().hex
-    expires_at = datetime.now(UTC) + timedelta(days=ttl_days)
+    delta = timedelta(minutes=ttl_minutes) if ttl_minutes is not None else timedelta(days=ttl_days)
+    expires_at = datetime.now(UTC) + delta
     await session.execute(
         text(
             """

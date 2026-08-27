@@ -3,5 +3,8 @@
 .pytest_cache/
 apps/web/node_modules/
 apps/web/.next/
+apps/web/tsconfig.tsbuildinfo
 .git/
 .env
+.claude/
+.venv/

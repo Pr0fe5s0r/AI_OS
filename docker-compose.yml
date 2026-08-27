@@ -1,12 +1,30 @@
 # Shared env for the api + worker (same image, same config).
 x-app-env: &app-env
+  # How long one question may run before the caller is told it failed. Both
+  # answer paths were unbounded, and a streamed vectorless answer was observed
+  # holding a connection open for over twelve minutes with no error and no end.
+  ANSWER_DEADLINE_SECONDS: ${ANSWER_DEADLINE_SECONDS:-300}
+  JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-1800}
+  MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-128}
+  MAX_DOCUMENTS: ${MAX_DOCUMENTS:-0}
+  MAX_CATALOGUE_BYTES: ${MAX_CATALOGUE_BYTES:-67108864}
+  QUERY_EXPANSION: ${QUERY_EXPANSION:-false}
+  QUERY_EXPANSION_AGENTIC: ${QUERY_EXPANSION_AGENTIC:-true}
+  SUMMARIES_ENABLED: ${SUMMARIES_ENABLED:-true}
+  SUMMARIES_INTERVAL_SECONDS: ${SUMMARIES_INTERVAL_SECONDS:-300}
   DATABASE_URL: postgresql+asyncpg://aios:aios@postgres:5432/aios
   REDIS_URL: redis://redis:6379/0
+  NEO4J_URI: bolt://neo4j:7687
+  NEO4J_USER: ${NEO4J_USER:-neo4j}
+  NEO4J_PASSWORD: ${NEO4J_PASSWORD:-markos-graph}
   LLM_PROVIDER: ${LLM_PROVIDER:-openai}
   OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
   OPENAI_API_KEY: ${OPENAI_API_KEY:-}
   EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
   CHAT_MODEL: ${CHAT_MODEL:-gpt-4o-mini}
+  # Unset by default: without it the agent never looks at a page, and the
+  # system behaves exactly as it did before pages existed.
+  VISION_MODEL: ${VISION_MODEL:-}
   NEBIUS_BASE_URL: ${NEBIUS_BASE_URL:-https://api.studio.nebius.com/v1}
   NEBIUS_API_KEY: ${NEBIUS_API_KEY:-}
   OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
@@ -14,13 +32,33 @@ x-app-env: &app-env
   GITHUB_TOKEN: ${GITHUB_TOKEN:-}
   GITHUB_REPO: ${GITHUB_REPO:-}
   GITHUB_LIMIT: ${GITHUB_LIMIT:-30}
+  # "Sign in with GitHub" (OAuth). Unset -> the UI falls back to a token field.
+  GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+  GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+  GITHUB_OAUTH_SCOPE: ${GITHUB_OAUTH_SCOPE:-public_repo}
+  # "Sign in with Slack" (OAuth). Unset -> the UI falls back to a bot-token field.
+  SLACK_CLIENT_ID: ${SLACK_CLIENT_ID:-}
+  SLACK_CLIENT_SECRET: ${SLACK_CLIENT_SECRET:-}
+  SLACK_OAUTH_SCOPE: ${SLACK_OAUTH_SCOPE:-channels:history,channels:read,users:read}
+  # inbound email reply handling (POST /api/inbound/email) is off until set
+  INBOUND_EMAIL_SECRET: ${INBOUND_EMAIL_SECRET:-}
+  WEB_BASE_URL: ${WEB_BASE_URL:-http://localhost:3005}
+  WEB_ORIGINS: ${WEB_ORIGINS:-http://localhost:3005}
   FERNET_KEY: ${FERNET_KEY:-}
+  # Object storage for the ORIGINAL uploaded files. The KB keeps the converted
+  # Markdown for retrieval and now also the original bytes, so a PDF can be
+  # shown as a PDF. MinIO locally; any S3-compatible endpoint in production.
+  S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY:-aiosminio}
+  S3_SECRET_KEY: ${S3_SECRET_KEY:-aiosminio-secret}
+  S3_BUCKET: ${S3_BUCKET:-originals}
+  S3_MAX_ORIGINAL_MB: ${S3_MAX_ORIGINAL_MB:-25}
   SMTP_HOST: ${SMTP_HOST:-}
   SMTP_PORT: ${SMTP_PORT:-587}
   SMTP_USER: ${SMTP_USER:-}
   SMTP_PASSWORD: ${SMTP_PASSWORD:-}
   SMTP_FROM: ${SMTP_FROM:-ai-os@localhost}
-  PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8000}
+  PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://tnega-api-o9ecgm-5fbf26-217-154-175-169.traefik.me}
   SCAN_ENABLED: ${SCAN_ENABLED:-true}
   SCAN_INTERVAL_MINUTES: ${SCAN_INTERVAL_MINUTES:-15}
   SCAN_INGEST_TIMEOUT: ${SCAN_INGEST_TIMEOUT:-120}
@@ -28,7 +66,8 @@ x-app-env: &app-env
 
 services:
   postgres:
-    image: pgvector/pgvector:pg16
+    # Plain Postgres: the system of record. Vectors live in Neo4j, not here.
+    image: postgres:16
     environment:
       POSTGRES_USER: aios
       POSTGRES_PASSWORD: aios
@@ -43,6 +82,25 @@ services:
       interval: 3s
       timeout: 3s
       retries: 20
+
+  # The living graph + vectors: Things, Event mirrors, typed links, embeddings.
+  neo4j:
+    image: neo4j:5-community
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-markos-graph}
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 1g
+    ports:
+      # host 7475/7688 -> container 7474/7687 (defaults left free for other stacks)
+      - "7475:7474"
+      - "7688:7687"
+    volumes:
+      - neo4jdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u $${NEO4J_AUTH%%/*} -p $${NEO4J_AUTH#*/} 'RETURN 1' || exit 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
 
   # Local fake inbox: catches every email the app sends. Nothing leaves the
   # machine. Read them at http://localhost:8025
@@ -60,13 +118,35 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      # host 6389 -> container 6379 (6379 is used by another local stack)
-      - "6389:6379"
+      # host 16379 -> container 6379. 6379 clashes with another local stack, and
+      # 6389 lands inside a Windows WinNAT-reserved TCP range (6359-6458), which
+      # fails to bind with WSAEACCES. 16379 sits clear of every reserved block.
+      # Host-side only: api/worker reach Redis at redis:6379 over the compose net.
+      - "16379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 3s
       timeout: 3s
       retries: 20
+
+  # Object storage for original uploaded files. S3-compatible, so the app talks
+  # to it with the same client it would use against AWS S3 in production.
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-aiosminio}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-aiosminio-secret}
+    # Internal-only. The API and worker reach S3 at http://minio:9000 over the
+    # Compose network; publishing 9000/9001 on the host makes parallel stacks
+    # collide and is not required for application traffic.
+    expose:
+      - "9000"
+    volumes:
+      - miniodata:/data
+    # No healthcheck: recent MinIO images ship neither curl nor a configured mc
+    # alias, so any check here is unreliable. The app creates the bucket on
+    # startup with a short retry instead (packages/core/blobs.ensure_bucket).
 
   api:
     build:
@@ -80,8 +160,18 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      minio:
+        condition: service_started
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/api/health')"]
+      # Inside the container, against the process itself. A healthcheck that
+      # calls a public ingress URL is testing DNS, the internet and the proxy —
+      # none of which the container can do anything about, and all of which are
+      # absent on a laptop. It reported this API as unhealthy while it was
+      # serving 200s, which then blocked the worker from starting at all: every
+      # upload returned 202 and sat in a queue with nothing to run it.
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
       interval: 3s
       timeout: 3s
       retries: 20
@@ -93,28 +183,46 @@ services:
     environment: *app-env
     command: ["arq", "apps.worker.main.WorkerSettings"]
     depends_on:
+      # NOT the api. The worker talks to Redis, Postgres, Neo4j and the object
+      # store; it never calls the API, so gating it on the API's health only
+      # creates a way for ingestion to be silently dead while uploads are
+      # still accepted.
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      minio:
+        condition: service_started
 
   web:
     build:
       context: ./apps/web
       dockerfile: Dockerfile
+      args:
+        # rewrites() is baked into the build, so the proxy target must be known
+        # here as well as at runtime. Same value both places, deliberately.
+        API_URL: http://api:8000
     environment:
       # Server-side rewrite target so the browser only ever calls /api/*
       API_URL: http://api:8000
-      WATCHPACK_POLLING: "true"
-    volumes:
-      # Hot reload: edit apps/web on the host, see it live. node_modules stays in-image.
-      - ./apps/web:/app
-      - /app/node_modules
-      - /app/.next
+    # No volumes. The old set bind-mounted ./apps/web over /app and then tried to
+    # rescue the shadowed dependencies with anonymous volumes for node_modules and
+    # .next. Anonymous volumes are created once and REUSED on every recreate, so
+    # /app/node_modules kept serving whatever `npm ci` produced the first time the
+    # container ever ran — Next 14.2.5, no d3 — and no amount of rebuilding could
+    # dislodge it. That is what "Module not found: Can't resolve 'd3'" was, with
+    # package.json and package-lock.json both pinning d3 7.9.0 the whole time.
+    # The image already contains the source and the installed deps; let it.
+    # For hot reload, run `npm run dev` in apps/web on the host instead.
     ports:
-      - "3000:3000"
+      - "3005:3000"
     depends_on:
-      - api
+      api:
+        condition: service_healthy
 
 volumes:
   pgdata:
+  neo4jdata:
+  miniodata:

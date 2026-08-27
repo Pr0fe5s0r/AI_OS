@@ -4,3 +4,15 @@ __pycache__/
 .pytest_cache/
 node_modules/
 .next/
+
+# TS build artifact
+apps/web/tsconfig.tsbuildinfo
+
+# A separately cloned repository, not part of this project.
+PageIndex/
+# Reference implementations cloned for reading, not part of this repo.
+PixelRAG/
+
+# Release artifacts — built on demand, never committed.
+sdk/js/*.tgz
+sdk/markvector/dist/

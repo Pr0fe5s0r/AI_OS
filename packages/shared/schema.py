@@ -1,73 +1,204 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, Field
 
+# ---------------------------------------------------------------------------
+# The Knowledge Base speaks about exactly one unit of knowledge: an Item.
+#
+# Every other word the requirements use for it — content, record, document,
+# knowledge object — means this. Whatever produced it (an uploaded file, a
+# synced Drive document, a generated report), by the time it reaches storage
+# it is an Item: Markdown, plus the metadata needed to find it, scope it and
+# know whether it is still current.
+# ---------------------------------------------------------------------------
 
-class Actor(BaseModel):
-    """Who performed an event."""
 
-    id: str
-    name: str
-    email: str | None = None
+class Lifecycle(StrEnum):
+    """Where an item is in its life. Retrieval serves ACTIVE only."""
+
+    ACTIVE = "active"
+    SUPERSEDED = "superseded"  # a newer version of the same source exists
+    ARCHIVED = "archived"  # withdrawn deliberately
+    FAILED = "failed"  # ingestion did not complete; visible, never silent
 
 
-class Event(BaseModel):
-    """Generic, source-agnostic event.
+class Scope(BaseModel):
+    """Two-level tenancy: an agency, and a client collection beneath it.
 
-    The core engine stores and searches these. Verticals decide which
-    ``source`` / ``type`` values are meaningful — the schema itself carries no
-    domain logic.
+    Isolation between agencies AND between brands is a precondition, so this
+    travels with every write and every query rather than being remembered at
+    each call site. ``collection_id`` is optional because some items belong to the
+    agency itself rather than to one of its clients.
     """
 
+    workspace_id: str
+    collection_id: str | None = None
+
+    model_config = {"frozen": True}
+
+
+class SourceRef(BaseModel):
+    """Where an item came from, and how to get back to it.
+
+    The KB never keeps the original binary (KB-7), so this is the only route
+    back to it. ``locator`` is whatever the source needs to re-fetch: a Drive
+    file id, an S3 key, a URL, a chat session id.
+    """
+
+    source: str  # "upload" | "gdrive" | "s3" | "notion" | ...
+    locator: str
+    url: str | None = None
+    fetched_at: datetime | None = None
+
+
+def content_hash(markdown: str) -> str:
+    """The hash the whole write path turns on.
+
+    One mechanism answers four separate requirements: skip duplicates (KB-1),
+    reprocess only what changed on sync (KB-4), never re-embed unchanged
+    content (KB-8), and decide when a new version supersedes the last (KB-1).
+    Computed over the normalised Markdown, not the original bytes — the same
+    document re-exported produces different bytes but identical knowledge.
+    """
+    return hashlib.sha256(markdown.strip().encode("utf-8")).hexdigest()
+
+
+class Item(BaseModel):
+    """One unit of knowledge in the KB."""
+
     id: str
-    company_id: str = "default"
-    source: str  # "github" | "slack" | "zendesk" | ...
-    type: str  # e.g. "issue", "message", "ticket"
-    actor: Actor
-    timestamp: datetime
-    content: str  # the text we embed + full-text index
+    scope: Scope
+    title: str
+    body: str  # Markdown — the canonical stored representation
+    source: SourceRef
+    hash: str = ""
+    version: int = 1
+    supersedes: str | None = None  # id of the version this replaced
+    status: Lifecycle = Lifecycle.ACTIVE
+
+    # When the content was written vs. the period it *describes*. A July report
+    # about Q2 has a created_at in July and a period covering Q2; time-aware
+    # retrieval needs both and they are routinely different.
+    created_at: datetime | None = None
+    period_start: datetime | None = None
+    period_end: datetime | None = None
+
     metadata: dict[str, Any] = Field(default_factory=dict)
-    raw: dict[str, Any] = Field(default_factory=dict)  # untouched source payload
 
     model_config = {"extra": "forbid"}
 
+    def with_hash(self) -> Item:
+        return self.model_copy(update={"hash": self.hash or content_hash(self.body)})
+
+
+class Classification(BaseModel):
+    """One class assigned to an item.
+
+    The KB owns this decision, not the uploader (KB-2.a): ``confidence`` and
+    ``basis`` record how it was reached so low-confidence assignments can be
+    surfaced, and ``pinned`` marks a human override that re-classification
+    must never silently revert (KB-2.b).
+    """
+
+    item_id: str
+    class_id: str
+    confidence: float = 0.0
+    basis: str | None = None
+    pinned: bool = False
+
+
+class Passage(BaseModel):
+    """One matching passage of a document — the unit that was actually scored."""
+
+    chunk_id: str
+    ordinal: int
+    heading: str
+    text: str
+    score: float
+    semantic: float = 0.0
+    keyword: float = 0.0
+    # The page this passage was READ OFF, when it was read from a picture
+    # rather than from extracted text. Optional and usually absent: only PDFs
+    # have pages, and only a page somebody actually looked at is rendered.
+    # Present, it means the reader can check the transcription against the page
+    # — which is the only reason transcribing a table is trustworthy at all.
+    page: int | None = None
+    # Where on that page the reading came from, as percentages of the page:
+    # {x, y, w, h, label}. Drawn over the page image so a citation points at
+    # the row or the cell rather than at a whole sheet of paper. Empty
+    # whenever the reader could not place something confidently — a box round
+    # the wrong thing is worse than no box.
+    regions: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class Hit(BaseModel):
+    """One retrieval result, carrying the provenance a citation needs."""
+
+    item_id: str
+    title: str
+    excerpt: str
+    source: SourceRef
+    score: float
+    semantic: float = 0.0
+    keyword: float = 0.0
+    # Where in the document the excerpt came from, e.g.
+    # "4. Functional Requirements > KB-3. Ingestion". This is the difference
+    # between citing a file and citing a passage: it lets a reader check the
+    # claim without opening the document and searching it themselves.
+    heading: str = ""
+    # Every passage of this document that matched, best first. The document is
+    # the result, but the passages are the evidence — and a long document
+    # matching in six places is a materially different answer from one
+    # matching in a single line, which a document-level score cannot express.
+    passages: list[Passage] = Field(default_factory=list)
+
 
 # ---------------------------------------------------------------------------
-# Understand layer — generic graph + resolution + norms result types.
-# The core produces these; verticals supply the rules that drive them.
+# Graph — relationships between items, and the vectors used to find them.
 # ---------------------------------------------------------------------------
 
 
-class ResolvedEntity(BaseModel):
-    """One link discovered by core.resolve() between two events/nodes."""
+class Link(StrEnum):
+    """The relationship types the KB models. Deliberately few."""
 
-    source_event_id: str
-    target_node_id: str
-    node_type: str
-    method: str  # "id" | "embedding" | "keyword"
-    edge_type: str  # "SAME_AS" | "MENTIONS" | "CLOSES" | "AUTHORED"
-    confidence: float
+    SUPERSEDES = "SUPERSEDES"  # version lineage
+    DERIVES_FROM = "DERIVES_FROM"  # a report built from other items
+    REFERENCES = "REFERENCES"  # one item cites another
+
+
+class Connection(BaseModel):
+    """A configured link to an external source, as shown to an operator.
+
+    The token itself never appears here — it stays sealed in the credential
+    store and is only unsealed at the moment of a fetch.
+    """
+
+    workspace_id: str
+    source: str
+    connected: bool = True
+    config: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime | None = None
 
 
 class GraphNode(BaseModel):
     id: str
-    company_id: str = "default"
-    type: str  # Incident | PullRequest | Ticket | Feature | Person | Message
-    key: str
-    label: str
+    workspace_id: str
+    collection_id: str | None = None
+    title: str
+    status: str = Lifecycle.ACTIVE
     source: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class GraphEdge(BaseModel):
-    company_id: str = "default"
     src_id: str
     dst_id: str
-    type: str  # AUTHORED | CLOSES | MENTIONS | SAME_AS | CAUSED_BY
-    weight: float = 1.0
+    type: str
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -75,147 +206,3 @@ class GraphResult(BaseModel):
     center: str
     nodes: list[GraphNode] = Field(default_factory=list)
     edges: list[GraphEdge] = Field(default_factory=list)
-
-
-class NormBaseline(BaseModel):
-    company_id: str
-    metric: str
-    unit: str
-    n: int
-    median: float
-    mean: float
-    std: float
-    window_days: int
-    computed_at: datetime
-
-
-# ---------------------------------------------------------------------------
-# Alert layer — situations, briefs, delivery.
-# ---------------------------------------------------------------------------
-
-
-class Evidence(BaseModel):
-    """One cited fact backing a situation."""
-
-    event_id: str
-    source: str
-    timestamp: datetime
-    excerpt: str
-    url: str | None = None
-
-
-class Situation(BaseModel):
-    id: str
-    company_id: str
-    rule: str
-    severity: str  # low | medium | high | critical
-    title: str
-    summary: str = ""
-    recommended_action: str | None = None
-    evidence: list[Evidence] = Field(default_factory=list)
-    status: str = "open"  # open | delivered | acknowledged | resolved
-    created_at: datetime
-    resolved_at: datetime | None = None
-
-
-class ActionLink(BaseModel):
-    """A one-click button rendered into a delivered brief (e.g. an email)."""
-
-    label: str
-    url: str
-    primary: bool = False
-
-
-class Brief(BaseModel):
-    situation_id: str
-    title: str
-    severity: str
-    summary: str
-    recommended_action: str | None = None
-    evidence: list[Evidence] = Field(default_factory=list)
-    citations: list[str] = Field(default_factory=list)
-    assigned_to: str | None = None
-    action_links: list[ActionLink] = Field(default_factory=list)
-    note: str = ""  # extra context rendered above the buttons
-
-
-class AssigneeDecision(BaseModel):
-    """Who the agent picked to own the work, and how sure it is."""
-
-    assignee: str  # a candidate id, or "none"
-    confidence: float = 0.0
-    rationale: str = ""
-
-
-class DeliveryReceipt(BaseModel):
-    situation_id: str
-    channel: str
-    recipient: str
-    status: str
-    delivered_at: datetime
-
-
-# ---------------------------------------------------------------------------
-# Act layer — actions with human-approval gating.
-# ---------------------------------------------------------------------------
-
-
-class ActionRequest(BaseModel):
-    company_id: str
-    action: str
-    params: dict[str, Any] = Field(default_factory=dict)
-    situation_id: str | None = None
-    requested_by: str = "system"
-
-
-class ActionDecision(BaseModel):
-    """What the agent decided to do about a situation, and how sure it is."""
-
-    action: str  # a registered action name, or "escalate"
-    argument: str = ""  # opaque payload the vertical maps into action params
-    confidence: float = 0.0  # 0..1
-    rationale: str = ""
-
-
-class ActionResult(BaseModel):
-    id: int | None = None
-    action: str
-    status: str  # pending_approval | executed | dry_run | rejected | failed
-    detail: str = ""
-    result: dict[str, Any] = Field(default_factory=dict)
-
-
-class Connection(BaseModel):
-    company_id: str
-    source: str
-    connected: bool
-    config: dict[str, Any] = Field(default_factory=dict)
-    created_at: datetime | None = None
-
-
-class Ticket(BaseModel):
-    """A concrete piece of work someone owns."""
-
-    id: int | None = None
-    company_id: str = "default"
-    situation_id: str | None = None
-    title: str
-    description: str = ""
-    assignee: str
-    status: str = "open"  # open | done
-    source_event_id: str | None = None
-    external_url: str | None = None
-    created_at: datetime | None = None
-    closed_at: datetime | None = None
-
-
-class TeamMember(BaseModel):
-    """A person the system can notify or assign work to."""
-
-    id: str  # the source login used to assign (e.g. GitHub username)
-    name: str
-    email: str
-    roles: list[str] = Field(default_factory=list)
-    skills: list[str] = Field(default_factory=list)
-    max_open_issues: int = 3
-    assignable: bool = True

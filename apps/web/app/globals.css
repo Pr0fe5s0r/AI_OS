@@ -13,11 +13,20 @@ body {
 
 body {
   margin: 0;
-  background: #0a0a0a;
-  color: #e8e8e8;
-  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: #070809;
+  color: #e7ecf2;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+}
+
+/* A faint grid, like a coordinate space the points live in. Barely there —
+   it reads as "this is a spatial index" without becoming decoration. */
+.field-grid {
+  background-image:
+    linear-gradient(to right, rgba(124, 140, 255, 0.05) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(124, 140, 255, 0.05) 1px, transparent 1px);
+  background-size: 32px 32px;
 }
 
 ::-webkit-scrollbar {
@@ -25,14 +34,73 @@ body {
   height: 10px;
 }
 ::-webkit-scrollbar-thumb {
-  background: #2a2a2a;
+  background: #232a33;
   border-radius: 999px;
-  border: 2px solid #0a0a0a;
+  border: 2px solid #070809;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #383838;
+  background: #303a46;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
 }
 
 ::selection {
-  background: rgba(63, 185, 80, 0.3);
+  background: rgba(124, 140, 255, 0.32);
+}
+
+*:focus-visible {
+  outline: 2px solid rgba(124, 140, 255, 0.6);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+@keyframes fieldPulse {
+  0%,
+  100% {
+    opacity: 0.5;
+    r: var(--r, 3);
+  }
+  50% {
+    opacity: 1;
+    r: calc(var(--r, 3) * 1.35);
+  }
+}
+.field-pulse {
+  animation: fieldPulse 2.6s ease-in-out infinite;
+}
+
+@keyframes traceSweep {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(100%);
+  }
+}
+.trace-sweep {
+  animation: traceSweep 2.2s linear infinite;
+}
+
+.card-in {
+  animation: rise 0.22s ease-out both;
+}
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .field-pulse,
+  .trace-sweep,
+  .card-in,
+  .animate-ping2 {
+    animation: none !important;
+  }
 }
